@@ -39,6 +39,7 @@ scheduler = BackgroundScheduler(timezone="UTC")
 scheduler.start()
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+ANTHROPIC_WORKSPACE_ID = os.environ.get("ANTHROPIC_WORKSPACE_ID", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 EVOLUTION_BASE_URL = os.environ.get("EVOLUTION_BASE_URL", "").rstrip("/")
 EVOLUTION_APIKEY = os.environ.get("EVOLUTION_APIKEY", "")
@@ -155,13 +156,17 @@ def chamar_claude(system_prompt, conteudo_usuario, imagem_base64=None):
         })
     messages_content.append({"type": "text", "text": conteudo_usuario})
 
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    if ANTHROPIC_WORKSPACE_ID:
+        headers["anthropic-workspace-id"] = ANTHROPIC_WORKSPACE_ID
+
     resp = requests.post(
         "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
+        headers=headers,
         json={
             "model": "claude-haiku-4-5",
             "max_tokens": 400,
@@ -170,7 +175,9 @@ def chamar_claude(system_prompt, conteudo_usuario, imagem_base64=None):
         },
         timeout=30,
     )
-    resp.raise_for_status()
+    if resp.status_code >= 400:
+        print(f"[chamar_claude] ERRO {resp.status_code}: {resp.text[:1000]}", flush=True)
+        raise RuntimeError(f"Claude API {resp.status_code}: {resp.text[:500]}")
     texto = resp.json()["content"][0]["text"]
     return json.loads(texto)
 
