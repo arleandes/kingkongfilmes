@@ -178,8 +178,16 @@ def chamar_claude(system_prompt, conteudo_usuario, imagem_base64=None):
     if resp.status_code >= 400:
         print(f"[chamar_claude] ERRO {resp.status_code}: {resp.text[:1000]}", flush=True)
         raise RuntimeError(f"Claude API {resp.status_code}: {resp.text[:500]}")
-    texto = resp.json()["content"][0]["text"]
-    return json.loads(texto)
+    texto = resp.json()["content"][0]["text"].strip()
+    # As vezes o modelo embrulha o JSON num bloco de codigo markdown - remove isso.
+    if texto.startswith("```"):
+        texto = re.sub(r"^```(?:json)?\s*", "", texto)
+        texto = re.sub(r"\s*```$", "", texto)
+    try:
+        return json.loads(texto)
+    except json.JSONDecodeError:
+        print(f"[chamar_claude] resposta nao-JSON do Claude: {texto[:500]}", flush=True)
+        raise
 
 
 # --------------------------------------------------------------------------
@@ -211,7 +219,7 @@ IRRITADO ou com um tom de URGÊNCIA/RECLAMAÇÃO real (não confunda "queria sab
 neutro com estar chateado - só marque como chateado se houver sinal real de insatisfação,
 reclamação, ou urgência forte).
 
-Responda SEMPRE E APENAS em JSON válido, neste formato exato, sem nenhum texto fora do JSON:
+Responda SEMPRE E APENAS em JSON válido, neste formato exato, sem nenhum texto fora do JSON e SEM usar bloco de código markdown (nada de ```):
 {
   "tipo": "arte" | "gravacao" | "duvida" | "outro",
   "resposta_cliente": "texto da mensagem a ser enviada de volta ao cliente no grupo",
@@ -289,7 +297,7 @@ Decida se a mensagem é um PEDIDO DE NOVO LEMBRETE (ex: "me lembra de ligar pro 
 "lembra eu de mandar o orçamento amanhã de manhã") ou OUTRA COISA (uma resposta a um lembrete
 anterior, uma pergunta, um comentário qualquer).
 
-Responda SEMPRE E APENAS em JSON válido, neste formato exato:
+Responda SEMPRE E APENAS em JSON válido, neste formato exato, sem usar bloco de código markdown (nada de ```):
 {
   "eh_pedido_de_lembrete": true ou false,
   "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00 (formato ISO 8601 com o fuso -03:00, só
