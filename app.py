@@ -61,7 +61,7 @@ TEAM_NUMBERS = [TORRES_NUMBER, LUAN_NUMBER]
 
 # Grupos monitorados: id -> {"nome": ..., "interno": True/False}
 GRUPOS = {
-    "120363409281934368@g.us": {"nome": "Terapia", "interno": True},
+    "120363409281934368@g.us": {"nome": "Terapia", "interno": False},
     "120363215853284263@g.us": {"nome": "Zurca", "interno": False},
     "120363425598150153@g.us": {"nome": "Dr. Fellipe Barbosa", "interno": False},
     "120363422131389631@g.us": {"nome": "Gestão", "interno": True},
