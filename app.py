@@ -67,6 +67,8 @@ GRUPOS = {
     "120363410147723558@g.us": {"nome": "Grupo lembrete (TESTE)", "interno": False},
 }
 
+TRIPA_DESIGNER_JID = "120363403421546688@g.us"
+
 # --------------------------------------------------------------------------
 # Utilidades
 # --------------------------------------------------------------------------
@@ -122,6 +124,28 @@ def enviar_texto(numero_ou_jid: str, texto: str):
     )
 
 
+def enviar_midia(numero_ou_jid: str, media_base64: str, mediatype: str, caption: str = "", nome_arquivo: str = "arquivo"):
+    """Encaminha uma imagem ou documento (base64) pra um numero/grupo via Evolution API.
+    mediatype: "image" ou "document"."""
+    try:
+        resp = requests.post(
+            f"{EVOLUTION_BASE_URL}/message/sendMedia/{EVOLUTION_INSTANCE}",
+            headers={"apikey": EVOLUTION_APIKEY, "Content-Type": "application/json"},
+            json={
+                "number": numero_ou_jid,
+                "mediatype": mediatype,
+                "media": media_base64,
+                "fileName": nome_arquivo,
+                "caption": caption,
+            },
+            timeout=40,
+        )
+        if resp.status_code >= 400:
+            print(f"[enviar_midia] ERRO {resp.status_code}: {resp.text[:500]}", flush=True)
+    except Exception as e:
+        print(f"[enviar_midia] falhou: {e}", flush=True)
+
+
 def baixar_midia_evolution(message_key):
     resp = requests.post(
         f"{EVOLUTION_BASE_URL}/chat/getBase64FromMediaMessage/{EVOLUTION_INSTANCE}",
@@ -147,12 +171,17 @@ def transcrever_audio(caminho_arquivo):
     return resp.json().get("text", "")
 
 
-def chamar_claude(system_prompt, conteudo_usuario, imagem_base64=None):
+def chamar_claude(system_prompt, conteudo_usuario, imagem_base64=None, pdf_base64=None):
     messages_content = []
     if imagem_base64:
         messages_content.append({
             "type": "image",
             "source": {"type": "base64", "media_type": "image/jpeg", "data": imagem_base64},
+        })
+    if pdf_base64:
+        messages_content.append({
+            "type": "document",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": pdf_base64},
         })
     messages_content.append({"type": "text", "text": conteudo_usuario})
 
@@ -169,7 +198,7 @@ def chamar_claude(system_prompt, conteudo_usuario, imagem_base64=None):
         headers=headers,
         json={
             "model": "claude-haiku-4-5",
-            "max_tokens": 400,
+            "max_tokens": 800,
             "system": system_prompt,
             "messages": [{"role": "user", "content": messages_content}],
         },
@@ -239,12 +268,23 @@ agora, algo com risco de dar errado) E você não tiver certeza de como responde
 genérica de que a mensagem foi recebida e a equipe já vai te dar um retorno - NUNCA invente ou
 arrisque uma resposta específica que você não tem certeza se está certa.
 
+PEDIDO DE ARTE PRA EQUIPE DE DESIGN: o campo "pedido_organizado_designer" é OBRIGATÓRIO em TODA
+resposta, sem exceção - nunca omita essa chave do JSON. Quando "tipo" for "arte", preencha esse
+campo com o pedido reorganizado de forma clara e objetiva pro designer que vai executar (ele tem
+dificuldade de entender pedidos bagunçados/informais, então capriche em deixar claro e
+organizado). Extraia e liste os detalhes concretos que o cliente mandou (evento, data, dia da
+semana se der pra inferir, horário, nomes/artistas, texto exato que precisa ir na arte,
+referências, etc) em formato de lista simples, um item por linha. Se faltar alguma informação
+importante pra fazer a arte, diga isso claramente no pedido também. Quando "tipo" NÃO for "arte",
+inclua a chave "pedido_organizado_designer" mesmo assim, só que com uma string vazia "".
+
 Responda SEMPRE E APENAS em JSON válido, neste formato exato, sem nenhum texto fora do JSON e SEM usar bloco de código markdown (nada de ```):
 {
   "tipo": "arte" | "gravacao" | "duvida" | "outro",
   "resposta_cliente": "texto da mensagem a ser enviada de volta ao cliente no grupo",
   "chateado": true ou false,
   "duvida_urgente": true ou false,
+  "pedido_organizado_designer": "pedido de arte organizado pro designer, ou string vazia se tipo nao for arte",
   "resumo_interno": "uma frase curta resumindo a mensagem do cliente, pra uso interno da equipe"
 }
 """
@@ -265,6 +305,8 @@ def processar_mensagem_grupo(remote_jid, grupo, key, data):
 
     conteudo_texto = None
     imagem_base64 = None
+    pdf_base64 = None
+    nome_arquivo_doc = "arquivo.pdf"
 
     if "conversation" in message or message_type == "conversation":
         conteudo_texto = message.get("conversation", "")
@@ -282,6 +324,19 @@ def processar_mensagem_grupo(remote_jid, grupo, key, data):
             os.unlink(caminho)
         else:
             conteudo_texto = "(cliente mandou um áudio que não pôde ser baixado)"
+    elif "document" in message_type.lower():
+        doc_msg = message.get("documentMessage", {})
+        caption = doc_msg.get("caption", "")
+        nome_arquivo_doc = doc_msg.get("fileName", "arquivo.pdf")
+        mimetype = doc_msg.get("mimetype", "")
+        b64 = baixar_midia_evolution(key)
+        if b64 and ("pdf" in mimetype.lower() or nome_arquivo_doc.lower().endswith(".pdf")):
+            pdf_base64 = b64
+            conteudo_texto = caption or f"(cliente mandou um PDF/informativo: {nome_arquivo_doc})"
+        elif b64:
+            conteudo_texto = caption or f"(cliente mandou um arquivo que não é PDF: {nome_arquivo_doc})"
+        else:
+            conteudo_texto = "(cliente mandou um arquivo que não pôde ser baixado)"
     else:
         return {"skipped": f"tipo de mensagem não tratado: {message_type}"}
 
@@ -296,14 +351,29 @@ def processar_mensagem_grupo(remote_jid, grupo, key, data):
         f"Mensagem do cliente: {conteudo_texto}"
     )
 
-    resultado = chamar_claude(SYSTEM_PROMPT_ATENDIMENTO, prompt_usuario, imagem_base64=imagem_base64)
+    resultado = chamar_claude(SYSTEM_PROMPT_ATENDIMENTO, prompt_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64)
 
     resposta_cliente = resultado.get("resposta_cliente", "")
     if resposta_cliente:
         enviar_texto(remote_jid, resposta_cliente)
 
+    # Pedido de arte: organiza e encaminha pro grupo Tripa Designer, junto com
+    # a foto/PDF que o cliente mandou (se tiver).
+    pedido_designer = resultado.get("pedido_organizado_designer") or ""
+    encaminhado_designer = False
+    if resultado.get("tipo") == "arte" and pedido_designer:
+        mensagem_tripa = (
+            f"📋 Novo pedido de arte — Cliente: {grupo['nome']}\n\n{pedido_designer}"
+        )
+        enviar_texto(TRIPA_DESIGNER_JID, mensagem_tripa)
+        if imagem_base64:
+            enviar_midia(TRIPA_DESIGNER_JID, imagem_base64, "image", caption=f"Imagem do pedido - {grupo['nome']}")
+        if pdf_base64:
+            enviar_midia(TRIPA_DESIGNER_JID, pdf_base64, "document", caption=f"Arquivo do pedido - {grupo['nome']}", nome_arquivo=nome_arquivo_doc)
+        encaminhado_designer = True
+
     # Avisa Torres e Luan sobre TODO atendimento feito no grupo (nao so os chateados),
-    # pra eles ficarem sempre por dentro do que o robo respondeu.
+    # pra eles ficarem sempre por dentro do que o robo respondeu. Sem anexar foto/PDF aqui.
     urgente = resultado.get("chateado") or resultado.get("duvida_urgente")
     if urgente:
         motivo = []
@@ -320,7 +390,8 @@ def processar_mensagem_grupo(remote_jid, grupo, key, data):
         f"Grupo: {grupo['nome']}\n"
         f"Cliente: {sender_name}\n"
         f"Tipo: {resultado.get('tipo', 'outro')}\n"
-        f"Resumo: {resultado.get('resumo_interno', conteudo_texto)}"
+        + ("📐 Pedido específico encaminhado pra Tripa Designer\n" if encaminhado_designer else "")
+        + f"Resumo: {resultado.get('resumo_interno', conteudo_texto)}"
     )
     for numero in TEAM_NUMBERS:
         enviar_texto(numero, aviso_equipe)
