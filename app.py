@@ -387,7 +387,7 @@ def processar_dm(remote_jid, data):
     tinha_pendente = marcar_resolvido(pessoa)
 
     agora = horario_bahia_agora()
-    prompt_sistema = SYSTEM_PROMPT_LEMBRETE.format(agora_iso=agora.isoformat())
+    prompt_sistema = SYSTEM_PROMPT_LEMBRETE.replace("{agora_iso}", agora.isoformat())
     try:
         resultado = chamar_claude(prompt_sistema, texto)
     except Exception as e:
