@@ -230,6 +230,14 @@ Responda SEMPRE E APENAS em JSON válido, neste formato exato, sem nenhum texto 
 
 
 def processar_mensagem_grupo(remote_jid, grupo, key, data):
+    # Quem mandou a mensagem DENTRO do grupo (diferente do remote_jid, que e o
+    # ID do grupo). Se for a propria equipe (Torres ou Luan) falando no grupo,
+    # o robo nunca deve responder nem entrar na conversa.
+    participant = key.get("participant") or data.get("participant") or ""
+    if participant and (numero_bate(participant, TORRES_NUMBER) or numero_bate(participant, LUAN_NUMBER)):
+        print(f"[processar_mensagem_grupo] mensagem da propria equipe ({participant}), ignorando", flush=True)
+        return {"skipped": "mensagem da equipe (Torres/Luan), sem auto-resposta"}
+
     sender_name = data.get("pushName", "cliente")
     message = data.get("message", {})
     message_type = data.get("messageType", "")
@@ -297,14 +305,14 @@ Decida se a mensagem é um PEDIDO DE NOVO LEMBRETE (ex: "me lembra de ligar pro 
 "lembra eu de mandar o orçamento amanhã de manhã") ou OUTRA COISA (uma resposta a um lembrete
 anterior, uma pergunta, um comentário qualquer).
 
-Responda SEMPRE E APENAS em JSON válido, neste formato exato, sem usar bloco de código markdown (nada de ```):
-{
-  "eh_pedido_de_lembrete": true ou false,
-  "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00 (formato ISO 8601 com o fuso -03:00, só
-                          preencha se eh_pedido_de_lembrete for true; interprete horários
-                          relativos ao 'agora' informado acima)",
-  "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer"
-}
+IMPORTANTE: o campo "data_hora_alvo_iso" deve conter APENAS a data/hora em formato ISO 8601
+com fuso -03:00 (exemplo: 2026-08-29T15:00:00-03:00), sem nenhum texto explicativo junto -
+só preencha esse campo se eh_pedido_de_lembrete for true, interpretando horários relativos
+ao "agora" informado acima.
+
+Responda SEMPRE E APENAS em JSON válido, numa única linha por valor, neste formato exato,
+sem usar bloco de código markdown (nada de ```) e sem quebras de linha dentro dos valores:
+{"eh_pedido_de_lembrete": true ou false, "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer"}
 """
 
 
