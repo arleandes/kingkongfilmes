@@ -475,7 +475,111 @@ def marcar_resolvido(pessoa):
     return False
 
 
-def processar_dm(remote_jid, data):
+SYSTEM_PROMPT_REVISAO = """Você é um revisor de texto cuidadoso da KingKong Filmes, revisando peças
+gráficas (cards, artes, banners) e PDFs/informativos antes de irem ao ar. Leia TODO o texto visível
+na imagem ou documento e identifique erros de ortografia, gramática/concordância, pontuação,
+digitação (palavra trocada, faltando ou duplicada), e inconsistências óbvias de informação (ex:
+dia da semana que não bate com a data, horário faltando, nome de pessoa/local escrito de duas
+formas diferentes na mesma peça). NÃO opine sobre design, cores, layout ou estética - só sobre o
+texto escrito. Seja rigoroso mas não invente erro que não existe; se estiver tudo certo, diga isso.
+
+Responda SEMPRE E APENAS em JSON válido, sem bloco de código markdown (nada de ```):
+{
+  "tem_erro": true ou false,
+  "erros": ["lista de erros encontrados, cada um curto e claro, citando o trecho exato que está errado e a correção"],
+  "observacao": "qualquer observação adicional relevante (ex: texto ilegível em alguma parte), ou string vazia"
+}
+"""
+
+
+def extrair_midia_para_revisao(key, data, message_type):
+    """A partir de uma mensagem de imagem ou documento, baixa a midia e devolve
+    (imagem_base64, pdf_base64, caption, aviso). 'aviso' e um texto pronto pra mandar
+    de volta quando NAO da pra revisar (ex: nao baixou, ou nao e imagem/pdf); None se ok."""
+    message = data.get("message", {})
+    imagem_base64 = None
+    pdf_base64 = None
+    caption = ""
+    aviso = None
+
+    if "image" in message_type.lower():
+        caption = message.get("imageMessage", {}).get("caption", "")
+        imagem_base64 = baixar_midia_evolution(key)
+        if not imagem_base64:
+            aviso = "Recebi a imagem mas não consegui baixar pra revisar, pode reenviar?"
+    elif "document" in message_type.lower():
+        doc_msg = message.get("documentMessage", {})
+        caption = doc_msg.get("caption", "")
+        nome_arquivo = doc_msg.get("fileName", "arquivo.pdf")
+        mimetype = doc_msg.get("mimetype", "")
+        b64 = baixar_midia_evolution(key)
+        if b64 and ("pdf" in mimetype.lower() or nome_arquivo.lower().endswith(".pdf")):
+            pdf_base64 = b64
+        elif b64:
+            aviso = "Recebi o arquivo, mas só consigo revisar imagem (foto do card) ou PDF por enquanto."
+        else:
+            aviso = "Recebi o arquivo mas não consegui baixar pra revisar, pode reenviar?"
+    else:
+        aviso = "skip"  # tipo de mensagem que nem chega a ser imagem/documento
+
+    return imagem_base64, pdf_base64, caption, aviso
+
+
+def revisar_peca(imagem_base64, pdf_base64, caption):
+    """Chama o Claude pra revisar a peca. Devolve (tem_erro, texto_formatado, resultado_bruto)."""
+    prompt_usuario = "Revise essa peça em busca de erros de escrita." + (f" Legenda enviada junto: {caption}" if caption else "")
+    resultado = chamar_claude(SYSTEM_PROMPT_REVISAO, prompt_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64)
+
+    if resultado.get("tem_erro"):
+        erros = resultado.get("erros") or []
+        texto_resp = "⚠️ Encontrei possíveis erros na peça:\n" + "\n".join(f"- {e}" for e in erros)
+    else:
+        texto_resp = "✅ Revisei e não encontrei erros de escrita. Está tudo certo!"
+    if resultado.get("observacao"):
+        texto_resp += f"\n\nObs: {resultado['observacao']}"
+
+    return bool(resultado.get("tem_erro")), texto_resp, resultado
+
+
+def revisar_arte_dm(numero, key, data, message_type):
+    imagem_base64, pdf_base64, caption, aviso = extrair_midia_para_revisao(key, data, message_type)
+    if aviso:
+        enviar_texto(numero, aviso)
+        return {"skipped": aviso}
+
+    try:
+        _, texto_resp, resultado = revisar_peca(imagem_base64, pdf_base64, caption)
+    except Exception as e:
+        enviar_texto(numero, "Tive um problema pra revisar esse arquivo agora, pode tentar de novo em instantes?")
+        return {"erro_claude": str(e)}
+
+    enviar_texto(numero, texto_resp)
+    return {"resultado": resultado}
+
+
+def processar_revisao_grupo_designer(remote_jid, key, data):
+    """No grupo Tripa Designer: se alguem postar uma foto/PDF de peca, revisa e SO avisa
+    no grupo se achar algo errado (silencioso quando esta tudo certo, pra nao virar ruido)."""
+    message_type = data.get("messageType", "")
+    imagem_base64, pdf_base64, caption, aviso = extrair_midia_para_revisao(key, data, message_type)
+    if aviso:
+        # No grupo nao mandamos os avisos de "nao consegui baixar" pra nao gerar ruido -
+        # so logamos e seguimos.
+        print(f"[processar_revisao_grupo_designer] {aviso}", flush=True)
+        return {"skipped": aviso}
+
+    try:
+        tem_erro, texto_resp, resultado = revisar_peca(imagem_base64, pdf_base64, caption)
+    except Exception as e:
+        print(f"[processar_revisao_grupo_designer] erro claude: {e}", flush=True)
+        return {"erro_claude": str(e)}
+
+    if tem_erro:
+        enviar_texto(remote_jid, texto_resp)
+    return {"resultado": resultado}
+
+
+def processar_dm(remote_jid, key, data):
     if numero_bate(remote_jid, TORRES_NUMBER):
         pessoa, numero = "torres", TORRES_NUMBER
     elif numero_bate(remote_jid, LUAN_NUMBER):
@@ -484,9 +588,15 @@ def processar_dm(remote_jid, data):
         return {"skipped": "DM de número não reconhecido"}
 
     message = data.get("message", {})
+    message_type = data.get("messageType", "")
+
+    # Foto ou PDF no privado = pedido de revisao de peca (nao de lembrete).
+    if "image" in message_type.lower() or "document" in message_type.lower():
+        return revisar_arte_dm(numero, key, data, message_type)
+
     texto = message.get("conversation", "")
     if not texto:
-        return {"skipped": "DM sem texto (áudio/imagem em DM não tratado nesta versão)"}
+        return {"skipped": "DM sem texto (tipo de mensagem não tratado nesta versão)"}
 
     # Se já existe lembrete pendente pra essa pessoa, qualquer resposta encerra o nag.
     tinha_pendente = marcar_resolvido(pessoa)
@@ -536,7 +646,10 @@ def webhook():
         return jsonify({"ok": True, "skipped": "duplicado"})
 
     try:
-        if remote_jid in GRUPOS:
+        if remote_jid == TRIPA_DESIGNER_JID:
+            print("[webhook] grupo Tripa Designer - checando se tem peça pra revisar", flush=True)
+            resultado = processar_revisao_grupo_designer(remote_jid, key, data)
+        elif remote_jid in GRUPOS:
             grupo = GRUPOS[remote_jid]
             print(f"[webhook] grupo reconhecido: {grupo['nome']} (interno={grupo['interno']})", flush=True)
             if grupo["interno"]:
@@ -547,7 +660,7 @@ def webhook():
             return jsonify({"ok": True, "skipped": "grupo não cadastrado"})
         elif remote_jid.endswith("@s.whatsapp.net") or remote_jid.endswith("@lid"):
             print(f"[webhook] tratando como DM: {remote_jid}", flush=True)
-            resultado = processar_dm(remote_jid, data)
+            resultado = processar_dm(remote_jid, key, data)
         else:
             print(f"[webhook] origem não tratada: {remote_jid}", flush=True)
             return jsonify({"ok": True, "skipped": "origem não tratada"})
