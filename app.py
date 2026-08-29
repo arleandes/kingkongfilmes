@@ -206,24 +206,45 @@ palavras mantendo o espírito. Sempre que possível, referencie algo específico
 mandou (o que a foto mostra, o que ele disse no áudio) em vez de um "recebemos sua mensagem"
 genérico - isso é o que faz a resposta parecer atenção humana de verdade. Sem assinatura no
 final. Quando mencionar quem vai cuidar da demanda, diga sempre "a equipe" (nunca nomes
-específicos). Não prometa prazos ou valores exatos. No máximo 1-2 emojis, só quando fizer sentido.
+específicos).
+
+RESPOSTA SIMPLES E CURTA: prefira sempre a versão mais simples e direta possível (2-4 frases
+curtas). Quanto mais simples a resposta, menor a chance de erro - evite frases longas, elaboradas
+ou com informação demais.
+
+CONCORDÂNCIA (português do Brasil): revise mentalmente a concordância verbal e nominal antes de
+responder. Em especial, "a equipe" é substantivo SINGULAR - use sempre verbo e pronome no
+singular ("a equipe vai te dar retorno", "ela vai cuidar disso"), NUNCA no plural ("elas vão",
+"eles vão"). Não prometa prazos ou valores exatos. No máximo 1-2 emojis, só quando fizer sentido.
 
 HORÁRIO COMERCIAL: segunda a sexta, das 8h às 18h (horário de Brasília). Você vai receber a
 informação se a mensagem chegou dentro ou fora desse horário.
 - Dentro do horário: responda confirmando que a demanda foi recebida e será encaminhada à equipe.
 - Fora do horário: avise educadamente que está fora do expediente, mas garanta que a mensagem
-  foi registrada e será repassada à equipe assim que o expediente for retomado no próximo dia útil.
+  foi registrada e será repassada à equipe assim que o expediente for retomado. IMPORTANTE: NUNCA
+  cite um dia específico (nunca diga "amanhã", "segunda-feira", nem qualquer nome de dia) - você
+  não sabe com certeza se o próximo dia é útil ou não (pode ser fim de semana ou feriado). Use
+  sempre uma frase genérica e segura, como "assim que retomarmos o expediente" ou "no próximo
+  dia útil", sem especificar qual dia é.
 
 Além da resposta ao cliente, avalie se a mensagem parece de um cliente CHATEADO, FRUSTRADO,
 IRRITADO ou com um tom de URGÊNCIA/RECLAMAÇÃO real (não confunda "queria saber se já está pronto"
 neutro com estar chateado - só marque como chateado se houver sinal real de insatisfação,
 reclamação, ou urgência forte).
 
+DÚVIDA EM CASO URGENTE: se a mensagem parecer urgente (ex: prazo pra hoje/já, evento acontecendo
+agora, algo com risco de dar errado) E você não tiver certeza de como responder corretamente
+(falta informação, é um caso muito específico, foge do que costuma ser pedido), marque
+"duvida_urgente" como true. Nesse caso, "resposta_cliente" deve ser só uma confirmação simples e
+genérica de que a mensagem foi recebida e a equipe já vai te dar um retorno - NUNCA invente ou
+arrisque uma resposta específica que você não tem certeza se está certa.
+
 Responda SEMPRE E APENAS em JSON válido, neste formato exato, sem nenhum texto fora do JSON e SEM usar bloco de código markdown (nada de ```):
 {
   "tipo": "arte" | "gravacao" | "duvida" | "outro",
   "resposta_cliente": "texto da mensagem a ser enviada de volta ao cliente no grupo",
   "chateado": true ou false,
+  "duvida_urgente": true ou false,
   "resumo_interno": "uma frase curta resumindo a mensagem do cliente, pra uso interno da equipe"
 }
 """
@@ -281,15 +302,28 @@ def processar_mensagem_grupo(remote_jid, grupo, key, data):
     if resposta_cliente:
         enviar_texto(remote_jid, resposta_cliente)
 
-    if resultado.get("chateado"):
-        alerta = (
-            f"🚨 Cliente possivelmente insatisfeito!\n"
-            f"Grupo: {grupo['nome']}\n"
-            f"Cliente: {sender_name}\n"
-            f"Resumo: {resultado.get('resumo_interno', conteudo_texto)}"
-        )
-        for numero in TEAM_NUMBERS:
-            enviar_texto(numero, alerta)
+    # Avisa Torres e Luan sobre TODO atendimento feito no grupo (nao so os chateados),
+    # pra eles ficarem sempre por dentro do que o robo respondeu.
+    urgente = resultado.get("chateado") or resultado.get("duvida_urgente")
+    if urgente:
+        motivo = []
+        if resultado.get("chateado"):
+            motivo.append("cliente possivelmente insatisfeito")
+        if resultado.get("duvida_urgente"):
+            motivo.append("caso urgente que o robô não teve certeza de como responder")
+        prefixo = f"🚨 Atenção ({' + '.join(motivo)})"
+    else:
+        prefixo = "📩 Novo atendimento automático"
+
+    aviso_equipe = (
+        f"{prefixo}\n"
+        f"Grupo: {grupo['nome']}\n"
+        f"Cliente: {sender_name}\n"
+        f"Tipo: {resultado.get('tipo', 'outro')}\n"
+        f"Resumo: {resultado.get('resumo_interno', conteudo_texto)}"
+    )
+    for numero in TEAM_NUMBERS:
+        enviar_texto(numero, aviso_equipe)
 
     return {"resultado": resultado}
 
