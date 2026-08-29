@@ -1,4 +1,4 @@
-
+""
 Webhook instantâneo - KingKong Filmes
  
 Duas funções nesse serviço:
@@ -75,6 +75,7 @@ GRUPOS = {
     "120363204077711888@g.us": {"nome": "Latidos e miados", "interno": False},
     "120363312409734498@g.us": {"nome": "House and Co", "interno": False},
     "120363407172233170@g.us": {"nome": "Chicafé", "interno": False},
+    "120363410147723558@g.us": {"nome": "Grupo lembrete (TESTE)", "interno": False},
 }
  
 # --------------------------------------------------------------------------
