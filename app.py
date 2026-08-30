@@ -302,6 +302,15 @@ referências, etc) em formato de lista simples, um item por linha. Se faltar alg
 importante pra fazer a arte, diga isso claramente no pedido também. Quando "tipo" NÃO for "arte",
 inclua a chave "pedido_organizado_designer" mesmo assim, só que com uma string vazia "".
 
+RESUMO INTERNO HUMANIZADO: o campo "resumo_interno" é a mensagem que Torres e Luan vão ler pra
+saber rapidamente o que aconteceu naquele atendimento, então precisa ser natural e fácil de
+entender de primeira - escreva como se estivesse contando pra um colega o que rolou, em 1-2 frases
+completas e claras, NUNCA um fragmento telegráfico tipo "Pergunta sobre X" ou uma lista de
+palavras-chave soltas. Inclua o que o cliente queria/perguntou e, quando fizer sentido, o que você
+respondeu. Exemplo bom: "A Fernanda perguntou se a gente também faz cobertura de casamento -
+expliquei que não, que a Correria é só marketing digital." Exemplo ruim (evite escrever assim):
+"Dúvida sobre casamento."
+
 Responda SEMPRE E APENAS em JSON válido, neste formato exato, sem nenhum texto fora do JSON e SEM usar bloco de código markdown (nada de ```):
 {
   "tipo": "arte" | "gravacao" | "duvida" | "outro",
@@ -309,7 +318,7 @@ Responda SEMPRE E APENAS em JSON válido, neste formato exato, sem nenhum texto 
   "chateado": true ou false,
   "duvida_urgente": true ou false,
   "pedido_organizado_designer": "pedido de arte organizado pro designer, ou string vazia se tipo nao for arte",
-  "resumo_interno": "uma frase curta resumindo a mensagem do cliente, pra uso interno da equipe"
+  "resumo_interno": "1-2 frases naturais e humanizadas contando pra equipe o que o cliente queria e o que foi respondido"
 }
 """
 
@@ -493,11 +502,9 @@ def _finalizar_processamento_grupo(chave):
 
     aviso_equipe = (
         f"{prefixo}\n"
-        f"Grupo: {grupo['nome']}\n"
-        f"Cliente: {sender_name}\n"
-        f"Tipo: {resultado.get('tipo', 'outro')}\n"
-        + ("📐 Pedido específico encaminhado pra Tripa Designer\n" if encaminhado_designer else "")
-        + f"Resumo: {resultado.get('resumo_interno', conteudo_texto)}"
+        f"{grupo['nome']} · {sender_name}\n\n"
+        f"{resultado.get('resumo_interno', conteudo_texto)}"
+        + ("\n\n📐 Encaminhei o pedido pra Tripa Designer." if encaminhado_designer else "")
     )
     for numero in TEAM_NUMBERS:
         enviar_texto(numero, aviso_equipe)
