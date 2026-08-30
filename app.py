@@ -195,7 +195,19 @@ def init_db():
                     criado_em TIMESTAMPTZ NOT NULL DEFAULT now()
                 )
             """)
-        print(f"[init_db] banco de dados pronto (schema '{DB_SCHEMA}', tabelas tarefas/tarefas_eventos/regras_atendimento/fatos_memoria)", flush=True)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS mensagens_grupo (
+                    id SERIAL PRIMARY KEY,
+                    grupo_jid TEXT NOT NULL,
+                    grupo_nome TEXT,
+                    autor TEXT,
+                    eh_equipe BOOLEAN NOT NULL DEFAULT false,
+                    conteudo TEXT,
+                    criado_em TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_mensagens_grupo_jid_criado ON mensagens_grupo (grupo_jid, criado_em)")
+        print(f"[init_db] banco de dados pronto (schema '{DB_SCHEMA}', tabelas tarefas/tarefas_eventos/regras_atendimento/fatos_memoria/mensagens_grupo)", flush=True)
     except Exception as e:
         print(f"[init_db] erro ao inicializar banco de dados: {e}", flush=True)
 
@@ -269,6 +281,69 @@ def listar_fatos():
             return []
     with _fatos_lock:
         return [r["texto"] for r in _fatos_memoria]
+
+
+# Historico leve de mensagens por grupo (equipe e cliente), pra Torres/Luan poderem
+# perguntar no privado "o que rolou no grupo tal" sem precisar abrir o grupo. Fallback em
+# memoria guarda so as ultimas mensagens por grupo, pra nao crescer sem limite.
+_mensagens_grupo_memoria = {}  # grupo_jid -> lista de mensagens (mais recente por ultimo)
+_mensagens_grupo_lock = threading.Lock()
+_MENSAGENS_MEMORIA_MAX_POR_GRUPO = 100
+
+
+def registrar_mensagem_grupo(grupo_jid, grupo_nome, autor, conteudo, eh_equipe):
+    if DATABASE_URL:
+        try:
+            with db_cursor(commit=True) as cur:
+                cur.execute(
+                    "INSERT INTO mensagens_grupo (grupo_jid, grupo_nome, autor, eh_equipe, conteudo) "
+                    "VALUES (%s, %s, %s, %s, %s)",
+                    (grupo_jid, grupo_nome, autor, eh_equipe, conteudo),
+                )
+            return
+        except Exception as e:
+            print(f"[registrar_mensagem_grupo] banco de dados falhou, usando fallback em memoria: {e}", flush=True)
+    with _mensagens_grupo_lock:
+        fila = _mensagens_grupo_memoria.setdefault(grupo_jid, [])
+        fila.append({
+            "autor": autor, "conteudo": conteudo, "eh_equipe": eh_equipe,
+            "criado_em": horario_bahia_agora().isoformat(),
+        })
+        if len(fila) > _MENSAGENS_MEMORIA_MAX_POR_GRUPO:
+            del fila[0]
+
+
+def buscar_mensagens_recentes_grupo(grupo_jid, limite=30):
+    if DATABASE_URL:
+        try:
+            with db_cursor() as cur:
+                cur.execute(
+                    "SELECT autor, eh_equipe, conteudo, criado_em FROM mensagens_grupo "
+                    "WHERE grupo_jid = %s ORDER BY criado_em DESC LIMIT %s",
+                    (grupo_jid, limite),
+                )
+                return list(reversed(cur.fetchall()))
+        except Exception as e:
+            print(f"[buscar_mensagens_recentes_grupo] erro: {e}", flush=True)
+            return []
+    with _mensagens_grupo_lock:
+        return list(_mensagens_grupo_memoria.get(grupo_jid, []))[-limite:]
+
+
+def identificar_grupo_mencionado(texto):
+    """Procura, no texto de uma mensagem de DM, o nome de algum grupo de cliente
+    conhecido (comparacao sem acento/case, por substring) - pra Torres/Luan poderem
+    perguntar sobre um grupo pelo nome sem precisar citar o JID."""
+    texto_norm = normalizar_texto(texto)
+    melhor = None
+    for jid, info in GRUPOS.items():
+        if info.get("interno"):
+            continue
+        nome_norm = normalizar_texto(info["nome"])
+        if nome_norm and nome_norm in texto_norm:
+            if not melhor or len(nome_norm) > len(normalizar_texto(GRUPOS[melhor]["nome"])):
+                melhor = jid
+    return melhor
 
 
 def criar_tarefa(cliente_nome, grupo_jid, tipo_peca, descricao, autor="cliente"):
@@ -736,11 +811,22 @@ def processar_mensagem_grupo(remote_jid, grupo, key, data):
         data.get("participant") or "",
     ]
     participant = next((c for c in candidatos_participant if c), "")
-    if any(
+    eh_equipe = any(
         numero_bate(c, numero)
         for c in candidatos_participant if c
         for numero in NUMEROS_SEM_AUTO_RESPOSTA_EM_GRUPO
-    ):
+    )
+
+    sender_name = data.get("pushName", "cliente")
+    conteudo_texto, imagem_base64, pdf_base64, nome_arquivo_doc = extrair_conteudo_mensagem_grupo(key, data)
+
+    # Registra a mensagem no historico do grupo (equipe ou cliente) pra Torres/Luan
+    # poderem perguntar no privado depois "o que rolou no grupo tal" sem precisar abrir o
+    # grupo - guardado independente do que acontece com a auto-resposta.
+    if conteudo_texto:
+        registrar_mensagem_grupo(remote_jid, grupo["nome"], sender_name, conteudo_texto, eh_equipe)
+
+    if eh_equipe:
         print(f"[processar_mensagem_grupo] mensagem da propria equipe/outro agente ({candidatos_participant}), ignorando", flush=True)
         # Se Torres, Luan ou o outro agente ja respondeu no grupo enquanto o bot ainda
         # estava com uma resposta pendente (dentro da janela de debounce) pra esse mesmo
@@ -755,9 +841,6 @@ def processar_mensagem_grupo(remote_jid, grupo, key, data):
         if chaves_do_grupo:
             print(f"[processar_mensagem_grupo] equipe respondeu no grupo {remote_jid}, cancelando {len(chaves_do_grupo)} resposta(s) pendente(s) do bot", flush=True)
         return {"skipped": "mensagem da equipe (Torres/Luan) ou de outro agente de IA do time, sem auto-resposta"}
-
-    sender_name = data.get("pushName", "cliente")
-    conteudo_texto, imagem_base64, pdf_base64, nome_arquivo_doc = extrair_conteudo_mensagem_grupo(key, data)
 
     if not conteudo_texto:
         return {"skipped": "sem conteúdo pra processar ou tipo não tratado"}
@@ -924,7 +1007,15 @@ um pedido de lembrete não é um comando pro Tripa, um fato pra guardar não é 
    pedido de ação, só algo que deve ficar guardado pra ser usado depois quando fizer sentido
    (inclusive pra responder perguntas futuras tipo "do que o Luan gosta?").
 
-3) COMANDO PRA REPASSAR ALGO PRO GRUPO TRIPA (ex: "passa pra Tripa fazer isso até amanhã 10h e
+3) PERGUNTA SOBRE O QUE ACONTECEU EM ALGUM GRUPO DE CLIENTE (ex: "o que rolou no grupo do Terapia
+   hoje?", "tem pedido pendente lá na Chicafé?", "o cliente Zurca já respondeu?") - {pessoa_nome}
+   quer SABER/CONSULTAR algo sobre uma conversa de um grupo específico, SEM pedir nenhuma ação nova
+   (isso é diferente do tipo 4: se a mensagem pede pra REPASSAR/ENCAMINHAR algo pro Tripa, mesmo que
+   cite o nome de um cliente, é tipo 4, não tipo 3). Preencha "grupo_perguntado" com o nome do grupo
+   mencionado, o mais parecido possível com um destes grupos de cliente conhecidos:
+   {lista_grupos}
+
+4) COMANDO PRA REPASSAR ALGO PRO GRUPO TRIPA (ex: "passa pra Tripa fazer isso até amanhã 10h e
    cobra ele às 9h40 perguntando se já fez", "avisa a Tripa que vai ter essa promoção: ...") -
    {pessoa_nome} quer que uma informação/pedido seja encaminhado pro grupo interno da equipe de
    design (Tripa), podendo incluir um prazo e/ou um horário pra cobrar se já foi feito. Organize o
@@ -937,13 +1028,13 @@ um pedido de lembrete não é um comando pro Tripa, um fato pra guardar não é 
    IMPORTANTE: você NUNCA envia isso direto - só organiza o conteúdo, quem decide se confirma o
    envio é sempre {pessoa_nome} (vai ver um preview antes).
 
-4) QUALQUER OUTRA COISA (pergunta, comentário, resposta a um lembrete anterior, pedido/comando que
-   não se encaixa nos tipos acima) - preencha "resposta_conversa" com uma resposta natural e útil,
-   como uma colega de equipe responderia no privado. Se os FATOS QUE VOCÊ JÁ SABE (se houver, no
-   topo deste prompt) tiverem a resposta pra uma pergunta, use-os pra responder direto. Se for um
+5) QUALQUER OUTRA COISA (comentário, resposta a um lembrete anterior, pedido/comando que não se
+   encaixa nos tipos acima) - preencha "resposta_conversa" com uma resposta natural e útil, como
+   uma colega de equipe responderia no privado. Se os FATOS QUE VOCÊ JÁ SABE (se houver, no topo
+   deste prompt) tiverem a resposta pra uma pergunta, use-os pra responder direto. Se for um
    pedido/comando que você ainda não tem como executar automaticamente, confirme que entendeu e que
    vai anotar/repassar, sem inventar que já fez algo que não fez. Nunca deixe esse campo vazio
-   quando nenhum dos tipos 1/2/3 acima se aplicar - toda mensagem privada precisa de uma resposta.
+   quando nenhum dos tipos 1/2/3/4 acima se aplicar - toda mensagem privada precisa de resposta.
 
 IMPORTANTE sobre datas/horários: qualquer campo "*_iso" deve conter APENAS a data/hora em formato
 ISO 8601 com fuso -03:00 (exemplo: 2026-08-29T15:00:00-03:00), sem nenhum texto explicativo junto,
@@ -952,7 +1043,7 @@ interpretando horários relativos ao "agora" informado acima.
 Responda SEMPRE E APENAS em JSON válido, numa única linha por valor, neste formato exato,
 sem usar bloco de código markdown (nada de ```) e sem quebras de linha dentro dos valores. Inclua
 TODAS as chaves sempre, mesmo vazias/false quando não se aplicarem:
-{"eh_pedido_de_lembrete": true ou false, "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_comando_para_tripa": true ou false, "mensagem_tripa": "texto pronto pra encaminhar pro grupo Tripa, ou string vazia", "tem_cobranca": true ou false, "horario_cobranca_iso": "horario ISO da cobranca, ou string vazia", "pergunta_cobranca": "pergunta curta pra mandar na cobranca, ou string vazia", "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/3 acima for verdadeiro"}
+{"eh_pedido_de_lembrete": true ou false, "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_pergunta_sobre_grupo": true ou false, "grupo_perguntado": "nome do grupo mencionado, ou string vazia", "eh_comando_para_tripa": true ou false, "mensagem_tripa": "texto pronto pra encaminhar pro grupo Tripa, ou string vazia", "tem_cobranca": true ou false, "horario_cobranca_iso": "horario ISO da cobranca, ou string vazia", "pergunta_cobranca": "pergunta curta pra mandar na cobranca, ou string vazia", "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/3/4 acima for verdadeiro"}
 """
 
 
@@ -1363,6 +1454,47 @@ def corrigir_texto_dm(numero, tom, texto_a_corrigir):
     return {"resultado": resultado}
 
 
+SYSTEM_PROMPT_CONSULTA_GRUPO = """Você é a Cintia, assistente virtual da Correria. {pessoa_nome} te
+perguntou algo no privado sobre o grupo de WhatsApp "{grupo_nome}", pra não precisar abrir o grupo
+pra conferir. Abaixo está o histórico recente de mensagens desse grupo que você tem disponível
+(pode ser que não cubra tudo, só o que foi registrado).
+
+Responda a pergunta de {pessoa_nome} usando SOMENTE essas mensagens como base. Se a resposta não
+estiver clara nas mensagens disponíveis, diga isso com naturalidade (ex: "não tenho esse
+registro/isso não apareceu no que eu vi do grupo") em vez de inventar. Responda de forma natural,
+objetiva e humanizada, como uma colega de equipe contando o que viu.
+
+HISTÓRICO DO GRUPO:
+{historico}
+
+Responda SEMPRE E APENAS em JSON válido, sem bloco de código markdown (nada de ```):
+{"resposta": "sua resposta natural pra {pessoa_nome}"}
+"""
+
+
+def responder_pergunta_sobre_grupo(pessoa_nome, pergunta, grupo_jid, grupo_nome):
+    mensagens = buscar_mensagens_recentes_grupo(grupo_jid)
+    if not mensagens:
+        return f"Ainda não tenho nenhum histórico registrado do grupo \"{grupo_nome}\" pra consultar."
+    linhas = []
+    for m in mensagens:
+        quem = "equipe" if m.get("eh_equipe") else (m.get("autor") or "cliente")
+        linhas.append(f"- {quem}: {m.get('conteudo', '')}")
+    historico = "\n".join(linhas)
+    prompt_sistema = (
+        SYSTEM_PROMPT_CONSULTA_GRUPO
+        .replace("{pessoa_nome}", pessoa_nome)
+        .replace("{grupo_nome}", grupo_nome)
+        .replace("{historico}", historico)
+    )
+    try:
+        resultado = chamar_claude(prompt_sistema, pergunta)
+        return resultado.get("resposta") or "Não consegui montar uma resposta a partir do histórico do grupo, pode reformular a pergunta?"
+    except Exception as e:
+        print(f"[responder_pergunta_sobre_grupo] erro: {e}", flush=True)
+        return "Tive um problema pra consultar o histórico desse grupo agora, tenta de novo daqui a pouco?"
+
+
 def processar_dm(remote_jid, key, data):
     if numero_bate(remote_jid, TORRES_NUMBER):
         pessoa, numero = "torres", TORRES_NUMBER
@@ -1430,11 +1562,15 @@ def processar_dm(remote_jid, key, data):
         "FATOS QUE VOCÊ JÁ SABE (use quando fizer sentido pra responder):\n"
         + "\n".join(f"- {f}" for f in fatos) + "\n\n"
     ) if fatos else ""
+    lista_grupos = "\n".join(
+        f"- {info['nome']}" for info in GRUPOS.values() if not info.get("interno")
+    )
     prompt_sistema = (
         SYSTEM_PROMPT_LEMBRETE
         .replace("{agora_iso}", agora.isoformat())
         .replace("{contexto_fatos}", contexto_fatos)
         .replace("{pessoa_nome}", "Torres" if pessoa == "torres" else "Luan")
+        .replace("{lista_grupos}", lista_grupos)
     )
     try:
         resultado = chamar_claude(prompt_sistema, texto)
@@ -1453,6 +1589,19 @@ def processar_dm(remote_jid, key, data):
     elif resultado.get("eh_fato_para_lembrar") and resultado.get("fato_texto"):
         salvar_fato(pessoa, resultado["fato_texto"])
         enviar_texto(numero, f"Anotado! ✅ Vou lembrar: \"{resultado['fato_texto']}\"")
+    elif resultado.get("eh_pergunta_sobre_grupo") and resultado.get("grupo_perguntado"):
+        grupo_jid_pergunta = identificar_grupo_mencionado(resultado["grupo_perguntado"])
+        if not grupo_jid_pergunta:
+            enviar_texto(
+                numero,
+                f"Entendi que a pergunta é sobre o grupo \"{resultado['grupo_perguntado']}\", mas não achei "
+                "esse grupo aqui. Pode confirmar o nome certinho?",
+            )
+        else:
+            grupo_nome_pergunta = GRUPOS[grupo_jid_pergunta]["nome"]
+            pessoa_nome = "Torres" if pessoa == "torres" else "Luan"
+            resposta = responder_pergunta_sobre_grupo(pessoa_nome, texto, grupo_jid_pergunta, grupo_nome_pergunta)
+            enviar_texto(numero, resposta)
     elif resultado.get("eh_comando_para_tripa") and resultado.get("mensagem_tripa"):
         mensagem_tripa = resultado["mensagem_tripa"]
         tem_cobranca = bool(resultado.get("tem_cobranca"))
