@@ -692,6 +692,62 @@ def processar_revisao_grupo_designer(remote_jid, key, data):
     return {"resultado": resultado}
 
 
+SYSTEM_PROMPT_CORRECAO_TEXTO = """Você ajuda a revisar e reescrever, em português do Brasil, um texto
+que a pessoa escreveu com dificuldade (pode ter erro de ortografia, gramática, concordância, ou
+frases desorganizadas/informais demais). A pessoa pediu o tom "{tom}" pro resultado.
+
+- Corrija toda a ortografia, gramática e concordância.
+- Reescreva no tom pedido: "formal" é mais sério e profissional, sem gírias e sem emojis;
+  "cordial" é educado, caloroso e amigável, mas ainda soa natural (pode usar 1 emoji se fizer
+  sentido no contexto).
+- Preserve o significado e a intenção original do texto - não invente informação nova nem mude o
+  que a pessoa quis dizer.
+- Gere 2 opções DIFERENTES entre si (não apenas uma troca mínima de palavra), pra pessoa escolher
+  a que soa melhor pra ela.
+
+Responda SEMPRE E APENAS em JSON válido, sem texto fora do JSON e sem bloco de código markdown
+(nada de ```), neste formato exato:
+{"opcao_1": "primeira versão reescrita e corrigida", "opcao_2": "segunda versão reescrita e corrigida, diferente da primeira"}
+"""
+
+_REGEX_PEDIDO_CORRECAO = re.compile(r"^\s*corri[gj]\w*\s+(?:o\s+)?texto\b.*?:", re.IGNORECASE | re.DOTALL)
+
+
+def extrair_tom_e_texto_correcao(texto_completo):
+    """Se a mensagem começar com o padrão 'corrija o texto com o tom formal/cordial: <texto>',
+    devolve (tom, texto_a_corrigir). Se não bater com o padrão, devolve (None, None)."""
+    m = _REGEX_PEDIDO_CORRECAO.match(texto_completo)
+    if not m:
+        return None, None
+    prefixo = m.group(0).lower()
+    tom = "formal" if "formal" in prefixo else "cordial"
+    texto_a_corrigir = texto_completo[m.end():].strip()
+    return tom, texto_a_corrigir
+
+
+def corrigir_texto_dm(numero, tom, texto_a_corrigir):
+    if not texto_a_corrigir:
+        enviar_texto(
+            numero,
+            "Manda o texto depois dos dois pontos, tipo: \"Corrija o texto com o tom formal: "
+            "<seu texto aqui>\"",
+        )
+        return {"skipped": "pedido de correcao sem texto"}
+
+    prompt_sistema = SYSTEM_PROMPT_CORRECAO_TEXTO.replace("{tom}", tom)
+    try:
+        resultado = chamar_claude(prompt_sistema, texto_a_corrigir)
+    except Exception as e:
+        enviar_texto(numero, "Tive um problema pra revisar esse texto agora, pode tentar de novo?")
+        return {"erro_claude": str(e)}
+
+    opcao_1 = resultado.get("opcao_1", "")
+    opcao_2 = resultado.get("opcao_2", "")
+    resposta = f"Aqui vão 2 opções no tom {tom}:\n\n1️⃣ {opcao_1}\n\n2️⃣ {opcao_2}"
+    enviar_texto(numero, resposta)
+    return {"resultado": resultado}
+
+
 def processar_dm(remote_jid, key, data):
     if numero_bate(remote_jid, TORRES_NUMBER):
         pessoa, numero = "torres", TORRES_NUMBER
@@ -710,6 +766,12 @@ def processar_dm(remote_jid, key, data):
     texto = message.get("conversation", "")
     if not texto:
         return {"skipped": "DM sem texto (tipo de mensagem não tratado nesta versão)"}
+
+    # Pedido de correção de texto ("corrija o texto com o tom formal/cordial: ...") tem
+    # prioridade sobre a lógica de lembrete - não é um lembrete, é outra ferramenta.
+    tom, texto_a_corrigir = extrair_tom_e_texto_correcao(texto)
+    if tom:
+        return corrigir_texto_dm(numero, tom, texto_a_corrigir)
 
     # Se já existe lembrete pendente pra essa pessoa, qualquer resposta encerra o nag.
     tinha_pendente = marcar_resolvido(pessoa)
