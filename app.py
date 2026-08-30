@@ -49,6 +49,12 @@ TORRES_NUMBER = os.environ.get("TORRES_NUMBER", "5571999394216")
 LUAN_NUMBER = os.environ.get("LUAN_NUMBER", "5571992200583")
 TEAM_NUMBERS = [TORRES_NUMBER, LUAN_NUMBER]
 
+# Outro agente de IA (do próprio time) que também atende nos grupos de cliente -
+# quando ele falar num grupo, o robô nunca deve responder/entrar na conversa,
+# igual já acontece com mensagens do Torres e do Luan.
+OUTRO_AGENTE_IA_NUMBER = os.environ.get("OUTRO_AGENTE_IA_NUMBER", "5571984224897")
+NUMEROS_SEM_AUTO_RESPOSTA_EM_GRUPO = [TORRES_NUMBER, LUAN_NUMBER, OUTRO_AGENTE_IA_NUMBER]
+
 # Grupos monitorados: id -> {"nome": ..., "interno": True/False}
 GRUPOS = {
     "120363409281934368@g.us": {"nome": "Terapia", "interno": False},
@@ -384,9 +390,9 @@ def processar_mensagem_grupo(remote_jid, grupo, key, data):
     # ID do grupo). Se for a propria equipe (Torres ou Luan) falando no grupo,
     # o robo nunca deve responder nem entrar na conversa.
     participant = key.get("participant") or data.get("participant") or ""
-    if participant and (numero_bate(participant, TORRES_NUMBER) or numero_bate(participant, LUAN_NUMBER)):
-        print(f"[processar_mensagem_grupo] mensagem da propria equipe ({participant}), ignorando", flush=True)
-        return {"skipped": "mensagem da equipe (Torres/Luan), sem auto-resposta"}
+    if participant and any(numero_bate(participant, numero) for numero in NUMEROS_SEM_AUTO_RESPOSTA_EM_GRUPO):
+        print(f"[processar_mensagem_grupo] mensagem da propria equipe/outro agente ({participant}), ignorando", flush=True)
+        return {"skipped": "mensagem da equipe (Torres/Luan) ou de outro agente de IA do time, sem auto-resposta"}
 
     sender_name = data.get("pushName", "cliente")
     conteudo_texto, imagem_base64, pdf_base64, nome_arquivo_doc = extrair_conteudo_mensagem_grupo(key, data)
