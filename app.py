@@ -532,21 +532,29 @@ def _finalizar_processamento_grupo(chave):
 # Parte 2: lembretes pessoais (Torres / Luan)
 # --------------------------------------------------------------------------
 
-SYSTEM_PROMPT_LEMBRETE = """O usuário está falando em português, num DM de WhatsApp com um assistente
-que agenda lembretes. A data/hora atual é: {agora_iso} (horário de Brasília, America/Bahia).
+SYSTEM_PROMPT_LEMBRETE = """Você é a Cintia, assistente virtual da Correria, falando em português num
+DM de WhatsApp com {pessoa_nome}, sócio/responsável da agência. A data/hora atual é: {agora_iso}
+(horário de Brasília, America/Bahia).
 
 Decida se a mensagem é um PEDIDO DE NOVO LEMBRETE (ex: "me lembra de ligar pro cliente X às 15h",
-"lembra eu de mandar o orçamento amanhã de manhã") ou OUTRA COISA (uma resposta a um lembrete
-anterior, uma pergunta, um comentário qualquer).
+"lembra eu de mandar o orçamento amanhã de manhã") ou OUTRA COISA (uma pergunta, um comentário, um
+pedido/comando qualquer, ou uma resposta a um lembrete anterior).
 
 IMPORTANTE: o campo "data_hora_alvo_iso" deve conter APENAS a data/hora em formato ISO 8601
 com fuso -03:00 (exemplo: 2026-08-29T15:00:00-03:00), sem nenhum texto explicativo junto -
 só preencha esse campo se eh_pedido_de_lembrete for true, interpretando horários relativos
 ao "agora" informado acima.
 
+Se a mensagem NÃO for um pedido de lembrete, preencha também o campo "resposta_conversa" com uma
+resposta natural e útil, como uma colega de equipe responderia no privado: se for uma pergunta que
+você sabe responder, responda direto; se for um pedido/comando que você ainda não tem como
+executar automaticamente, confirme que entendeu e que vai anotar/repassar, sem inventar que já fez
+algo que não fez; se for só um comentário, responda com naturalidade. Nunca deixe esse campo vazio
+quando eh_pedido_de_lembrete for false - toda mensagem privada precisa de uma resposta.
+
 Responda SEMPRE E APENAS em JSON válido, numa única linha por valor, neste formato exato,
 sem usar bloco de código markdown (nada de ```) e sem quebras de linha dentro dos valores:
-{"eh_pedido_de_lembrete": true ou false, "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer"}
+{"eh_pedido_de_lembrete": true ou false, "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que eh_pedido_de_lembrete for false"}
 """
 
 
@@ -918,10 +926,15 @@ def processar_dm(remote_jid, key, data):
     tinha_pendente = marcar_resolvido(pessoa)
 
     agora = horario_bahia_agora()
-    prompt_sistema = SYSTEM_PROMPT_LEMBRETE.replace("{agora_iso}", agora.isoformat())
+    prompt_sistema = (
+        SYSTEM_PROMPT_LEMBRETE
+        .replace("{agora_iso}", agora.isoformat())
+        .replace("{pessoa_nome}", "Torres" if pessoa == "torres" else "Luan")
+    )
     try:
         resultado = chamar_claude(prompt_sistema, texto)
     except Exception as e:
+        enviar_texto(numero, "Tive um problema pra processar sua mensagem agora, pode mandar de novo?")
         return {"erro_claude": str(e), "lembrete_anterior_resolvido": tinha_pendente}
 
     if resultado.get("eh_pedido_de_lembrete"):
@@ -934,6 +947,11 @@ def processar_dm(remote_jid, key, data):
         enviar_texto(numero, f"Combinado! Vou te lembrar 10 min antes: \"{resultado.get('texto_lembrete', texto)}\" 👍")
     elif tinha_pendente:
         enviar_texto(numero, "Combinado, marquei como resolvido! ✅")
+    else:
+        # Nao e pedido de lembrete nem resposta fechando uma pendencia - mesmo assim,
+        # toda mensagem no privado precisa de alguma resposta (nunca ficar em silencio).
+        resposta_conversa = resultado.get("resposta_conversa") or "Beleza, recebi aqui! 👍"
+        enviar_texto(numero, resposta_conversa)
 
     return {"resultado": resultado, "lembrete_anterior_resolvido": tinha_pendente}
 
