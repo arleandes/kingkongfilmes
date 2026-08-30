@@ -29,11 +29,19 @@ import tempfile
 import time
 import threading
 import unicodedata
+from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 
 from flask import Flask, request, jsonify
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
+
+try:
+    import psycopg2
+    import psycopg2.extras
+    import psycopg2.pool
+except ImportError:
+    psycopg2 = None
 
 app = Flask(__name__)
 scheduler = BackgroundScheduler(timezone="UTC")
@@ -75,6 +83,181 @@ GRUPOS = {
 }
 
 TRIPA_DESIGNER_JID = "120363403421546688@g.us"
+
+# --------------------------------------------------------------------------
+# Banco de dados (memoria de tarefas persistente)
+# --------------------------------------------------------------------------
+#
+# Configure a variavel de ambiente DATABASE_URL (o Railway preenche isso
+# automaticamente quando voce adiciona um servico de PostgreSQL ao mesmo
+# projeto e referencia a variavel no servico do webhook). Sem essa variavel
+# configurada, o servico continua funcionando normalmente, so que sem
+# memoria de tarefas persistente (usa fallback em memoria, que se perde a
+# cada redeploy - o mesmo comportamento de antes desta funcionalidade).
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+STATUS_PENDENTE = "PENDENTE"
+STATUS_EM_EXECUCAO = "EM_EXECUCAO"
+STATUS_AGUARDANDO_CORRECAO = "AGUARDANDO_CORRECAO"
+STATUS_CONCLUIDO = "CONCLUIDO"
+
+_db_pool = None
+
+
+def get_db_pool():
+    global _db_pool
+    if _db_pool is None and DATABASE_URL and psycopg2:
+        _db_pool = psycopg2.pool.ThreadedConnectionPool(1, 10, dsn=DATABASE_URL)
+    return _db_pool
+
+
+@contextmanager
+def db_cursor(commit=False):
+    """Context manager que empresta uma conexao do pool, devolve um cursor (linhas como
+    dict), e sempre devolve a conexao pro pool no final (commitando se commit=True, ou
+    dando rollback se der excecao no meio do caminho)."""
+    pool = get_db_pool()
+    if not pool:
+        raise RuntimeError("DATABASE_URL nao configurada ou psycopg2 indisponivel")
+    conn = pool.getconn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            yield cur
+        if commit:
+            conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        pool.putconn(conn)
+
+
+def init_db():
+    """Cria as tabelas de tarefas se ainda nao existirem. Chamado uma vez quando o
+    servico sobe. Se DATABASE_URL nao estiver configurada, so avisa no log e segue -
+    o resto do servico funciona normalmente com o fallback em memoria."""
+    if not DATABASE_URL:
+        print("[init_db] DATABASE_URL nao configurada - memoria de tarefas persistente desativada (usando fallback em memoria)", flush=True)
+        return
+    if not psycopg2:
+        print("[init_db] biblioteca psycopg2 nao instalada (adicione psycopg2-binary no requirements.txt) - memoria de tarefas persistente desativada", flush=True)
+        return
+    try:
+        with db_cursor(commit=True) as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS tarefas (
+                    id SERIAL PRIMARY KEY,
+                    cliente_nome TEXT NOT NULL,
+                    grupo_jid TEXT,
+                    tipo_peca TEXT,
+                    descricao TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'PENDENTE',
+                    criado_em TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    atualizado_em TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS tarefas_eventos (
+                    id SERIAL PRIMARY KEY,
+                    tarefa_id INTEGER NOT NULL REFERENCES tarefas(id) ON DELETE CASCADE,
+                    tipo_evento TEXT NOT NULL,
+                    conteudo TEXT,
+                    autor TEXT,
+                    criado_em TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_tarefas_cliente_status ON tarefas (cliente_nome, status)")
+        print("[init_db] banco de dados pronto (tabelas tarefas/tarefas_eventos)", flush=True)
+    except Exception as e:
+        print(f"[init_db] erro ao inicializar banco de dados: {e}", flush=True)
+
+
+def criar_tarefa(cliente_nome, grupo_jid, tipo_peca, descricao, autor="cliente"):
+    """Cria uma tarefa nova no banco (pedido original) e registra o primeiro evento no
+    historico. Devolve o id da tarefa criada, ou None se o banco nao estiver disponivel
+    ou der erro (nesse caso quem chamou deve usar o fallback em memoria)."""
+    try:
+        with db_cursor(commit=True) as cur:
+            cur.execute(
+                "INSERT INTO tarefas (cliente_nome, grupo_jid, tipo_peca, descricao, status) "
+                "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                (cliente_nome, grupo_jid, tipo_peca, descricao, STATUS_PENDENTE),
+            )
+            tarefa_id = cur.fetchone()["id"]
+            cur.execute(
+                "INSERT INTO tarefas_eventos (tarefa_id, tipo_evento, conteudo, autor) "
+                "VALUES (%s, %s, %s, %s)",
+                (tarefa_id, "pedido_original", descricao, autor),
+            )
+        return tarefa_id
+    except Exception as e:
+        print(f"[criar_tarefa] erro: {e}", flush=True)
+        return None
+
+
+def buscar_tarefa_pendente_por_cliente(cliente_nome):
+    """Pega a tarefa mais antiga daquele cliente que ainda nao foi concluida (PENDENTE,
+    EM_EXECUCAO ou AGUARDANDO_CORRECAO). Devolve um dict com os campos da tarefa, ou None
+    se nao tiver nenhuma tarefa aberta ou o banco nao estiver disponivel."""
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                "SELECT * FROM tarefas WHERE cliente_nome = %s AND status != %s "
+                "ORDER BY criado_em ASC LIMIT 1",
+                (cliente_nome, STATUS_CONCLUIDO),
+            )
+            return cur.fetchone()
+    except Exception as e:
+        print(f"[buscar_tarefa_pendente_por_cliente] erro: {e}", flush=True)
+        return None
+
+
+def adicionar_evento_tarefa(tarefa_id, tipo_evento, conteudo, autor="sistema", novo_status=None):
+    """Registra um evento no historico da tarefa (alteracao, correcao, entrega, aprovacao,
+    conclusao...) e, se informado, atualiza o status da tarefa junto."""
+    if not tarefa_id:
+        return
+    try:
+        with db_cursor(commit=True) as cur:
+            cur.execute(
+                "INSERT INTO tarefas_eventos (tarefa_id, tipo_evento, conteudo, autor) "
+                "VALUES (%s, %s, %s, %s)",
+                (tarefa_id, tipo_evento, conteudo, autor),
+            )
+            if novo_status:
+                cur.execute(
+                    "UPDATE tarefas SET status = %s, atualizado_em = now() WHERE id = %s",
+                    (novo_status, tarefa_id),
+                )
+    except Exception as e:
+        print(f"[adicionar_evento_tarefa] erro: {e}", flush=True)
+
+
+def listar_tarefas_pendentes(cliente_nome=None):
+    """Lista tarefas com status != CONCLUIDO, opcionalmente filtrando por cliente. Ainda
+    nao usado em nenhum fluxo automatico - preparado pra futura cobranca de pendencias no
+    fim do expediente."""
+    try:
+        with db_cursor() as cur:
+            if cliente_nome:
+                cur.execute(
+                    "SELECT * FROM tarefas WHERE cliente_nome = %s AND status != %s ORDER BY criado_em ASC",
+                    (cliente_nome, STATUS_CONCLUIDO),
+                )
+            else:
+                cur.execute(
+                    "SELECT * FROM tarefas WHERE status != %s ORDER BY criado_em ASC",
+                    (STATUS_CONCLUIDO,),
+                )
+            return cur.fetchall()
+    except Exception as e:
+        print(f"[listar_tarefas_pendentes] erro: {e}", flush=True)
+        return []
+
+
+init_db()  # roda uma vez quando o servico sobe (seja via gunicorn ou python app.py)
+
 
 # --------------------------------------------------------------------------
 # Utilidades
@@ -501,7 +684,7 @@ def _finalizar_processamento_grupo(chave):
         encaminhado_designer = True
         # Guarda o pedido pra poder comparar depois com a arte finalizada, quando o
         # designer postar ela no grupo Tripa citando o cliente na legenda.
-        registrar_pedido_pendente(grupo["nome"], pedido_designer)
+        registrar_pedido_pendente(grupo["nome"], pedido_designer, grupo_jid=remote_jid, tipo_peca=tipo_peca)
 
     # Avisa Torres e Luan sobre TODO atendimento feito no grupo (nao so os chateados),
     # pra eles ficarem sempre por dentro do que o robo respondeu. Sem anexar foto/PDF aqui.
@@ -715,7 +898,16 @@ def normalizar_texto(txt):
     return txt
 
 
-def registrar_pedido_pendente(cliente_nome, pedido_texto):
+def registrar_pedido_pendente(cliente_nome, pedido_texto, grupo_jid=None, tipo_peca=None):
+    """Registra um pedido de arte aguardando entrega, pra comparar depois com a arte
+    finalizada. Usa o banco de dados (tabela tarefas) quando disponivel, pra sobreviver a
+    reinicios/redeploys do servico; se o banco nao estiver configurado (ou der erro), cai
+    pro fallback antigo em memoria (que se perde se o servico reiniciar nesse meio tempo)."""
+    if DATABASE_URL:
+        tarefa_id = criar_tarefa(cliente_nome, grupo_jid, tipo_peca, pedido_texto, autor="cliente")
+        if tarefa_id is not None:
+            return
+        print("[registrar_pedido_pendente] banco de dados falhou, usando fallback em memoria", flush=True)
     chave = normalizar_texto(cliente_nome)
     with _pedidos_lock:
         fila = _pedidos_pendentes_designer.setdefault(chave, [])
@@ -744,8 +936,22 @@ def extrair_cliente_da_legenda(caption):
 
 
 def buscar_pedido_pendente(cliente_nome):
-    """Pega (e remove) o pedido pendente mais antigo daquele cliente, descartando
-    pedidos vencidos pelo TTL. Devolve None se nao tiver nenhum pedido pendente."""
+    """Pega o pedido pendente mais antigo daquele cliente - do banco de dados quando
+    disponivel (nesse caso a tarefa fica aberta, permitindo varias rodadas de correcao
+    ate ser marcada concluida), ou da fila em memoria como fallback (nesse caso o pedido
+    e removido da fila ao ser encontrado, e pedidos vencidos pelo TTL sao descartados).
+    Devolve um dict com pelo menos as chaves 'pedido_texto' e 'cliente_nome', e 'tarefa_id'
+    preenchido quando veio do banco (None quando veio do fallback em memoria); ou None se
+    nao tiver nenhum pedido pendente daquele cliente."""
+    if DATABASE_URL:
+        tarefa = buscar_tarefa_pendente_por_cliente(cliente_nome)
+        if tarefa:
+            return {
+                "tarefa_id": tarefa["id"],
+                "cliente_nome": tarefa["cliente_nome"],
+                "pedido_texto": tarefa["descricao"],
+            }
+        return None
     chave = normalizar_texto(cliente_nome)
     agora = time.time()
     with _pedidos_lock:
@@ -755,7 +961,9 @@ def buscar_pedido_pendente(cliente_nome):
         fila[:] = [p for p in fila if agora - p["timestamp"] <= _PEDIDO_PENDENTE_TTL]
         if not fila:
             return None
-        return fila.pop(0)
+        pedido = fila.pop(0)
+        pedido["tarefa_id"] = None
+        return pedido
 
 
 SYSTEM_PROMPT_COMPARACAO_PEDIDO = """Você compara uma peça gráfica finalizada com o pedido original
@@ -824,13 +1032,23 @@ def processar_revisao_grupo_designer(remote_jid, key, data):
         pedido = buscar_pedido_pendente(cliente_nome)
         if pedido:
             try:
-                _, texto_comparacao, resultado_comparacao = comparar_arte_com_pedido(
+                bate, texto_comparacao, resultado_comparacao = comparar_arte_com_pedido(
                     pedido["pedido_texto"], imagem_base64, pdf_base64
                 )
             except Exception as e:
                 print(f"[processar_revisao_grupo_designer] erro na comparacao com pedido: {e}", flush=True)
             else:
                 enviar_texto(remote_jid, texto_comparacao)
+                # Quando o pedido veio do banco (tem tarefa_id), atualiza o status da
+                # tarefa de acordo com o resultado da conferencia: concluida se bateu
+                # tudo certo, ou aguardando correcao se faltou/tem algo errado - assim a
+                # mesma tarefa continua aberta pra receber a proxima rodada corrigida.
+                if pedido.get("tarefa_id"):
+                    novo_status = STATUS_CONCLUIDO if bate else STATUS_AGUARDANDO_CORRECAO
+                    adicionar_evento_tarefa(
+                        pedido["tarefa_id"], "entrega", texto_comparacao,
+                        autor="designer", novo_status=novo_status,
+                    )
         else:
             print(
                 f"[processar_revisao_grupo_designer] legenda citou '{cliente_nome}' mas nao "
