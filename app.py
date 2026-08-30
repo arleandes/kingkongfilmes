@@ -60,8 +60,8 @@ GRUPOS = {
     "120363409281934368@g.us": {"nome": "Terapia", "interno": False},
     "120363215853284263@g.us": {"nome": "Zurca", "interno": False},
     "120363425598150153@g.us": {"nome": "Dr. Fellipe Barbosa", "interno": False},
-    "120363422131389631@g.us": {"nome": "Gestão", "interno": True},
-    "120363403421546688@g.us": {"nome": "Tripa Designer", "interno": True},
+    "120363422131389631@g.us": {"nome": "Correria • Gestão 💎", "interno": True},
+    "120363403421546688@g.us": {"nome": "Criações/Gravações • Tripa • Correria", "interno": True},
     "120363410170863535@g.us": {"nome": "Curso doutor", "interno": False},
     "120363412192937913@g.us": {"nome": "Trafego Diego", "interno": False},
     "120363427807470909@g.us": {"nome": "Novo Mix", "interno": False},
@@ -299,15 +299,17 @@ agora, algo com risco de dar errado) E você não tiver certeza de como responde
 genérica de que a mensagem foi recebida e a equipe já vai te dar um retorno - NUNCA invente ou
 arrisque uma resposta específica que você não tem certeza se está certa.
 
-PEDIDO DE ARTE PRA EQUIPE DE DESIGN: o campo "pedido_organizado_designer" é OBRIGATÓRIO em TODA
-resposta, sem exceção - nunca omita essa chave do JSON. Quando "tipo" for "arte", preencha esse
-campo com o pedido reorganizado de forma clara e objetiva pro designer que vai executar (ele tem
-dificuldade de entender pedidos bagunçados/informais, então capriche em deixar claro e
-organizado). Extraia e liste os detalhes concretos que o cliente mandou (evento, data, dia da
-semana se der pra inferir, horário, nomes/artistas, texto exato que precisa ir na arte,
-referências, etc) em formato de lista simples, um item por linha. Se faltar alguma informação
-importante pra fazer a arte, diga isso claramente no pedido também. Quando "tipo" NÃO for "arte",
-inclua a chave "pedido_organizado_designer" mesmo assim, só que com uma string vazia "".
+PEDIDO DE ARTE PRA EQUIPE DE DESIGN: os campos "tipo_peca_designer" e "pedido_organizado_designer"
+são OBRIGATÓRIOS em TODA resposta, sem exceção - nunca omita essas chaves do JSON. Quando "tipo"
+for "arte": preencha "tipo_peca_designer" com uma classificação curta do material (ex: "Card",
+"Story", "Carrossel", "Banner", "Flyer", "Selo"); preencha "pedido_organizado_designer" com o
+pedido reorganizado de forma clara e objetiva pro designer que vai executar (ele tem dificuldade
+de entender pedidos bagunçados/informais, então capriche em deixar claro e organizado). Extraia e
+liste os detalhes concretos que o cliente mandou (evento, data, dia da semana se der pra inferir,
+horário, nomes/artistas, texto exato que precisa ir na arte, referências, etc) em formato de lista
+simples, um item por linha. Se faltar alguma informação importante pra fazer a arte, diga isso
+claramente no pedido também. Quando "tipo" NÃO for "arte", inclua as duas chaves mesmo assim, só
+que com string vazia "" nas duas.
 
 RESUMO INTERNO HUMANIZADO: o campo "resumo_interno" é a mensagem que Torres e Luan vão ler pra
 saber rapidamente o que aconteceu naquele atendimento, então precisa ser natural e fácil de
@@ -324,6 +326,7 @@ Responda SEMPRE E APENAS em JSON válido, neste formato exato, sem nenhum texto 
   "resposta_cliente": "texto da mensagem a ser enviada de volta ao cliente no grupo",
   "chateado": true ou false,
   "duvida_urgente": true ou false,
+  "tipo_peca_designer": "classificação curta do material (Card, Story, Carrossel, Banner, Flyer, Selo...), ou string vazia se tipo nao for arte",
   "pedido_organizado_designer": "pedido de arte organizado pro designer, ou string vazia se tipo nao for arte",
   "resumo_interno": "1-2 frases naturais e humanizadas contando pra equipe o que o cliente queria e o que foi respondido"
 }
@@ -486,8 +489,11 @@ def _finalizar_processamento_grupo(chave):
     pedido_designer = resultado.get("pedido_organizado_designer") or ""
     encaminhado_designer = False
     if resultado.get("tipo") == "arte" and pedido_designer:
+        tipo_peca = resultado.get("tipo_peca_designer") or "Arte"
         mensagem_tripa = (
-            f"📋 Novo pedido de arte — Cliente: {grupo['nome']}\n\n{pedido_designer}"
+            f"*CLIENTE:* {grupo['nome']}\n"
+            f"*SOLICITAÇÃO:* {tipo_peca}\n"
+            f"*DESCRIÇÃO:* {pedido_designer}"
         )
         enviar_texto(TRIPA_DESIGNER_JID, mensagem_tripa)
         for tipo_midia, midia_b64, nome_arquivo in midias_designer:
@@ -512,9 +518,9 @@ def _finalizar_processamento_grupo(chave):
 
     aviso_equipe = (
         f"{prefixo}\n"
-        f"{grupo['nome']} · {sender_name}\n\n"
+        f"*{grupo['nome']}* · {sender_name}\n\n"
         f"{resultado.get('resumo_interno', conteudo_texto)}"
-        + ("\n\n📐 Encaminhei o pedido pra Tripa Designer." if encaminhado_designer else "")
+        + ("\n\n📐 Encaminhei o pedido pra Tripa." if encaminhado_designer else "")
     )
     for numero in TEAM_NUMBERS:
         enviar_texto(numero, aviso_equipe)
@@ -785,10 +791,9 @@ def comparar_arte_com_pedido(pedido_texto, imagem_base64, pdf_base64):
 
 def processar_revisao_grupo_designer(remote_jid, key, data):
     """No grupo Tripa Designer: se alguem postar uma foto/PDF de peca, revisa a ortografia
-    e SO avisa no grupo se achar algo errado (silencioso quando esta tudo certo, pra nao
-    virar ruido). Se a legenda citar o nome de um cliente (ex: "terapia") e tiver um pedido
-    de arte pendente daquele cliente, TAMBEM compara a arte com o pedido original e AVISA
-    SEMPRE no grupo (bateu ou nao bateu), ja que essa checagem foi pedida explicitamente."""
+    e SEMPRE avisa no grupo o resultado (bateu ou nao bateu). Se a legenda citar o nome de
+    um cliente (ex: "terapia") e tiver um pedido de arte pendente daquele cliente, TAMBEM
+    compara a arte com o pedido original e avisa o resultado dessa comparação também."""
     message_type = data.get("messageType", "")
     imagem_base64, pdf_base64, caption, aviso = extrair_midia_para_revisao(key, data, message_type)
     if aviso:
@@ -803,8 +808,7 @@ def processar_revisao_grupo_designer(remote_jid, key, data):
         print(f"[processar_revisao_grupo_designer] erro claude: {e}", flush=True)
         return {"erro_claude": str(e)}
 
-    if tem_erro:
-        enviar_texto(remote_jid, texto_resp)
+    enviar_texto(remote_jid, texto_resp)
 
     resultado_comparacao = None
     cliente_nome = extrair_cliente_da_legenda(caption)
