@@ -97,6 +97,13 @@ TRIPA_DESIGNER_JID = "120363403421546688@g.us"
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
+# Nome do schema Postgres dedicado a essa aplicacao. Usamos um schema separado
+# (em vez do schema "public") pra garantir isolamento total mesmo quando
+# DATABASE_URL aponta pro mesmo banco Postgres usado pelo Evolution API - as
+# tabelas do Evolution ficam no schema "public" delas, e as nossas ficam aqui
+# dentro, sem nenhum risco de colisao de nomes ou de mexer nos dados deles.
+DB_SCHEMA = os.environ.get("DB_SCHEMA", "correria_tarefas")
+
 STATUS_PENDENTE = "PENDENTE"
 STATUS_EM_EXECUCAO = "EM_EXECUCAO"
 STATUS_AGUARDANDO_CORRECAO = "AGUARDANDO_CORRECAO"
@@ -108,7 +115,10 @@ _db_pool = None
 def get_db_pool():
     global _db_pool
     if _db_pool is None and DATABASE_URL and psycopg2:
-        _db_pool = psycopg2.pool.ThreadedConnectionPool(1, 10, dsn=DATABASE_URL)
+        _db_pool = psycopg2.pool.ThreadedConnectionPool(
+            1, 10, dsn=DATABASE_URL,
+            options=f"-c search_path={DB_SCHEMA},public",
+        )
     return _db_pool
 
 
@@ -145,6 +155,7 @@ def init_db():
         return
     try:
         with db_cursor(commit=True) as cur:
+            cur.execute(f"CREATE SCHEMA IF NOT EXISTS {DB_SCHEMA}")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS tarefas (
                     id SERIAL PRIMARY KEY,
@@ -168,7 +179,7 @@ def init_db():
                 )
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_tarefas_cliente_status ON tarefas (cliente_nome, status)")
-        print("[init_db] banco de dados pronto (tabelas tarefas/tarefas_eventos)", flush=True)
+        print(f"[init_db] banco de dados pronto (schema '{DB_SCHEMA}', tabelas tarefas/tarefas_eventos)", flush=True)
     except Exception as e:
         print(f"[init_db] erro ao inicializar banco de dados: {e}", flush=True)
 
