@@ -411,9 +411,7 @@ def adicionar_evento_tarefa(tarefa_id, tipo_evento, conteudo, autor="sistema", n
 
 
 def listar_tarefas_pendentes(cliente_nome=None):
-    """Lista tarefas com status != CONCLUIDO, opcionalmente filtrando por cliente. Ainda
-    nao usado em nenhum fluxo automatico - preparado pra futura cobranca de pendencias no
-    fim do expediente."""
+    """Lista tarefas com status != CONCLUIDO, opcionalmente filtrando por cliente."""
     try:
         with db_cursor() as cur:
             if cliente_nome:
@@ -432,7 +430,57 @@ def listar_tarefas_pendentes(cliente_nome=None):
         return []
 
 
+_STATUS_LEGIVEL = {
+    STATUS_PENDENTE: "ainda não iniciado",
+    STATUS_EM_EXECUCAO: "em execução",
+    STATUS_AGUARDANDO_CORRECAO: "aguardando correção",
+}
+
+
+def verificar_pendencias_fim_expediente():
+    """Roda no fim do expediente (dias úteis, 18h Bahia) e avisa sobre pedidos de arte
+    que ainda não foram concluídos: pro grupo Tripa (lembrete operacional pra equipe
+    terminar) e em privado pra Torres e Luan (pra eles ficarem sabendo o que ainda está em
+    aberto e não serem pegos de surpresa se algum cliente cobrar ou reclamar depois -
+    "sistema de defesa" contra pendência esquecida)."""
+    try:
+        pendentes = listar_tarefas_pendentes()
+    except Exception as e:
+        print(f"[verificar_pendencias_fim_expediente] erro ao buscar pendencias: {e}", flush=True)
+        return
+    if not pendentes:
+        print("[verificar_pendencias_fim_expediente] nenhuma pendência, não precisa avisar", flush=True)
+        return
+
+    linhas = [
+        f"- *{t.get('cliente_nome')}* — {t.get('tipo_peca') or 'arte'} "
+        f"({_STATUS_LEGIVEL.get(t.get('status'), t.get('status'))})"
+        for t in pendentes
+    ]
+    bloco = "\n".join(linhas)
+
+    enviar_texto(
+        TRIPA_DESIGNER_JID,
+        f"⏰ Fim de expediente! Esses pedidos ainda não foram fechados hoje, dá uma olhada:\n\n{bloco}",
+    )
+    aviso_privado = (
+        f"📋 Resumo do fim do expediente: {len(pendentes)} pedido(s) de cliente ainda em aberto "
+        f"com a Tripa:\n\n{bloco}\n\nSe algum cliente cobrar isso depois, já fica registrado que "
+        "estava em andamento."
+    )
+    enviar_texto(TORRES_NUMBER, aviso_privado)
+    enviar_texto(LUAN_NUMBER, aviso_privado)
+
+
 init_db()  # roda uma vez quando o servico sobe (seja via gunicorn ou python app.py)
+
+# Cobranca automatica de pendencias no fim do expediente (dias uteis, 18h horario de
+# Bahia = 21h UTC, ja que o scheduler roda em UTC e a Bahia nao tem horario de verao).
+scheduler.add_job(
+    verificar_pendencias_fim_expediente,
+    "cron", day_of_week="mon-fri", hour=21, minute=0,
+    id="verificar_pendencias_fim_expediente", replace_existing=True,
+)
 
 
 # --------------------------------------------------------------------------
