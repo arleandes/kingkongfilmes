@@ -28,6 +28,7 @@ import base64
 import tempfile
 import time
 import threading
+import unicodedata
 from datetime import datetime, timezone, timedelta
 
 from flask import Flask, request, jsonify
@@ -486,6 +487,9 @@ def _finalizar_processamento_grupo(chave):
         for tipo_midia, midia_b64, nome_arquivo in midias_designer:
             enviar_midia(TRIPA_DESIGNER_JID, midia_b64, tipo_midia, caption=f"Anexo do pedido - {grupo['nome']}", nome_arquivo=nome_arquivo)
         encaminhado_designer = True
+        # Guarda o pedido pra poder comparar depois com a arte finalizada, quando o
+        # designer postar ela no grupo Tripa citando o cliente na legenda.
+        registrar_pedido_pendente(grupo["nome"], pedido_designer)
 
     # Avisa Torres e Luan sobre TODO atendimento feito no grupo (nao so os chateados),
     # pra eles ficarem sempre por dentro do que o robo respondeu. Sem anexar foto/PDF aqui.
@@ -670,9 +674,115 @@ def revisar_arte_dm(numero, key, data, message_type):
     return {"resultado": resultado}
 
 
+# --------------------------------------------------------------------------
+# Comparacao da arte finalizada com o pedido original do cliente
+# --------------------------------------------------------------------------
+#
+# Quando um pedido de arte e encaminhado pra Tripa Designer, guardamos o pedido
+# organizado numa fila em memoria, por cliente. Quando o designer posta a arte
+# pronta no grupo Tripa Designer citando o nome do cliente na legenda (ex:
+# "terapia"), pegamos o pedido mais antigo pendente daquele cliente e pedimos
+# pro Claude comparar se a arte contempla tudo que foi pedido.
+
+_pedidos_pendentes_designer = {}  # chave normalizada do cliente -> lista de pedidos (FIFO)
+_pedidos_lock = threading.Lock()
+_PEDIDO_PENDENTE_TTL = 7 * 24 * 60 * 60  # descarta pedido nao reclamado depois de 7 dias
+
+
+def normalizar_texto(txt):
+    txt = (txt or "").lower()
+    txt = unicodedata.normalize("NFKD", txt).encode("ascii", "ignore").decode("ascii")
+    return txt
+
+
+def registrar_pedido_pendente(cliente_nome, pedido_texto):
+    chave = normalizar_texto(cliente_nome)
+    with _pedidos_lock:
+        fila = _pedidos_pendentes_designer.setdefault(chave, [])
+        fila.append({"cliente_nome": cliente_nome, "pedido_texto": pedido_texto, "timestamp": time.time()})
+
+
+_STOPWORDS_NOME_CLIENTE = {"de", "do", "da", "e", "dr", "dra", "grupo"}
+
+
+def extrair_cliente_da_legenda(caption):
+    """Se a legenda citar o nome de algum cliente conhecido (GRUPOS, exceto grupos
+    internos), devolve o nome oficial do grupo. Senao, devolve None."""
+    if not caption:
+        return None
+    cap_norm = normalizar_texto(caption)
+    for grupo in GRUPOS.values():
+        if grupo["interno"]:
+            continue
+        nome_norm = normalizar_texto(grupo["nome"])
+        if nome_norm and nome_norm in cap_norm:
+            return grupo["nome"]
+        for palavra in nome_norm.split():
+            if len(palavra) >= 4 and palavra not in _STOPWORDS_NOME_CLIENTE and palavra in cap_norm:
+                return grupo["nome"]
+    return None
+
+
+def buscar_pedido_pendente(cliente_nome):
+    """Pega (e remove) o pedido pendente mais antigo daquele cliente, descartando
+    pedidos vencidos pelo TTL. Devolve None se nao tiver nenhum pedido pendente."""
+    chave = normalizar_texto(cliente_nome)
+    agora = time.time()
+    with _pedidos_lock:
+        fila = _pedidos_pendentes_designer.get(chave)
+        if not fila:
+            return None
+        fila[:] = [p for p in fila if agora - p["timestamp"] <= _PEDIDO_PENDENTE_TTL]
+        if not fila:
+            return None
+        return fila.pop(0)
+
+
+SYSTEM_PROMPT_COMPARACAO_PEDIDO = """Você compara uma peça gráfica finalizada com o pedido original
+que o cliente fez, pra conferir se a arte contempla todas as informações pedidas.
+
+Você vai receber (1) o pedido original organizado (evento, data, horário, textos, nomes etc que o
+cliente pediu) e (2) a imagem ou PDF da arte finalizada. Leia todo o texto visível na arte e
+compare com cada item do pedido original.
+
+Aponte:
+- Informação que estava no pedido e NÃO aparece na arte (ex: faltou o horário, faltou um nome).
+- Informação que aparece na arte mas está DIFERENTE do que foi pedido (ex: data errada, nome
+  escrito diferente do pedido, dia da semana que não bate com a data).
+Não aponte diferença de design, cores, layout ou estética - só conteúdo/informação. Se a arte
+contempla tudo que foi pedido corretamente, diga isso claramente.
+
+Responda SEMPRE E APENAS em JSON válido, sem bloco de código markdown (nada de ```):
+{
+  "bate_com_pedido": true ou false,
+  "problemas": ["lista de itens faltando ou diferentes do pedido, cada um curto e claro"],
+  "resumo": "1 frase confirmando que bateu tudo, ou resumindo o principal problema"
+}
+"""
+
+
+def comparar_arte_com_pedido(pedido_texto, imagem_base64, pdf_base64):
+    prompt_usuario = f"Pedido original do cliente:\n{pedido_texto}\n\nCompare esse pedido com a arte anexada."
+    resultado = chamar_claude(SYSTEM_PROMPT_COMPARACAO_PEDIDO, prompt_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64)
+
+    bate = bool(resultado.get("bate_com_pedido"))
+    if bate:
+        texto_resp = f"✅ Conferi com o pedido do cliente: {resultado.get('resumo') or 'bateu tudo certo, contempla o que foi pedido.'}"
+    else:
+        problemas = resultado.get("problemas") or []
+        texto_resp = "⚠️ Comparei com o pedido do cliente e encontrei diferença(s):\n" + "\n".join(f"- {p}" for p in problemas)
+        if resultado.get("resumo"):
+            texto_resp += f"\n\n{resultado['resumo']}"
+
+    return bate, texto_resp, resultado
+
+
 def processar_revisao_grupo_designer(remote_jid, key, data):
-    """No grupo Tripa Designer: se alguem postar uma foto/PDF de peca, revisa e SO avisa
-    no grupo se achar algo errado (silencioso quando esta tudo certo, pra nao virar ruido)."""
+    """No grupo Tripa Designer: se alguem postar uma foto/PDF de peca, revisa a ortografia
+    e SO avisa no grupo se achar algo errado (silencioso quando esta tudo certo, pra nao
+    virar ruido). Se a legenda citar o nome de um cliente (ex: "terapia") e tiver um pedido
+    de arte pendente daquele cliente, TAMBEM compara a arte com o pedido original e AVISA
+    SEMPRE no grupo (bateu ou nao bateu), ja que essa checagem foi pedida explicitamente."""
     message_type = data.get("messageType", "")
     imagem_base64, pdf_base64, caption, aviso = extrair_midia_para_revisao(key, data, message_type)
     if aviso:
@@ -689,7 +799,28 @@ def processar_revisao_grupo_designer(remote_jid, key, data):
 
     if tem_erro:
         enviar_texto(remote_jid, texto_resp)
-    return {"resultado": resultado}
+
+    resultado_comparacao = None
+    cliente_nome = extrair_cliente_da_legenda(caption)
+    if cliente_nome:
+        pedido = buscar_pedido_pendente(cliente_nome)
+        if pedido:
+            try:
+                _, texto_comparacao, resultado_comparacao = comparar_arte_com_pedido(
+                    pedido["pedido_texto"], imagem_base64, pdf_base64
+                )
+            except Exception as e:
+                print(f"[processar_revisao_grupo_designer] erro na comparacao com pedido: {e}", flush=True)
+            else:
+                enviar_texto(remote_jid, texto_comparacao)
+        else:
+            print(
+                f"[processar_revisao_grupo_designer] legenda citou '{cliente_nome}' mas nao "
+                "achei pedido pendente pra comparar",
+                flush=True,
+            )
+
+    return {"resultado": resultado, "cliente_identificado": cliente_nome, "comparacao": resultado_comparacao}
 
 
 SYSTEM_PROMPT_CORRECAO_TEXTO = """Você ajuda a revisar e reescrever, em português do Brasil, um texto
