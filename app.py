@@ -179,9 +179,52 @@ def init_db():
                 )
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_tarefas_cliente_status ON tarefas (cliente_nome, status)")
-        print(f"[init_db] banco de dados pronto (schema '{DB_SCHEMA}', tabelas tarefas/tarefas_eventos)", flush=True)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS regras_atendimento (
+                    id SERIAL PRIMARY KEY,
+                    autor TEXT,
+                    texto TEXT NOT NULL,
+                    criado_em TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+        print(f"[init_db] banco de dados pronto (schema '{DB_SCHEMA}', tabelas tarefas/tarefas_eventos/regras_atendimento)", flush=True)
     except Exception as e:
         print(f"[init_db] erro ao inicializar banco de dados: {e}", flush=True)
+
+
+# Regras permanentes de atendimento que Torres/Luan definem no privado do bot mandando
+# "regra: <instrucao>". Ficam guardadas (banco, com fallback em memoria) e sao incluidas
+# em TODA resposta automatica de cliente dali pra frente, ate alguem decidir remover.
+_regras_memoria = []
+_regras_lock = threading.Lock()
+
+
+def salvar_regra(autor, texto):
+    if DATABASE_URL:
+        try:
+            with db_cursor(commit=True) as cur:
+                cur.execute(
+                    "INSERT INTO regras_atendimento (autor, texto) VALUES (%s, %s)",
+                    (autor, texto),
+                )
+            return
+        except Exception as e:
+            print(f"[salvar_regra] banco de dados falhou, usando fallback em memoria: {e}", flush=True)
+    with _regras_lock:
+        _regras_memoria.append({"autor": autor, "texto": texto})
+
+
+def listar_regras():
+    if DATABASE_URL:
+        try:
+            with db_cursor() as cur:
+                cur.execute("SELECT texto FROM regras_atendimento ORDER BY criado_em ASC")
+                return [r["texto"] for r in cur.fetchall()]
+        except Exception as e:
+            print(f"[listar_regras] erro: {e}", flush=True)
+            return []
+    with _regras_lock:
+        return [r["texto"] for r in _regras_memoria]
 
 
 def criar_tarefa(cliente_nome, grupo_jid, tipo_peca, descricao, autor="cliente"):
@@ -486,12 +529,34 @@ IRRITADO ou com um tom de URGÊNCIA/RECLAMAÇÃO real (não confunda "queria sab
 neutro com estar chateado - só marque como chateado se houver sinal real de insatisfação,
 reclamação, ou urgência forte).
 
-DÚVIDA EM CASO URGENTE: se a mensagem parecer urgente (ex: prazo pra hoje/já, evento acontecendo
-agora, algo com risco de dar errado) E você não tiver certeza de como responder corretamente
-(falta informação, é um caso muito específico, foge do que costuma ser pedido), marque
-"duvida_urgente" como true. Nesse caso, "resposta_cliente" deve ser só uma confirmação simples e
-genérica de que a mensagem foi recebida e a equipe já vai te dar um retorno - NUNCA invente ou
-arrisque uma resposta específica que você não tem certeza se está certa.
+NUNCA INVENTAR PROBLEMA TÉCNICO: você não deve, em hipótese nenhuma, dizer ao cliente que um
+arquivo/foto/vídeo "não abriu", "deu erro", "veio corrompido" ou qualquer variação disso - você não
+tem nenhuma informação real sobre isso, e alegar um problema técnico que não existe deixa o
+cliente sem graça e passa a impressão de que ele fez algo errado. Se o cliente mandar um vídeo
+(que você não consegue analisar o conteúdo, só imagem e PDF), apenas confirme o recebimento com
+naturalidade e diga que a equipe vai revisar - nunca invente um motivo técnico. Se faltou o cliente
+explicar o que precisa ser feito com o material enviado (ex: mandou só um vídeo sem legenda nem
+contexto), pergunte educadamente o que ele gostaria que fosse feito com aquele material, em vez de
+ficar em silêncio ou inventar uma resposta.
+
+TOM - inspiração vs. imitação: pode se inspirar no jeito humano e atencioso que a equipe (Torres e
+Luan) responde os clientes normalmente. PORÉM, mesmo quando a equipe conversa com um cliente
+específico com mais intimidade/informalidade (por já terem uma relação mais próxima), você NUNCA
+deve imitar esse nível de informalidade - seu tom padrão é sempre cordial e formal-amigável, como
+definido acima, com todos os clientes, sem exceção.
+
+DÚVIDA (qualquer caso, urgente ou não): se em algum momento você não tiver certeza real de como
+responder (falta informação, é um caso muito específico, foge do que costuma ser pedido, ou é um
+pedido que a agência não tem certeza se atende), marque "duvida_geral" como true e preencha
+"opcoes_resposta" com 1-2 sugestões curtas de como responder, pra equipe escolher ou ajustar.
+Nesses casos, "resposta_cliente" deve ser só uma confirmação simples e genérica de que a mensagem
+foi recebida e a equipe já vai te dar um retorno - NUNCA arrisque enviar ao cliente uma resposta
+específica que você não tem certeza se está certa. Quando "duvida_geral" for false, inclua o campo
+mesmo assim com "opcoes_resposta" como lista vazia [].
+
+DÚVIDA EM CASO URGENTE: além da checagem acima, se a mensagem também parecer urgente (ex: prazo
+pra hoje/já, evento acontecendo agora, algo com risco de dar errado), marque adicionalmente
+"duvida_urgente" como true (isso faz a equipe ser avisada com destaque/prioridade).
 
 PEDIDO DE ARTE PRA EQUIPE DE DESIGN: os campos "tipo_peca_designer" e "pedido_organizado_designer"
 são OBRIGATÓRIOS em TODA resposta, sem exceção - nunca omita essas chaves do JSON. Quando "tipo"
@@ -519,7 +584,9 @@ Responda SEMPRE E APENAS em JSON válido, neste formato exato, sem nenhum texto 
   "tipo": "arte" | "gravacao" | "duvida" | "outro",
   "resposta_cliente": "texto da mensagem a ser enviada de volta ao cliente no grupo",
   "chateado": true ou false,
+  "duvida_geral": true ou false,
   "duvida_urgente": true ou false,
+  "opcoes_resposta": ["sugestão 1 de resposta pra equipe avaliar", "sugestão 2 (opcional)"],
   "tipo_peca_designer": "classificação curta do material (Card, Story, Carrossel, Banner, Flyer, Selo...), ou string vazia se tipo nao for arte",
   "pedido_organizado_designer": "pedido de arte organizado pro designer, ou string vazia se tipo nao for arte",
   "resumo_interno": "1-2 frases naturais e humanizadas contando pra equipe o que o cliente queria e o que foi respondido"
@@ -529,7 +596,7 @@ Responda SEMPRE E APENAS em JSON válido, neste formato exato, sem nenhum texto 
 
 _buffer_grupo = {}
 _buffer_lock = threading.Lock()
-DEBOUNCE_SEGUNDOS = 4 * 60  # espera esse tempo (4 minutos) depois da ultima mensagem do
+DEBOUNCE_SEGUNDOS = 7 * 60  # espera esse tempo (7 minutos) depois da ultima mensagem do
 # cliente antes de responder, pra juntar mensagens seguidas (ex: foto + legenda separada,
 # ou varias mensagens mandadas aos poucos) numa unica resposta, em vez de responder uma
 # vez pra cada mensagem separada.
@@ -563,6 +630,16 @@ def extrair_conteudo_mensagem_grupo(key, data):
             os.unlink(caminho)
         else:
             conteudo_texto = "(cliente mandou um áudio que não pôde ser baixado)"
+    elif "video" in message_type.lower():
+        caption = message.get("videoMessage", {}).get("caption", "")
+        # Video nao pode ser analisado (so imagem e PDF sao suportados) - so registra
+        # que chegou um video e a legenda, se tiver. NUNCA inventar que o arquivo "nao
+        # abriu" ou deu erro tecnico - isso e so falta de suporte pra esse tipo de midia,
+        # nao um problema com o arquivo do cliente.
+        conteudo_texto = (
+            f"(cliente mandou um vídeo com a legenda: {caption})" if caption
+            else "(cliente mandou um vídeo, sem legenda nem explicação do que precisa ser feito com ele)"
+        )
     elif "document" in message_type.lower():
         doc_msg = message.get("documentMessage", {})
         caption = doc_msg.get("caption", "")
@@ -572,6 +649,13 @@ def extrair_conteudo_mensagem_grupo(key, data):
         if b64 and ("pdf" in mimetype.lower() or nome_arquivo_doc.lower().endswith(".pdf")):
             pdf_base64 = b64
             conteudo_texto = caption or f"(cliente mandou um PDF/informativo: {nome_arquivo_doc})"
+        elif "video" in mimetype.lower() or nome_arquivo_doc.lower().endswith((".mp4", ".mov", ".avi", ".mkv")):
+            # Alguns celulares mandam video como "documento" em vez de mensagem de video
+            # nativa - mesmo tratamento: nunca dizer que deu erro tecnico ao abrir.
+            conteudo_texto = (
+                f"(cliente mandou um vídeo (arquivo {nome_arquivo_doc}) com a legenda: {caption})" if caption
+                else f"(cliente mandou um vídeo (arquivo {nome_arquivo_doc}), sem legenda nem explicação do que precisa ser feito com ele)"
+            )
         elif b64:
             conteudo_texto = caption or f"(cliente mandou um arquivo que não é PDF: {nome_arquivo_doc})"
         else:
@@ -586,9 +670,23 @@ def processar_mensagem_grupo(remote_jid, grupo, key, data):
     # Quem mandou a mensagem DENTRO do grupo (diferente do remote_jid, que e o
     # ID do grupo). Se for a propria equipe (Torres ou Luan) falando no grupo,
     # o robo nunca deve responder nem entrar na conversa.
-    participant = key.get("participant") or data.get("participant") or ""
-    if participant and any(numero_bate(participant, numero) for numero in NUMEROS_SEM_AUTO_RESPOSTA_EM_GRUPO):
-        print(f"[processar_mensagem_grupo] mensagem da propria equipe/outro agente ({participant}), ignorando", flush=True)
+    # Confere tanto "participant" quanto variantes alternativas que o Whatsapp/Evolution
+    # as vezes manda (ex: quando o remetente usa um identificador "lid" em vez do numero
+    # de telefone direto) - assim a checagem de "e a propria equipe falando" nao falha so
+    # porque o formato do identificador mudou.
+    candidatos_participant = [
+        key.get("participant") or "",
+        key.get("participantAlt") or "",
+        key.get("participantPn") or "",
+        data.get("participant") or "",
+    ]
+    participant = next((c for c in candidatos_participant if c), "")
+    if any(
+        numero_bate(c, numero)
+        for c in candidatos_participant if c
+        for numero in NUMEROS_SEM_AUTO_RESPOSTA_EM_GRUPO
+    ):
+        print(f"[processar_mensagem_grupo] mensagem da propria equipe/outro agente ({candidatos_participant}), ignorando", flush=True)
         return {"skipped": "mensagem da equipe (Torres/Luan) ou de outro agente de IA do time, sem auto-resposta"}
 
     sender_name = data.get("pushName", "cliente")
@@ -661,7 +759,16 @@ def _finalizar_processamento_grupo(chave):
         )
 
     dentro_horario = dentro_do_horario_comercial()
+    regras_extras = listar_regras()
+    bloco_regras = ""
+    if regras_extras:
+        bloco_regras = (
+            "REGRAS ADICIONAIS QUE A EQUIPE DEFINIU (seguir sempre, têm prioridade sobre "
+            "qualquer outra instrução se houver conflito):\n"
+            + "\n".join(f"- {r}" for r in regras_extras) + "\n\n"
+        )
     prompt_usuario = (
+        f"{bloco_regras}"
         f"Nome do cliente: {sender_name}\n"
         f"Grupo: {grupo['nome']}\n"
         f"Está dentro do horário comercial agora? {'sim' if dentro_horario else 'não'}\n"
@@ -699,22 +806,31 @@ def _finalizar_processamento_grupo(chave):
 
     # Avisa Torres e Luan sobre TODO atendimento feito no grupo (nao so os chateados),
     # pra eles ficarem sempre por dentro do que o robo respondeu. Sem anexar foto/PDF aqui.
-    urgente = resultado.get("chateado") or resultado.get("duvida_urgente")
+    duvida_geral = resultado.get("duvida_geral") or resultado.get("duvida_urgente")
+    urgente = resultado.get("chateado") or duvida_geral
     if urgente:
         motivo = []
         if resultado.get("chateado"):
             motivo.append("cliente possivelmente insatisfeito")
-        if resultado.get("duvida_urgente"):
-            motivo.append("caso urgente que o robô não teve certeza de como responder")
+        if duvida_geral:
+            motivo.append("robô não teve certeza de como responder - só mandei uma confirmação genérica pro cliente")
         prefixo = f"🚨 Atenção ({' + '.join(motivo)})"
     else:
         prefixo = "📩 Novo atendimento automático"
+
+    opcoes = [o for o in (resultado.get("opcoes_resposta") or []) if o]
+    bloco_opcoes = ""
+    if duvida_geral and opcoes:
+        bloco_opcoes = "\n\n💡 Sugestões de resposta (se quiser, manda uma dessas ou a sua no grupo):\n" + "\n".join(
+            f"{i+1}) {o}" for i, o in enumerate(opcoes)
+        )
 
     aviso_equipe = (
         f"{prefixo}\n"
         f"*{grupo['nome']}* · {sender_name}\n\n"
         f"{resultado.get('resumo_interno', conteudo_texto)}"
         + ("\n\n📐 Encaminhei o pedido pra Tripa." if encaminhado_designer else "")
+        + bloco_opcoes
     )
     for numero in TEAM_NUMBERS:
         enviar_texto(numero, aviso_equipe)
@@ -1144,6 +1260,19 @@ def processar_dm(remote_jid, key, data):
     texto = message.get("conversation", "")
     if not texto:
         return {"skipped": "DM sem texto (tipo de mensagem não tratado nesta versão)"}
+
+    # Palavra-chave "regra:" tem prioridade maxima sobre qualquer outra logica - e como
+    # Torres/Luan ensinam uma instrucao permanente de atendimento, que passa a valer pra
+    # toda resposta automatica de cliente dali pra frente (guardada no banco).
+    if texto.strip().lower().startswith("regra:"):
+        texto_regra = texto.split(":", 1)[1].strip()
+        if texto_regra:
+            salvar_regra(pessoa, texto_regra)
+            enviar_texto(numero, f'Anotado! ✅ Vou seguir essa regra a partir de agora: "{texto_regra}"')
+            return {"regra_salva": texto_regra, "autor": pessoa}
+        else:
+            enviar_texto(numero, "Entendi que é uma regra nova, mas não veio nenhum texto depois de \"regra:\". Pode mandar de novo com a instrução?")
+            return {"skipped": "regra vazia"}
 
     # Pedido de correção de texto ("corrija o texto com o tom formal/cordial: ...") tem
     # prioridade sobre a lógica de lembrete - não é um lembrete, é outra ferramenta.
