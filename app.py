@@ -116,12 +116,17 @@ def dentro_do_horario_comercial() -> bool:
 
 
 def enviar_texto(numero_ou_jid: str, texto: str):
-    requests.post(
-        f"{EVOLUTION_BASE_URL}/message/sendText/{EVOLUTION_INSTANCE}",
-        headers={"apikey": EVOLUTION_APIKEY, "Content-Type": "application/json"},
-        json={"number": numero_ou_jid, "text": texto},
-        timeout=20,
-    )
+    try:
+        resp = requests.post(
+            f"{EVOLUTION_BASE_URL}/message/sendText/{EVOLUTION_INSTANCE}",
+            headers={"apikey": EVOLUTION_APIKEY, "Content-Type": "application/json"},
+            json={"number": numero_ou_jid, "text": texto},
+            timeout=20,
+        )
+        if resp.status_code >= 400:
+            print(f"[enviar_texto] ERRO {resp.status_code}: {resp.text[:500]}", flush=True)
+    except Exception as e:
+        print(f"[enviar_texto] falhou: {e}", flush=True)
 
 
 def enviar_midia(numero_ou_jid: str, media_base64: str, mediatype: str, caption: str = "", nome_arquivo: str = "arquivo"):
@@ -223,11 +228,19 @@ def chamar_claude(system_prompt, conteudo_usuario, imagem_base64=None, pdf_base6
 # Parte 1: resposta automática nos grupos de cliente
 # --------------------------------------------------------------------------
 
-SYSTEM_PROMPT_ATENDIMENTO = """Você redige mensagens de WhatsApp em nome da KingKong Filmes, uma agência de
+SYSTEM_PROMPT_ATENDIMENTO = """Você redige mensagens de WhatsApp em nome da Correria, uma agência de
 marketing digital, respondendo clientes que mandam pedidos ou dúvidas em grupos de WhatsApp.
 A agência atende três tipos de demanda: pedidos de arte (peças gráficas), pedidos de gravação
 (vídeos/filmagens) e dúvidas gerais (status, prazos, etc). A empresa só presta atendimento,
 nunca tenta vender nada na resposta.
+
+ESCOPO DE SERVIÇO: a Correria é uma agência de marketing digital que atende empresas
+(conteúdo de redes sociais, vídeos, artes, campanhas). Ela NÃO faz cobertura de eventos sociais
+pessoais como casamento, aniversário de família, formatura, etc. Se o cliente perguntar sobre um
+serviço claramente fora desse escopo, a resposta NUNCA deve dar a entender que a agência oferece
+isso, nem dizer que "a equipe vai retornar com as possibilidades" ou algo que soe como confirmação
+- só reconheça o recebimento da mensagem de forma neutra e diga que a equipe vai dar um retorno,
+sem sugerir que esse tipo de serviço é algo que a agência faz.
 
 TOM: sempre formal e super amigável ao mesmo tempo. Trate o cliente pelo nome quando disponível.
 Nunca soe como um robô: nunca repita a mesma frase pronta - sempre reformule com suas próprias
