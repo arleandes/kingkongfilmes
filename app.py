@@ -751,6 +751,17 @@ simples, um item por linha. Se faltar alguma informação importante pra fazer a
 claramente no pedido também. Quando "tipo" NÃO for "arte", inclua as duas chaves mesmo assim, só
 que com string vazia "" nas duas.
 
+PROMESSA/COMPROMISSO ASSUMIDO: analise se a "resposta_cliente" (ou o que ficou combinado nessa
+conversa) inclui algum compromisso concreto que a agência está assumindo com prazo ou ação
+específica (ex: "vamos te enviar até amanhã", "a equipe vai revisar isso ainda hoje", "conseguimos
+entregar até sexta"). Se sim, marque "eh_promessa" como true e preencha "texto_promessa" com um
+resumo curto e claro desse compromisso, incluindo o cliente e o prazo/ação combinados (ex:
+"Prometido pro cliente Terapia: entregar a arte da promoção até amanhã") - isso é usado pra avisar
+a equipe e guardar de lembrete, pra não esquecer o que foi prometido e servir de registro caso o
+cliente cobre depois. Quando não houver nenhum compromisso concreto (ex: só uma confirmação
+genérica de recebimento, sem prazo/ação específica prometida), "eh_promessa" é false e
+"texto_promessa" fica vazio.
+
 RESUMO INTERNO HUMANIZADO: o campo "resumo_interno" é a mensagem que Torres e Luan vão ler pra
 saber rapidamente o que aconteceu naquele atendimento, então precisa ser natural e fácil de
 entender de primeira - escreva como se estivesse contando pra um colega o que rolou, em 1-2 frases
@@ -770,6 +781,8 @@ Responda SEMPRE E APENAS em JSON válido, neste formato exato, sem nenhum texto 
   "opcoes_resposta": ["sugestão 1 de resposta pra equipe avaliar", "sugestão 2 (opcional)"],
   "tipo_peca_designer": "classificação curta do material (Card, Story, Carrossel, Banner, Flyer, Selo...), ou string vazia se tipo nao for arte",
   "pedido_organizado_designer": "pedido de arte organizado pro designer, ou string vazia se tipo nao for arte",
+  "eh_promessa": true ou false,
+  "texto_promessa": "resumo curto do compromisso assumido com o cliente (com prazo/acao), ou string vazia",
   "resumo_interno": "1-2 frases naturais e humanizadas contando pra equipe o que o cliente queria e o que foi respondido"
 }
 """
@@ -1036,6 +1049,12 @@ def _finalizar_processamento_grupo(chave):
     for numero in TEAM_NUMBERS:
         enviar_texto(numero, aviso_equipe)
 
+    # Se a resposta pareceu assumir um compromisso concreto com o cliente (prazo/acao), avisa
+    # Torres e Luan no privado perguntando se devem guardar isso de lembrete - assim nada
+    # prometido fica só na conversa do grupo, esquecido.
+    if resultado.get("eh_promessa") and resultado.get("texto_promessa"):
+        notificar_promessa_detectada(resultado["texto_promessa"])
+
     print(f"[_finalizar_processamento_grupo] concluido pra {remote_jid}: {resultado}", flush=True)
 
 
@@ -1051,7 +1070,19 @@ DM de WhatsApp com {pessoa_nome}, sócio/responsável da agência. A data/hora a
 um pedido de lembrete não é um comando pro Tripa, um fato pra guardar não é um lembrete, etc):
 
 1) PEDIDO DE NOVO LEMBRETE (ex: "me lembra de ligar pro cliente X às 15h", "lembra eu de mandar o
-   orçamento amanhã de manhã") - algo que {pessoa_nome} mesmo(a) quer ser lembrado(a) de fazer.
+   orçamento amanhã de manhã", "lembra o Luan de mandar a nota fiscal do Novo Mix", "me lembra de
+   pagar as contas da contabilidade dia 20 de cada mês") - algo que alguém (o próprio
+   {pessoa_nome}, o outro sócio, ou a equipe do Tripa) precisa ser lembrado(a) de fazer.
+   Preencha "destinatario_lembrete" com quem deve RECEBER o lembrete: "torres", "luan" ou "tripa".
+   Se {pessoa_nome} disser "me lembra"/"eu preciso lembrar" (sobre si mesmo), o destinatário é o
+   próprio {pessoa_nome}. Se disser "lembra o Luan"/"lembra a Luan" (o outro sócio), destinatário é
+   "luan" (ou "torres" se for o Luan pedindo pra lembrar o Torres). Se for algo pro grupo de design,
+   destinatário é "tripa". Se o pedido for recorrente (ex: "todo dia 20", "toda segunda-feira",
+   "todo mês") em vez de uma data única, preencha "eh_recorrente" como true e "recorrencia_dia_mes"
+   com o dia do mês (1-31) em que deve repetir todo mês; se for pontual (uma data específica),
+   "eh_recorrente" é false e "recorrencia_dia_mes" fica vazio. Em "data_hora_alvo_iso" preencha
+   sempre a próxima ocorrência (data e horário), mesmo quando for recorrente - o horário do dia é o
+   que se repete todo mês nos recorrentes.
 
 2) FATO PRA GUARDAR NA MEMÓRIA (ex: "o Luan gosta da cor rosa", "o cliente Terapia prefere painel
    roxo", "meu aniversário é dia X") - uma informação/preferência que não é uma tarefa nem um
@@ -1094,50 +1125,98 @@ interpretando horários relativos ao "agora" informado acima.
 Responda SEMPRE E APENAS em JSON válido, numa única linha por valor, neste formato exato,
 sem usar bloco de código markdown (nada de ```) e sem quebras de linha dentro dos valores. Inclua
 TODAS as chaves sempre, mesmo vazias/false quando não se aplicarem:
-{"eh_pedido_de_lembrete": true ou false, "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_pergunta_sobre_grupo": true ou false, "grupo_perguntado": "nome do grupo mencionado, ou string vazia", "eh_comando_para_tripa": true ou false, "mensagem_tripa": "texto pronto pra encaminhar pro grupo Tripa, ou string vazia", "tem_cobranca": true ou false, "horario_cobranca_iso": "horario ISO da cobranca, ou string vazia", "pergunta_cobranca": "pergunta curta pra mandar na cobranca, ou string vazia", "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/3/4 acima for verdadeiro"}
+{"eh_pedido_de_lembrete": true ou false, "destinatario_lembrete": "torres, luan ou tripa - quem deve receber o lembrete", "eh_recorrente": true ou false, "recorrencia_dia_mes": "dia do mes (1-31) se for recorrente mensal, ou string vazia", "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_pergunta_sobre_grupo": true ou false, "grupo_perguntado": "nome do grupo mencionado, ou string vazia", "eh_comando_para_tripa": true ou false, "mensagem_tripa": "texto pronto pra encaminhar pro grupo Tripa, ou string vazia", "tem_cobranca": true ou false, "horario_cobranca_iso": "horario ISO da cobranca, ou string vazia", "pergunta_cobranca": "pergunta curta pra mandar na cobranca, ou string vazia", "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/3/4 acima for verdadeiro"}
 """
 
 
-# guarda no máximo 1 lembrete ativo por pessoa: {"torres": {...}, "luan": {...}}
+# guarda no máximo 1 lembrete ativo por destinatario: {"torres": {...}, "luan": {...}, "tripa": {...}}
+# - destinatario e quem deve RECEBER o lembrete, que pode ser diferente de quem pediu (ex:
+# Torres pede pra lembrar o Luan de algo).
 lembretes_ativos = {}
 
 
-def enviar_lembrete(pessoa, numero, texto_lembrete, primeira_vez):
+def enviar_lembrete(destinatario, numero_ou_jid, texto_lembrete, primeira_vez):
     prefixo = "⏰ Lembrete!" if primeira_vez else "⏰ Lembrete (ainda pendente):"
-    enviar_texto(numero, f"{prefixo} {texto_lembrete}")
+    enviar_texto(numero_ou_jid, f"{prefixo} {texto_lembrete}")
 
 
-def agendar_nag(pessoa, numero, texto_lembrete):
+def agendar_nag(destinatario, numero_ou_jid, texto_lembrete):
     def checar_e_reenviar():
-        info = lembretes_ativos.get(pessoa)
+        info = lembretes_ativos.get(destinatario)
         if not info or info.get("resolvido"):
             return
-        enviar_lembrete(pessoa, numero, texto_lembrete, primeira_vez=False)
+        enviar_lembrete(destinatario, numero_ou_jid, texto_lembrete, primeira_vez=False)
 
-    job = scheduler.add_job(checar_e_reenviar, "interval", minutes=30, id=f"nag-{pessoa}", replace_existing=True)
+    job = scheduler.add_job(checar_e_reenviar, "interval", minutes=30, id=f"nag-{destinatario}", replace_existing=True)
     return job
 
 
-def agendar_lembrete(pessoa, numero, data_hora_alvo: datetime, texto_lembrete: str):
-    aviso_em = data_hora_alvo - timedelta(minutes=10)
+def agendar_lembrete(destinatario, numero_ou_jid, data_hora_alvo: datetime, texto_lembrete: str, repetir_ate_confirmar=True):
+    """Agenda um lembrete pontual (uma unica data/hora). Pra Torres/Luan avisa 10 min antes e
+    fica cobrando (nag a cada 30 min) ate a pessoa responder alguma coisa no privado. Pro
+    grupo Tripa nao da pra saber quem "resolveu" a cobranca, entao manda so uma vez, na hora
+    certa, sem ficar repetindo (igual a cobranca de comando pro Tripa que ja existia)."""
     agora_utc = datetime.now(timezone.utc)
-    if aviso_em <= agora_utc:
-        aviso_em = agora_utc + timedelta(seconds=5)
-
-    lembretes_ativos[pessoa] = {
-        "texto": texto_lembrete,
-        "alvo": data_hora_alvo.isoformat(),
-        "resolvido": False,
-    }
+    if repetir_ate_confirmar:
+        aviso_em = data_hora_alvo - timedelta(minutes=10)
+        if aviso_em <= agora_utc:
+            aviso_em = agora_utc + timedelta(seconds=5)
+        lembretes_ativos[destinatario] = {
+            "texto": texto_lembrete,
+            "alvo": data_hora_alvo.isoformat(),
+            "resolvido": False,
+        }
+    else:
+        aviso_em = data_hora_alvo if data_hora_alvo > agora_utc else agora_utc + timedelta(seconds=5)
 
     def disparar_primeiro_aviso():
-        info = lembretes_ativos.get(pessoa)
-        if not info or info.get("resolvido"):
-            return
-        enviar_lembrete(pessoa, numero, texto_lembrete, primeira_vez=True)
-        agendar_nag(pessoa, numero, texto_lembrete)
+        if repetir_ate_confirmar:
+            info = lembretes_ativos.get(destinatario)
+            if not info or info.get("resolvido"):
+                return
+            enviar_lembrete(destinatario, numero_ou_jid, texto_lembrete, primeira_vez=True)
+            agendar_nag(destinatario, numero_ou_jid, texto_lembrete)
+        else:
+            enviar_lembrete(destinatario, numero_ou_jid, texto_lembrete, primeira_vez=True)
 
-    scheduler.add_job(disparar_primeiro_aviso, "date", run_date=aviso_em, id=f"lembrete-{pessoa}-{int(time.time())}")
+    scheduler.add_job(disparar_primeiro_aviso, "date", run_date=aviso_em, id=f"lembrete-{destinatario}-{int(time.time())}")
+
+
+def agendar_lembrete_recorrente(destinatario, numero_ou_jid, dia_mes: int, hora: int, minuto: int, texto_lembrete: str, repetir_ate_confirmar=True):
+    """Agenda um lembrete que se repete todo mes, num dia fixo (ex: dia 20), no horario
+    informado (horario de Bahia - convertido pra UTC, que e o fuso do scheduler)."""
+    hora_utc = (hora + 3) % 24  # Bahia = UTC-3 (sem horario de verao) -> UTC = Bahia + 3h
+
+    def disparar():
+        if repetir_ate_confirmar:
+            lembretes_ativos[destinatario] = {
+                "texto": texto_lembrete, "alvo": f"todo dia {dia_mes} do mes", "resolvido": False,
+            }
+            enviar_lembrete(destinatario, numero_ou_jid, texto_lembrete, primeira_vez=True)
+            agendar_nag(destinatario, numero_ou_jid, texto_lembrete)
+        else:
+            enviar_lembrete(destinatario, numero_ou_jid, texto_lembrete, primeira_vez=True)
+
+    scheduler.add_job(
+        disparar, "cron", day=dia_mes, hour=hora_utc, minute=minuto,
+        id=f"lembrete-recorrente-{destinatario}-{dia_mes}-{hora_utc}{minuto}",
+        replace_existing=True,
+    )
+
+
+def resolver_destinatario_lembrete(destinatario_lembrete):
+    """Traduz o campo 'destinatario_lembrete' do classificador (torres/luan/tripa) pra
+    (chave interna, numero/jid de envio, nome de exibicao, se deve repetir cobrando ate
+    confirmar). Devolve None quando o campo veio vazio/nao reconhecido, pra quem chamou usar
+    o padrao (a propria pessoa que pediu o lembrete)."""
+    d = normalizar_texto(destinatario_lembrete or "")
+    if d == "luan":
+        return "luan", LUAN_NUMBER, "o Luan", True
+    if d == "torres":
+        return "torres", TORRES_NUMBER, "o Torres", True
+    if d == "tripa":
+        return "tripa", TRIPA_DESIGNER_JID, "o grupo Tripa", False
+    return None
 
 
 def agendar_cobranca_tripa(horario_alvo: datetime, pergunta: str):
@@ -1156,6 +1235,24 @@ def agendar_cobranca_tripa(horario_alvo: datetime, pergunta: str):
 # serem enviados de verdade - guarda no maximo 1 comando pendente por pessoa (torres/luan).
 _comandos_pendentes = {}
 _COMANDO_PENDENTE_TTL = 30 * 60  # descarta comando nao confirmado depois de 30 min
+
+# Compromissos/promessas que a resposta automatica pareceu assumir com um cliente, aguardando
+# confirmacao de Torres OU Luan (qualquer um dos dois responde) antes de virar um fato salvo.
+_promessas_pendentes = []
+_PROMESSA_PENDENTE_TTL = 30 * 60
+
+
+def notificar_promessa_detectada(texto_promessa):
+    """Quando a resposta automatica a um cliente pareceu assumir um compromisso concreto
+    (prazo/acao), avisa Torres e Luan no privado perguntando se devem guardar isso de
+    lembrete - assim nada fica prometido e esquecido só na conversa do grupo."""
+    _promessas_pendentes.append({"texto": texto_promessa, "criado_em": time.time()})
+    aviso = (
+        f"🔔 Percebi um possível compromisso assumido com um cliente:\n\n\"{texto_promessa}\"\n\n"
+        "Quer que eu guarde isso pra não esquecer? (responde \"sim\" ou \"não\")"
+    )
+    for numero in TEAM_NUMBERS:
+        enviar_texto(numero, aviso)
 
 
 def parece_confirmacao(texto: str):
@@ -1649,6 +1746,26 @@ def processar_dm(remote_jid, key, data):
         # mensagem nova, ou uma correcao ao comando pendente - nesse caso o comando antigo
         # so expira depois do TTL, ou e substituido se essa mensagem virar um novo comando).
 
+    # Se tem uma promessa detectada aguardando confirmacao (Torres OU Luan podem responder -
+    # nao e por pessoa como o comando pro Tripa, porque os dois recebem o aviso), confere a
+    # mais antiga primeiro. Descarta as que passaram do TTL sem resposta.
+    agora_ts = time.time()
+    while _promessas_pendentes and (agora_ts - _promessas_pendentes[0]["criado_em"]) > _PROMESSA_PENDENTE_TTL:
+        _promessas_pendentes.pop(0)
+    if _promessas_pendentes:
+        confirma_promessa = parece_confirmacao(texto)
+        if confirma_promessa is True:
+            promessa = _promessas_pendentes.pop(0)
+            salvar_fato(pessoa, promessa["texto"])
+            enviar_texto(numero, f"Anotado! ✅ Vou guardar: \"{promessa['texto']}\"")
+            return {"promessa_guardada": promessa["texto"]}
+        elif confirma_promessa is False:
+            _promessas_pendentes.pop(0)
+            enviar_texto(numero, "Beleza, não guardei nada.")
+            return {"promessa_descartada": True}
+        # None: nao pareceu confirmacao, segue o fluxo normal - a promessa continua na fila
+        # esperando ate o TTL expirar ou alguem confirmar/recusar.
+
     # Se já existe lembrete pendente pra essa pessoa, qualquer resposta encerra o nag.
     tinha_pendente = marcar_resolvido(pessoa)
 
@@ -1680,8 +1797,31 @@ def processar_dm(remote_jid, key, data):
         except Exception:
             enviar_texto(numero, "Entendi que você quer um lembrete, mas não consegui identificar o horário certinho. Pode me falar de novo com a hora?")
             return {"erro": "não conseguiu parsear data_hora_alvo_iso", "resultado": resultado}
-        agendar_lembrete(pessoa, numero, alvo, resultado.get("texto_lembrete", texto))
-        enviar_texto(numero, f"Combinado! Vou te lembrar 10 min antes: \"{resultado.get('texto_lembrete', texto)}\" 👍")
+
+        texto_lembrete = resultado.get("texto_lembrete", texto)
+        destino = resolver_destinatario_lembrete(resultado.get("destinatario_lembrete"))
+        if destino:
+            destinatario_key, numero_destino, quem_recebe, repetir = destino
+        else:
+            destinatario_key, numero_destino, quem_recebe, repetir = pessoa, numero, "você", True
+
+        eh_recorrente = bool(resultado.get("eh_recorrente"))
+        dia_mes_str = str(resultado.get("recorrencia_dia_mes") or "").strip()
+        if eh_recorrente and dia_mes_str:
+            try:
+                dia_mes = max(1, min(31, int(dia_mes_str)))
+            except Exception:
+                dia_mes = alvo.day
+            agendar_lembrete_recorrente(destinatario_key, numero_destino, dia_mes, alvo.hour, alvo.minute, texto_lembrete, repetir_ate_confirmar=repetir)
+            quando = f"todo dia {dia_mes} de cada mês às {alvo.strftime('%H:%M')}"
+        else:
+            agendar_lembrete(destinatario_key, numero_destino, alvo, texto_lembrete, repetir_ate_confirmar=repetir)
+            quando = f"às {alvo.strftime('%H:%M')}" if not repetir else "10 min antes"
+
+        if quem_recebe == "você":
+            enviar_texto(numero, f"Combinado! Vou te lembrar {quando}: \"{texto_lembrete}\" 👍")
+        else:
+            enviar_texto(numero, f"Combinado! Vou lembrar {quem_recebe} {quando}: \"{texto_lembrete}\" 👍")
     elif resultado.get("eh_fato_para_lembrar") and resultado.get("fato_texto"):
         salvar_fato(pessoa, resultado["fato_texto"])
         enviar_texto(numero, f"Anotado! ✅ Vou lembrar: \"{resultado['fato_texto']}\"")
