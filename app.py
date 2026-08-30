@@ -325,9 +325,9 @@ Responda SEMPRE E APENAS em JSON válido, neste formato exato, sem nenhum texto 
 
 _buffer_grupo = {}
 _buffer_lock = threading.Lock()
-DEBOUNCE_SEGUNDOS = 8  # espera esse tempo depois da ultima mensagem do cliente antes de
-# responder, pra juntar mensagens seguidas (ex: foto + legenda separada, ou varias
-# mensagens encaminhadas em sequencia) numa unica resposta, em vez de responder uma
+DEBOUNCE_SEGUNDOS = 4 * 60  # espera esse tempo (4 minutos) depois da ultima mensagem do
+# cliente antes de responder, pra juntar mensagens seguidas (ex: foto + legenda separada,
+# ou varias mensagens mandadas aos poucos) numa unica resposta, em vez de responder uma
 # vez pra cada mensagem separada.
 
 
