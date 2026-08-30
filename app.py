@@ -314,16 +314,18 @@ Responda SEMPRE E APENAS em JSON válido, neste formato exato, sem nenhum texto 
 """
 
 
-def processar_mensagem_grupo(remote_jid, grupo, key, data):
-    # Quem mandou a mensagem DENTRO do grupo (diferente do remote_jid, que e o
-    # ID do grupo). Se for a propria equipe (Torres ou Luan) falando no grupo,
-    # o robo nunca deve responder nem entrar na conversa.
-    participant = key.get("participant") or data.get("participant") or ""
-    if participant and (numero_bate(participant, TORRES_NUMBER) or numero_bate(participant, LUAN_NUMBER)):
-        print(f"[processar_mensagem_grupo] mensagem da propria equipe ({participant}), ignorando", flush=True)
-        return {"skipped": "mensagem da equipe (Torres/Luan), sem auto-resposta"}
+_buffer_grupo = {}
+_buffer_lock = threading.Lock()
+DEBOUNCE_SEGUNDOS = 8  # espera esse tempo depois da ultima mensagem do cliente antes de
+# responder, pra juntar mensagens seguidas (ex: foto + legenda separada, ou varias
+# mensagens encaminhadas em sequencia) numa unica resposta, em vez de responder uma
+# vez pra cada mensagem separada.
 
-    sender_name = data.get("pushName", "cliente")
+
+def extrair_conteudo_mensagem_grupo(key, data):
+    """Extrai o conteudo de UMA mensagem (texto/imagem/audio/documento) de um grupo de
+    cliente. Devolve (conteudo_texto, imagem_base64, pdf_base64, nome_arquivo_doc), ou
+    (None, None, None, None) se o tipo de mensagem nao for tratado."""
     message = data.get("message", {})
     message_type = data.get("messageType", "")
 
@@ -362,10 +364,88 @@ def processar_mensagem_grupo(remote_jid, grupo, key, data):
         else:
             conteudo_texto = "(cliente mandou um arquivo que não pôde ser baixado)"
     else:
-        return {"skipped": f"tipo de mensagem não tratado: {message_type}"}
+        return None, None, None, None
+
+    return conteudo_texto, imagem_base64, pdf_base64, nome_arquivo_doc
+
+
+def processar_mensagem_grupo(remote_jid, grupo, key, data):
+    # Quem mandou a mensagem DENTRO do grupo (diferente do remote_jid, que e o
+    # ID do grupo). Se for a propria equipe (Torres ou Luan) falando no grupo,
+    # o robo nunca deve responder nem entrar na conversa.
+    participant = key.get("participant") or data.get("participant") or ""
+    if participant and (numero_bate(participant, TORRES_NUMBER) or numero_bate(participant, LUAN_NUMBER)):
+        print(f"[processar_mensagem_grupo] mensagem da propria equipe ({participant}), ignorando", flush=True)
+        return {"skipped": "mensagem da equipe (Torres/Luan), sem auto-resposta"}
+
+    sender_name = data.get("pushName", "cliente")
+    conteudo_texto, imagem_base64, pdf_base64, nome_arquivo_doc = extrair_conteudo_mensagem_grupo(key, data)
 
     if not conteudo_texto:
-        return {"skipped": "sem conteúdo pra processar"}
+        return {"skipped": "sem conteúdo pra processar ou tipo não tratado"}
+
+    # Junta essa mensagem com outras que cheguem do mesmo cliente nos proximos
+    # segundos, e so processa tudo junto depois que ele parar de mandar mensagem -
+    # assim evita responder varias vezes separadas pra um unico pedido que veio
+    # fatiado em mais de uma mensagem.
+    chave = (remote_jid, participant or "sem_participant")
+    with _buffer_lock:
+        buf = _buffer_grupo.get(chave)
+        if buf is None:
+            buf = {
+                "grupo": grupo,
+                "remote_jid": remote_jid,
+                "sender_name": sender_name,
+                "textos": [],
+                "imagem_base64": None,
+                "pdf_base64": None,
+                "midias_designer": [],
+                "timer": None,
+            }
+            _buffer_grupo[chave] = buf
+        buf["textos"].append(conteudo_texto)
+        buf["sender_name"] = sender_name
+        if imagem_base64:
+            if not buf["imagem_base64"]:
+                buf["imagem_base64"] = imagem_base64
+            buf["midias_designer"].append(("image", imagem_base64, "imagem.jpg"))
+        if pdf_base64:
+            if not buf["pdf_base64"]:
+                buf["pdf_base64"] = pdf_base64
+            buf["midias_designer"].append(("document", pdf_base64, nome_arquivo_doc))
+
+        if buf["timer"]:
+            buf["timer"].cancel()
+        timer = threading.Timer(DEBOUNCE_SEGUNDOS, _finalizar_processamento_grupo, args=(chave,))
+        timer.daemon = True
+        buf["timer"] = timer
+        timer.start()
+
+    return {"aguardando": f"mensagem adicionada ao buffer, processa em {DEBOUNCE_SEGUNDOS}s se o cliente nao mandar mais nada"}
+
+
+def _finalizar_processamento_grupo(chave):
+    with _buffer_lock:
+        buf = _buffer_grupo.pop(chave, None)
+    if not buf:
+        return
+
+    grupo = buf["grupo"]
+    remote_jid = buf["remote_jid"]
+    sender_name = buf["sender_name"]
+    textos = buf["textos"]
+    imagem_base64 = buf.get("imagem_base64")
+    pdf_base64 = buf.get("pdf_base64")
+    midias_designer = buf.get("midias_designer", [])
+
+    if len(textos) == 1:
+        conteudo_texto = textos[0]
+    else:
+        conteudo_texto = (
+            f"O cliente mandou isso em {len(textos)} mensagens seguidas - trate como uma "
+            "unica solicitacao, nao como pedidos separados, e responda so uma vez pra tudo "
+            "junto:\n" + "\n".join(f"{i+1}) {t}" for i, t in enumerate(textos))
+        )
 
     dentro_horario = dentro_do_horario_comercial()
     prompt_usuario = (
@@ -375,14 +455,18 @@ def processar_mensagem_grupo(remote_jid, grupo, key, data):
         f"Mensagem do cliente: {conteudo_texto}"
     )
 
-    resultado = chamar_claude(SYSTEM_PROMPT_ATENDIMENTO, prompt_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64)
+    try:
+        resultado = chamar_claude(SYSTEM_PROMPT_ATENDIMENTO, prompt_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64)
+    except Exception as e:
+        print(f"[_finalizar_processamento_grupo] erro claude: {e}", flush=True)
+        return
 
     resposta_cliente = resultado.get("resposta_cliente", "")
     if resposta_cliente:
         enviar_texto(remote_jid, resposta_cliente)
 
     # Pedido de arte: organiza e encaminha pro grupo Tripa Designer, junto com
-    # a foto/PDF que o cliente mandou (se tiver).
+    # todas as fotos/PDFs que o cliente mandou nessa leva de mensagens (se tiver).
     pedido_designer = resultado.get("pedido_organizado_designer") or ""
     encaminhado_designer = False
     if resultado.get("tipo") == "arte" and pedido_designer:
@@ -390,10 +474,8 @@ def processar_mensagem_grupo(remote_jid, grupo, key, data):
             f"📋 Novo pedido de arte — Cliente: {grupo['nome']}\n\n{pedido_designer}"
         )
         enviar_texto(TRIPA_DESIGNER_JID, mensagem_tripa)
-        if imagem_base64:
-            enviar_midia(TRIPA_DESIGNER_JID, imagem_base64, "image", caption=f"Imagem do pedido - {grupo['nome']}")
-        if pdf_base64:
-            enviar_midia(TRIPA_DESIGNER_JID, pdf_base64, "document", caption=f"Arquivo do pedido - {grupo['nome']}", nome_arquivo=nome_arquivo_doc)
+        for tipo_midia, midia_b64, nome_arquivo in midias_designer:
+            enviar_midia(TRIPA_DESIGNER_JID, midia_b64, tipo_midia, caption=f"Anexo do pedido - {grupo['nome']}", nome_arquivo=nome_arquivo)
         encaminhado_designer = True
 
     # Avisa Torres e Luan sobre TODO atendimento feito no grupo (nao so os chateados),
@@ -420,7 +502,7 @@ def processar_mensagem_grupo(remote_jid, grupo, key, data):
     for numero in TEAM_NUMBERS:
         enviar_texto(numero, aviso_equipe)
 
-    return {"resultado": resultado}
+    print(f"[_finalizar_processamento_grupo] concluido pra {remote_jid}: {resultado}", flush=True)
 
 
 # --------------------------------------------------------------------------
