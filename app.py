@@ -333,8 +333,11 @@ def buscar_mensagens_recentes_grupo(grupo_jid, limite=30):
 def identificar_grupo_mencionado(texto):
     """Procura, no texto de uma mensagem de DM, o nome de algum grupo de cliente
     conhecido (comparacao sem acento/case, por substring) - pra Torres/Luan poderem
-    perguntar sobre um grupo pelo nome sem precisar citar o JID."""
+    perguntar sobre um grupo pelo nome sem precisar citar o JID. O grupo Tripa (interno)
+    tambem pode ser perguntado assim, ja que o historico dele tambem fica registrado."""
     texto_norm = normalizar_texto(texto)
+    if "tripa" in texto_norm:
+        return TRIPA_DESIGNER_JID
     melhor = None
     for jid, info in GRUPOS.items():
         if info.get("interno"):
@@ -1344,12 +1347,48 @@ def comparar_arte_com_pedido(pedido_texto, imagem_base64, pdf_base64):
     return bate, texto_resp, resultado
 
 
+def _extrair_texto_log_tripa(data, message_type):
+    """Extrai um texto simples pra registrar no historico do grupo Tripa, cobrindo os
+    tipos de mensagem mais comuns (texto, imagem/documento/video com ou sem legenda,
+    audio). Devolve None quando nao ha nada relevante pra logar (ex: reacao, sticker) -
+    isso e so pra guardar o historico, nao interfere na logica de revisao de peca."""
+    message = data.get("message", {})
+    tipo = (message_type or "").lower()
+    if message.get("conversation"):
+        return message.get("conversation")
+    if message.get("extendedTextMessage", {}).get("text"):
+        return message["extendedTextMessage"]["text"]
+    if "image" in tipo:
+        caption = message.get("imageMessage", {}).get("caption", "")
+        return f"[imagem] {caption}" if caption else "[imagem enviada]"
+    if "document" in tipo:
+        caption = message.get("documentMessage", {}).get("caption", "")
+        return f"[arquivo] {caption}" if caption else "[arquivo enviado]"
+    if "video" in tipo:
+        caption = message.get("videoMessage", {}).get("caption", "")
+        return f"[vídeo] {caption}" if caption else "[vídeo enviado]"
+    if "audio" in tipo:
+        return "[áudio enviado]"
+    return None
+
+
 def processar_revisao_grupo_designer(remote_jid, key, data):
     """No grupo Tripa Designer: se alguem postar uma foto/PDF de peca, revisa a ortografia
     e SEMPRE avisa no grupo o resultado (bateu ou nao bateu). Se a legenda citar o nome de
     um cliente (ex: "terapia") e tiver um pedido de arte pendente daquele cliente, TAMBEM
     compara a arte com o pedido original e avisa o resultado dessa comparação também."""
     message_type = data.get("messageType", "")
+
+    # Registra TUDO que acontece no grupo Tripa (texto, imagem, arquivo, video, audio) no
+    # historico, mesmo mensagens que nao viram revisao de peca - assim da pra perguntar
+    # depois no privado "o que rolou no Tripa" e a Cintia sabe responder.
+    conteudo_log_tripa = _extrair_texto_log_tripa(data, message_type)
+    if conteudo_log_tripa:
+        registrar_mensagem_grupo(
+            remote_jid, GRUPOS.get(remote_jid, {}).get("nome", "Tripa"),
+            data.get("pushName", "equipe"), conteudo_log_tripa, True,
+        )
+
     imagem_base64, pdf_base64, caption, aviso = extrair_midia_para_revisao(key, data, message_type)
     if aviso:
         # No grupo nao mandamos os avisos de "nao consegui baixar" pra nao gerar ruido -
@@ -1503,16 +1542,25 @@ def processar_dm(remote_jid, key, data):
     else:
         return {"skipped": "DM de número não reconhecido"}
 
+    # Registra TUDO que Torres/Luan falam ou mandam no privado com a Cintia, pra servir
+    # de historico/backup (assim como ja fazemos com os grupos de cliente) - sistema de
+    # defesa contra falha/esquecimento, nao so pra lembrete/fato/comando reconhecido.
+    grupo_jid_dm = f"dm_{pessoa}"
+    grupo_nome_dm = "Privado - Torres" if pessoa == "torres" else "Privado - Luan"
+
     message = data.get("message", {})
     message_type = data.get("messageType", "")
 
     # Foto ou PDF no privado = pedido de revisao de peca (nao de lembrete).
     if "image" in message_type.lower() or "document" in message_type.lower():
+        registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, pessoa, "[enviou imagem/PDF pra revisão de arte]", True)
         return revisar_arte_dm(numero, key, data, message_type)
 
     texto = message.get("conversation", "")
     if not texto:
         return {"skipped": "DM sem texto (tipo de mensagem não tratado nesta versão)"}
+
+    registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, pessoa, texto, True)
 
     # Palavra-chave "regra:" tem prioridade maxima sobre qualquer outra logica - e como
     # Torres/Luan ensinam uma instrucao permanente de atendimento, que passa a valer pra
