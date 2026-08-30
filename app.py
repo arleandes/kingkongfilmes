@@ -187,7 +187,15 @@ def init_db():
                     criado_em TIMESTAMPTZ NOT NULL DEFAULT now()
                 )
             """)
-        print(f"[init_db] banco de dados pronto (schema '{DB_SCHEMA}', tabelas tarefas/tarefas_eventos/regras_atendimento)", flush=True)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS fatos_memoria (
+                    id SERIAL PRIMARY KEY,
+                    autor TEXT,
+                    texto TEXT NOT NULL,
+                    criado_em TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+        print(f"[init_db] banco de dados pronto (schema '{DB_SCHEMA}', tabelas tarefas/tarefas_eventos/regras_atendimento/fatos_memoria)", flush=True)
     except Exception as e:
         print(f"[init_db] erro ao inicializar banco de dados: {e}", flush=True)
 
@@ -225,6 +233,42 @@ def listar_regras():
             return []
     with _regras_lock:
         return [r["texto"] for r in _regras_memoria]
+
+
+# Fatos soltos que Torres/Luan contam no privado (preferencias, informacoes de clientes,
+# etc - ex: "Luan gosta da cor rosa") e que o bot deve conseguir recuperar depois quando
+# perguntado, em vez de responder de forma generica/aleatoria. Mesmo padrao hibrido
+# banco+memoria das regras de atendimento.
+_fatos_memoria = []
+_fatos_lock = threading.Lock()
+
+
+def salvar_fato(autor, texto):
+    if DATABASE_URL:
+        try:
+            with db_cursor(commit=True) as cur:
+                cur.execute(
+                    "INSERT INTO fatos_memoria (autor, texto) VALUES (%s, %s)",
+                    (autor, texto),
+                )
+            return
+        except Exception as e:
+            print(f"[salvar_fato] banco de dados falhou, usando fallback em memoria: {e}", flush=True)
+    with _fatos_lock:
+        _fatos_memoria.append({"autor": autor, "texto": texto})
+
+
+def listar_fatos():
+    if DATABASE_URL:
+        try:
+            with db_cursor() as cur:
+                cur.execute("SELECT texto FROM fatos_memoria ORDER BY criado_em ASC")
+                return [r["texto"] for r in cur.fetchall()]
+        except Exception as e:
+            print(f"[listar_fatos] erro: {e}", flush=True)
+            return []
+    with _fatos_lock:
+        return [r["texto"] for r in _fatos_memoria]
 
 
 def criar_tarefa(cliente_nome, grupo_jid, tipo_peca, descricao, autor="cliente"):
@@ -869,25 +913,46 @@ SYSTEM_PROMPT_LEMBRETE = """Você é a Cintia, assistente virtual da Correria, f
 DM de WhatsApp com {pessoa_nome}, sócio/responsável da agência. A data/hora atual é: {agora_iso}
 (horário de Brasília, America/Bahia).
 
-Decida se a mensagem é um PEDIDO DE NOVO LEMBRETE (ex: "me lembra de ligar pro cliente X às 15h",
-"lembra eu de mandar o orçamento amanhã de manhã") ou OUTRA COISA (uma pergunta, um comentário, um
-pedido/comando qualquer, ou uma resposta a um lembrete anterior).
+{contexto_fatos}Classifique a mensagem em UM dos tipos abaixo (o mais específico que se aplicar -
+um pedido de lembrete não é um comando pro Tripa, um fato pra guardar não é um lembrete, etc):
 
-IMPORTANTE: o campo "data_hora_alvo_iso" deve conter APENAS a data/hora em formato ISO 8601
-com fuso -03:00 (exemplo: 2026-08-29T15:00:00-03:00), sem nenhum texto explicativo junto -
-só preencha esse campo se eh_pedido_de_lembrete for true, interpretando horários relativos
-ao "agora" informado acima.
+1) PEDIDO DE NOVO LEMBRETE (ex: "me lembra de ligar pro cliente X às 15h", "lembra eu de mandar o
+   orçamento amanhã de manhã") - algo que {pessoa_nome} mesmo(a) quer ser lembrado(a) de fazer.
 
-Se a mensagem NÃO for um pedido de lembrete, preencha também o campo "resposta_conversa" com uma
-resposta natural e útil, como uma colega de equipe responderia no privado: se for uma pergunta que
-você sabe responder, responda direto; se for um pedido/comando que você ainda não tem como
-executar automaticamente, confirme que entendeu e que vai anotar/repassar, sem inventar que já fez
-algo que não fez; se for só um comentário, responda com naturalidade. Nunca deixe esse campo vazio
-quando eh_pedido_de_lembrete for false - toda mensagem privada precisa de uma resposta.
+2) FATO PRA GUARDAR NA MEMÓRIA (ex: "o Luan gosta da cor rosa", "o cliente Terapia prefere painel
+   roxo", "meu aniversário é dia X") - uma informação/preferência que não é uma tarefa nem um
+   pedido de ação, só algo que deve ficar guardado pra ser usado depois quando fizer sentido
+   (inclusive pra responder perguntas futuras tipo "do que o Luan gosta?").
+
+3) COMANDO PRA REPASSAR ALGO PRO GRUPO TRIPA (ex: "passa pra Tripa fazer isso até amanhã 10h e
+   cobra ele às 9h40 perguntando se já fez", "avisa a Tripa que vai ter essa promoção: ...") -
+   {pessoa_nome} quer que uma informação/pedido seja encaminhado pro grupo interno da equipe de
+   design (Tripa), podendo incluir um prazo e/ou um horário pra cobrar se já foi feito. Organize o
+   conteúdo a ser encaminhado de forma clara (junte instruções relacionadas da mesma mensagem em um
+   texto só, coerente, do jeito que um pedido de trabalho deveria ser escrito), preenchendo
+   "mensagem_tripa" com esse texto pronto pra encaminhar. Se {pessoa_nome} pediu pra cobrar em um
+   horário específico, preencha "tem_cobranca" como true, "horario_cobranca_iso" com esse horário
+   (ISO 8601, fuso -03:00) e "pergunta_cobranca" com uma pergunta curta e natural pra mandar pro
+   grupo Tripa nesse horário (ex: "Ei! Como está o pedido do Terapia? O prazo é até as 10h 👀").
+   IMPORTANTE: você NUNCA envia isso direto - só organiza o conteúdo, quem decide se confirma o
+   envio é sempre {pessoa_nome} (vai ver um preview antes).
+
+4) QUALQUER OUTRA COISA (pergunta, comentário, resposta a um lembrete anterior, pedido/comando que
+   não se encaixa nos tipos acima) - preencha "resposta_conversa" com uma resposta natural e útil,
+   como uma colega de equipe responderia no privado. Se os FATOS QUE VOCÊ JÁ SABE (se houver, no
+   topo deste prompt) tiverem a resposta pra uma pergunta, use-os pra responder direto. Se for um
+   pedido/comando que você ainda não tem como executar automaticamente, confirme que entendeu e que
+   vai anotar/repassar, sem inventar que já fez algo que não fez. Nunca deixe esse campo vazio
+   quando nenhum dos tipos 1/2/3 acima se aplicar - toda mensagem privada precisa de uma resposta.
+
+IMPORTANTE sobre datas/horários: qualquer campo "*_iso" deve conter APENAS a data/hora em formato
+ISO 8601 com fuso -03:00 (exemplo: 2026-08-29T15:00:00-03:00), sem nenhum texto explicativo junto,
+interpretando horários relativos ao "agora" informado acima.
 
 Responda SEMPRE E APENAS em JSON válido, numa única linha por valor, neste formato exato,
-sem usar bloco de código markdown (nada de ```) e sem quebras de linha dentro dos valores:
-{"eh_pedido_de_lembrete": true ou false, "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que eh_pedido_de_lembrete for false"}
+sem usar bloco de código markdown (nada de ```) e sem quebras de linha dentro dos valores. Inclua
+TODAS as chaves sempre, mesmo vazias/false quando não se aplicarem:
+{"eh_pedido_de_lembrete": true ou false, "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_comando_para_tripa": true ou false, "mensagem_tripa": "texto pronto pra encaminhar pro grupo Tripa, ou string vazia", "tem_cobranca": true ou false, "horario_cobranca_iso": "horario ISO da cobranca, ou string vazia", "pergunta_cobranca": "pergunta curta pra mandar na cobranca, ou string vazia", "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/3 acima for verdadeiro"}
 """
 
 
@@ -931,6 +996,39 @@ def agendar_lembrete(pessoa, numero, data_hora_alvo: datetime, texto_lembrete: s
         agendar_nag(pessoa, numero, texto_lembrete)
 
     scheduler.add_job(disparar_primeiro_aviso, "date", run_date=aviso_em, id=f"lembrete-{pessoa}-{int(time.time())}")
+
+
+def agendar_cobranca_tripa(horario_alvo: datetime, pergunta: str):
+    """Agenda uma unica mensagem de cobranca pro grupo Tripa num horario especifico
+    (ex: perguntar se um pedido com prazo ja foi feito)."""
+    agora_utc = datetime.now(timezone.utc)
+    if horario_alvo <= agora_utc:
+        horario_alvo = agora_utc + timedelta(seconds=5)
+    scheduler.add_job(
+        lambda: enviar_texto(TRIPA_DESIGNER_JID, f"⏰ {pergunta}"),
+        "date", run_date=horario_alvo, id=f"cobranca-tripa-{int(time.time())}",
+    )
+
+
+# Comandos "encaminhar pro Tripa" pedidos no privado passam por uma confirmacao antes de
+# serem enviados de verdade - guarda no maximo 1 comando pendente por pessoa (torres/luan).
+_comandos_pendentes = {}
+_COMANDO_PENDENTE_TTL = 30 * 60  # descarta comando nao confirmado depois de 30 min
+
+
+def parece_confirmacao(texto: str):
+    """Heuristica simples pra reconhecer sim/nao curtos, sem precisar chamar o Claude de
+    novo so pra isso. Devolve True (confirma), False (cancela), ou None (ambiguo/nao e
+    uma resposta de confirmacao, trata como mensagem nova)."""
+    t = normalizar_texto(texto).strip()
+    afirmativos = {"sim", "pode", "pode mandar", "confirma", "confirmado", "manda",
+                   "isso mesmo", "isso", "ok", "beleza", "pode enviar", "manda sim"}
+    negativos = {"nao", "cancela", "cancelar", "espera", "pera", "para", "deixa quieto"}
+    if t in afirmativos:
+        return True
+    if t in negativos:
+        return False
+    return None
 
 
 def marcar_resolvido(pessoa):
@@ -1303,13 +1401,39 @@ def processar_dm(remote_jid, key, data):
     if tom:
         return corrigir_texto_dm(numero, tom, texto_a_corrigir)
 
+    # Se tem um comando "pro Tripa" pendente de confirmacao pra essa pessoa, confere se
+    # essa mensagem e um sim/nao curto antes de tratar como mensagem nova.
+    pendente = _comandos_pendentes.get(pessoa)
+    if pendente and (time.time() - pendente["criado_em"]) <= _COMANDO_PENDENTE_TTL:
+        confirma = parece_confirmacao(texto)
+        if confirma is True:
+            enviar_texto(TRIPA_DESIGNER_JID, pendente["mensagem_tripa"])
+            if pendente.get("tem_cobranca") and pendente.get("horario_cobranca"):
+                agendar_cobranca_tripa(pendente["horario_cobranca"], pendente["pergunta_cobranca"])
+            _comandos_pendentes.pop(pessoa, None)
+            enviar_texto(numero, "Show, encaminhei pra Tripa! ✅" + (" Vou cobrar eles no horário combinado." if pendente.get("tem_cobranca") else ""))
+            return {"comando_tripa_confirmado": True}
+        elif confirma is False:
+            _comandos_pendentes.pop(pessoa, None)
+            enviar_texto(numero, "Beleza, não mandei nada. Se quiser, me manda de novo do jeito certo.")
+            return {"comando_tripa_cancelado": True}
+        # confirma is None: nao pareceu sim/nem nao, segue o fluxo normal (pode ser uma
+        # mensagem nova, ou uma correcao ao comando pendente - nesse caso o comando antigo
+        # so expira depois do TTL, ou e substituido se essa mensagem virar um novo comando).
+
     # Se já existe lembrete pendente pra essa pessoa, qualquer resposta encerra o nag.
     tinha_pendente = marcar_resolvido(pessoa)
 
     agora = horario_bahia_agora()
+    fatos = listar_fatos()
+    contexto_fatos = (
+        "FATOS QUE VOCÊ JÁ SABE (use quando fizer sentido pra responder):\n"
+        + "\n".join(f"- {f}" for f in fatos) + "\n\n"
+    ) if fatos else ""
     prompt_sistema = (
         SYSTEM_PROMPT_LEMBRETE
         .replace("{agora_iso}", agora.isoformat())
+        .replace("{contexto_fatos}", contexto_fatos)
         .replace("{pessoa_nome}", "Torres" if pessoa == "torres" else "Luan")
     )
     try:
@@ -1326,6 +1450,33 @@ def processar_dm(remote_jid, key, data):
             return {"erro": "não conseguiu parsear data_hora_alvo_iso", "resultado": resultado}
         agendar_lembrete(pessoa, numero, alvo, resultado.get("texto_lembrete", texto))
         enviar_texto(numero, f"Combinado! Vou te lembrar 10 min antes: \"{resultado.get('texto_lembrete', texto)}\" 👍")
+    elif resultado.get("eh_fato_para_lembrar") and resultado.get("fato_texto"):
+        salvar_fato(pessoa, resultado["fato_texto"])
+        enviar_texto(numero, f"Anotado! ✅ Vou lembrar: \"{resultado['fato_texto']}\"")
+    elif resultado.get("eh_comando_para_tripa") and resultado.get("mensagem_tripa"):
+        mensagem_tripa = resultado["mensagem_tripa"]
+        tem_cobranca = bool(resultado.get("tem_cobranca"))
+        horario_cobranca = None
+        pergunta_cobranca = resultado.get("pergunta_cobranca") or "Como está esse pedido? Já foi feito?"
+        preview_cobranca = ""
+        if tem_cobranca and resultado.get("horario_cobranca_iso"):
+            try:
+                horario_cobranca = datetime.fromisoformat(resultado["horario_cobranca_iso"])
+                preview_cobranca = f"\n\n⏰ Vou cobrar a Tripa às {horario_cobranca.strftime('%H:%M')} perguntando: \"{pergunta_cobranca}\""
+            except Exception:
+                tem_cobranca = False
+        _comandos_pendentes[pessoa] = {
+            "mensagem_tripa": mensagem_tripa,
+            "tem_cobranca": tem_cobranca,
+            "horario_cobranca": horario_cobranca,
+            "pergunta_cobranca": pergunta_cobranca,
+            "criado_em": time.time(),
+        }
+        enviar_texto(
+            numero,
+            f"Ficou assim pra encaminhar pra Tripa:\n\n{mensagem_tripa}{preview_cobranca}\n\n"
+            "Confirma que posso mandar? (responde \"sim\" ou \"não\")",
+        )
     elif tinha_pendente:
         enviar_texto(numero, "Combinado, marquei como resolvido! ✅")
     else:
