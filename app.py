@@ -698,6 +698,18 @@ def processar_mensagem_grupo(remote_jid, grupo, key, data):
         for numero in NUMEROS_SEM_AUTO_RESPOSTA_EM_GRUPO
     ):
         print(f"[processar_mensagem_grupo] mensagem da propria equipe/outro agente ({candidatos_participant}), ignorando", flush=True)
+        # Se Torres, Luan ou o outro agente ja respondeu no grupo enquanto o bot ainda
+        # estava com uma resposta pendente (dentro da janela de debounce) pra esse mesmo
+        # grupo, cancela essa resposta pendente - a equipe ja assumiu a conversa, o bot
+        # nunca deve falar por cima de quem ja respondeu.
+        with _buffer_lock:
+            chaves_do_grupo = [k for k in _buffer_grupo if k[0] == remote_jid]
+            for k in chaves_do_grupo:
+                buf_pendente = _buffer_grupo.pop(k, None)
+                if buf_pendente and buf_pendente.get("timer"):
+                    buf_pendente["timer"].cancel()
+        if chaves_do_grupo:
+            print(f"[processar_mensagem_grupo] equipe respondeu no grupo {remote_jid}, cancelando {len(chaves_do_grupo)} resposta(s) pendente(s) do bot", flush=True)
         return {"skipped": "mensagem da equipe (Torres/Luan) ou de outro agente de IA do time, sem auto-resposta"}
 
     sender_name = data.get("pushName", "cliente")
