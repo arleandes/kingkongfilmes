@@ -30,7 +30,7 @@ import time
 import threading
 import unicodedata
 from contextlib import contextmanager
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, date, timezone, timedelta
 
 from flask import Flask, request, jsonify
 import requests
@@ -1801,6 +1801,91 @@ def buscar_pedido_pendente(cliente_nome):
         return pedido
 
 
+_MESES_PT = {
+    "janeiro": 1, "fevereiro": 2, "marco": 3, "abril": 4, "maio": 5, "junho": 6,
+    "julho": 7, "agosto": 8, "setembro": 9, "outubro": 10, "novembro": 11, "dezembro": 12,
+}
+_DIAS_SEMANA_PT = ["segunda-feira", "terça-feira", "quarta-feira", "quinta-feira",
+                   "sexta-feira", "sábado", "domingo"]
+
+
+def _dia_semana_pt(data_obj):
+    return _DIAS_SEMANA_PT[data_obj.weekday()]
+
+
+def extrair_datas_mencionadas(texto, limite=12):
+    """Varre um texto (pedido/historico da conversa) procurando mencoes a datas especificas
+    (ex: '03 setembro', '03 de setembro de 2026', '03/09', '03/09/2026') e devolve uma lista
+    de tuplas (dia, mes, ano_ou_None) unicas, na ordem em que apareceram. Usado pra montar
+    uma validacao de calendario OBJETIVA (calculada por codigo) em vez de deixar o modelo
+    "calcular de cabeca" em que dia da semana uma data cai - foi exatamente isso que causou
+    um erro real em producao (a IA assumiu o ano 2025 por conta propria, sem motivo, e
+    apontou uma divergencia de dia da semana que nao existia)."""
+    if not texto:
+        return []
+    texto_norm = normalizar_texto(texto)
+    encontradas = []
+    vistos = set()
+
+    padrao_nome_mes = r'\b(\d{1,2})\s*(?:de\s+)?(' + "|".join(_MESES_PT.keys()) + r')(?:\s+de\s+(\d{4}))?\b'
+    for m in re.finditer(padrao_nome_mes, texto_norm):
+        dia = int(m.group(1))
+        mes = _MESES_PT[m.group(2)]
+        ano = int(m.group(3)) if m.group(3) else None
+        chave = (dia, mes, ano)
+        if 1 <= dia <= 31 and chave not in vistos:
+            vistos.add(chave)
+            encontradas.append(chave)
+
+    padrao_numerico = r'\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b'
+    for m in re.finditer(padrao_numerico, texto_norm):
+        dia, mes = int(m.group(1)), int(m.group(2))
+        if not (1 <= dia <= 31 and 1 <= mes <= 12):
+            continue
+        ano = None
+        if m.group(3):
+            ano = int(m.group(3))
+            if ano < 100:
+                ano += 2000
+        chave = (dia, mes, ano)
+        if chave not in vistos:
+            vistos.add(chave)
+            encontradas.append(chave)
+
+    return encontradas[:limite]
+
+
+def montar_validacao_calendario(texto_completo, agora=None):
+    """Monta um bloco de texto com o dia da semana REAL (calculado por codigo, nunca por
+    suposicao/calculo mental do modelo) de cada data mencionada na conversa - pro ano
+    explicito quando mencionado, senao pro ano atual e o seguinte (nunca escolhe um ano
+    sozinho quando nao ha essa info explicita, so mostra as opcoes mais plausiveis com o
+    contexto de hoje). Isso da ao modelo uma referencia objetiva pra comparar com o que esta
+    escrito na arte, em vez de arriscar um erro de calendario por conta propria."""
+    datas = extrair_datas_mencionadas(texto_completo)
+    if not datas:
+        return ""
+    agora = agora or horario_bahia_agora()
+    ano_atual = agora.year
+    linhas = []
+    for dia, mes, ano_explicito in datas:
+        anos_candidatos = [ano_explicito] if ano_explicito else [ano_atual, ano_atual + 1]
+        for ano in anos_candidatos:
+            try:
+                data_calc = date(ano, mes, dia)
+            except ValueError:
+                continue
+            marcador = " (ano atual)" if ano == ano_atual and not ano_explicito else ""
+            linhas.append(f"- {dia:02d}/{mes:02d}/{ano} = {_dia_semana_pt(data_calc)}{marcador}")
+    if not linhas:
+        return ""
+    return (
+        "VALIDAÇÃO DE CALENDÁRIO (calculada objetivamente por código, NUNCA por suposição - "
+        f"hoje é {agora.strftime('%d/%m/%Y')}, {_dia_semana_pt(agora.date())}):\n"
+        + "\n".join(linhas)
+    )
+
+
 SYSTEM_PROMPT_COMPARACAO_PEDIDO = """Você faz a CONFERÊNCIA DE CONTEÚDO de uma peça gráfica finalizada
 antes dela sair pro cliente - essa conferência é uma camada de qualidade separada da revisão de
 português, e existe SÓ internamente (nunca é vista pelo cliente). Você não está aqui pra corrigir
@@ -1828,18 +1913,69 @@ REGRAS DE PRECISÃO (não flexibilize nenhuma delas):
   escolha estética do designer. Nunca arredonde, nunca trate como equivalente.
 - Nomes próprios: compare a grafia exata contra o que está confirmado no histórico/pedido (ex:
   "Terapia Beach" vs "Terapia Bech", ou "Fellipe" vs "Felipe" - mesmo uma letra de diferença é erro).
-- Datas/dias da semana/horários: confira dia, dia da semana e horário um a um.
+- Datas/dias da semana/horários: confira dia, dia da semana e horário um a um - mas NUNCA aponte
+  divergência de data/dia da semana usando cálculo mental próprio (veja a seção de VALIDAÇÃO DE
+  CALENDÁRIO abaixo, que é obrigatória).
 - Exceções e condições (ex: "exceto salmão e moqueca"): se o pedido exigia essa informação e ela
   não aparece na arte, isso é uma falha de conteúdo mesmo que o resto (preço, título) esteja certo -
   nunca aprove só porque a parte principal bateu.
 - NUNCA aprove só pela aparência/design da arte estar bonita - sempre extraia as informações da
   arte e compare com o briefing final reconstruído antes de decidir.
 
-QUANDO HOUVER DÚVIDA (ex: uma transcrição de áudio no histórico não ficou clara sobre qual valor
-vale, ou duas mensagens parecem se contradizer sem dar pra saber qual é a mais recente/confirmada):
-NÃO escolha uma das opções por conta própria e não invente. Marque "duvida_ambigua" como true e
-preencha "pergunta_duvida" com uma pergunta objetiva pra Torres ou Luan resolverem, citando as duas
-informações em conflito e o cliente/peça em questão.
+VALIDAÇÃO DE CALENDÁRIO (datas, dias da semana e anos) - NUNCA use memória, suposição ou cálculo
+mental pra isso. Um erro real em produção já aconteceu assim: a IA assumiu sozinha que uma data
+sem ano era de 2025 (quando na verdade era 2026) e apontou uma "divergência" de dia da semana que
+não existia - isso gera retrabalho pro designer e derruba a confiança no sistema. Regras:
+- NUNCA ASSUME O ANO: quando a arte mostrar uma data sem ano (ex: "03 setembro", "quinta 03
+  setembro"), o ano correto vem do contexto (data de hoje, histórico da conversa, programação
+  informada pelo cliente) - nunca escolha um ano por conta própria sem essa base.
+- Junto com essa mensagem você pode receber um bloco "VALIDAÇÃO DE CALENDÁRIO" calculado por
+  CÓDIGO (não pelo modelo) mostrando, pra cada data mencionada na conversa, o dia da semana REAL
+  em cada ano plausível (ex: "03/09/2026 = quinta-feira"). Esse bloco é a ÚNICA fonte confiável pra
+  validar dia-da-semana - nunca calcule por conta própria, nunca confie em "eu sei que essa data
+  cai numa quarta" sem checar esse bloco. Se uma data aparecer na arte mas NÃO aparecer nesse bloco
+  (ou seja, não foi possível confirmar objetivamente o dia da semana dela), NÃO afirme que está
+  errada - trate como algo que precisa de confirmação humana (ver "PRECISA CONFIRMAR" abaixo).
+- Só aponte divergência de dia da semana se: (1) o bloco de validação confirma o dia da semana real
+  pro ano correto (identificado pelo contexto, nunca suposto), e (2) esse dia real é diferente do
+  que está escrito na arte. Só então isso vira ERRO CONFIRMADO.
+
+TRÊS ESTADOS POSSÍVEIS PRA CADA INFORMAÇÃO CONFERIDA (nunca misture um com o outro):
+1. CORRETO: a informação foi validada de verdade contra uma fonte (pedido, histórico, cálculo de
+   calendário objetivo) e bate com a arte.
+2. ERRO CONFIRMADO: existe uma comparação objetiva (com fonte clara) mostrando que a arte diverge
+   do briefing final/calendário.
+3. PRECISA CONFIRMAR: há informações diferentes ou uma data/regra que não dá pra validar com
+   segurança (ex: data não coberta pela validação de calendário, ou uma condição especial - tipo
+   "quinta aparece 'triplicado' e nos outros dias 'dobrado'" - sem confirmação no histórico de que
+   é intencional). NUNCA transforme "PRECISA CONFIRMAR" em "ERRO" - trate como dúvida real
+   (duvida_ambigua), nunca escolhendo um lado por conta própria.
+Antes de listar qualquer coisa em "problemas", pergunte-se internamente: "estou comparando isso
+com qual fonte?" (pedido, histórico, confirmação de Torres/Luan, ou o bloco de calendário). Se não
+existir uma fonte clara, NÃO é um problema - marque como dúvida ou nem cite. NUNCA complete uma
+informação porque "parece mais provável" (proibido: "provavelmente é 2025", "esse nome deve estar
+errado", "provavelmente deveria ser dobrado", "esse horário parece incorreto") - conferência exige
+prova, nunca palpite.
+
+ORDEM OBRIGATÓRIA DE RACIOCÍNIO antes de responder: (1) identificar o cliente e o pedido sendo
+conferido; (2) recuperar o briefing final (pedido original + correções do histórico); (3) se houver
+datas, identificar o ano correto pelo contexto (nunca supor) e validar dia da semana usando SOMENTE
+o bloco de calendário calculado por código; (4) comparar nomes; (5) comparar valores; (6) comparar
+horários; (7) comparar condições/exceções/promoções; (8) separar o que é ERRO CONFIRMADO (tem fonte
+clara) do que é PRECISA CONFIRMAR (dúvida real sem fonte segura); (9) só então montar a resposta.
+
+QUANDO HOUVER DÚVIDA REAL (ex: uma transcrição de áudio não ficou clara sobre qual valor vale, duas
+mensagens parecem se contradizer sem dar pra saber qual é a mais recente/confirmada, uma data não
+coberta pela validação de calendário, ou uma diferença que pode ser intencional mas não tem
+confirmação no histórico): NÃO escolha uma das opções por conta própria e não invente. Marque
+"duvida_ambigua" como true e preencha "pergunta_duvida" com uma pergunta objetiva pra Torres ou
+Luan resolverem, citando as informações em conflito, o cliente/peça em questão, e - se o resto da
+arte já foi conferido e está correto - deixe isso claro na pergunta (ex: "A arte está correta nos
+demais pontos. Só preciso confirmar uma informação antes de aprovar: ...").
+
+REGRA MESTRE: ENCONTRAR DIFERENÇA → INVESTIGAR (tem fonte clara?) → VALIDAR (bate com essa fonte,
+inclusive calendário quando for data) → só ENTÃO apontar. Nunca ENCONTRAR DIFERENÇA → SUPOR →
+APONTAR ERRO. Se não tiver certeza, não acusa - trata como dúvida.
 
 Responda SEMPRE E APENAS em JSON válido, sem bloco de código markdown (nada de ```):
 {
@@ -1857,9 +1993,15 @@ def comparar_arte_com_pedido(pedido_texto, imagem_base64, pdf_base64, historico_
         f"\n\nHISTÓRICO RECENTE DO CLIENTE (mais antigo primeiro - pode conter correções enviadas "
         f"DEPOIS do pedido original acima; a informação mais recente e confirmada é que vale):\n{historico_texto}"
     ) if historico_texto else ""
+    # Validacao de calendario calculada por CODIGO (nunca pelo modelo) pra qualquer data
+    # mencionada no pedido/historico - evita o modelo "calcular de cabeca" o dia da semana e
+    # assumir um ano por conta propria (causa real de um erro em producao).
+    bloco_calendario = montar_validacao_calendario(f"{pedido_texto}\n{historico_texto}")
+    bloco_calendario = f"\n\n{bloco_calendario}" if bloco_calendario else ""
     prompt_usuario = (
         f"Pedido original organizado (no momento em que foi encaminhado pro designer):\n{pedido_texto}"
-        f"{bloco_historico}\n\nFaça a conferência de conteúdo dessa arte anexada contra o briefing final."
+        f"{bloco_historico}{bloco_calendario}"
+        f"\n\nFaça a conferência de conteúdo dessa arte anexada contra o briefing final."
     )
     resultado = chamar_claude(SYSTEM_PROMPT_COMPARACAO_PEDIDO, prompt_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64)
 
