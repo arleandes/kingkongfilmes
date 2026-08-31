@@ -1903,17 +1903,48 @@ def processar_dm(remote_jid, key, data):
 
     message = data.get("message", {})
     message_type = data.get("messageType", "")
+    tipo_lower = message_type.lower()
 
     # Foto ou PDF no privado = pedido de revisao de peca (nao de lembrete).
-    if "image" in message_type.lower() or "document" in message_type.lower():
+    if "image" in tipo_lower or "document" in tipo_lower:
         registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, pessoa, "[enviou imagem/PDF pra revisão de arte]", True)
         return revisar_arte_dm(numero, key, data, message_type)
 
-    texto = message.get("conversation", "")
-    if not texto:
-        return {"skipped": "DM sem texto (tipo de mensagem não tratado nesta versão)"}
-
-    registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, pessoa, texto, True)
+    # Audio/PTT no privado: transcreve e trata como se fosse uma mensagem de texto normal
+    # dali pra frente (pode ser um pedido de lembrete, uma regra, uma pergunta, etc) - antes
+    # isso caia direto no "nao tratado" e nem era registrado no historico.
+    if "audio" in tipo_lower or "ptt" in tipo_lower:
+        b64_audio = baixar_midia_evolution(key)
+        if b64_audio:
+            with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as f:
+                f.write(base64.b64decode(b64_audio))
+                caminho_audio = f.name
+            texto = transcrever_audio(caminho_audio)
+            os.unlink(caminho_audio)
+        else:
+            texto = ""
+        if not texto:
+            registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, pessoa, "[mandou um áudio que não pôde ser transcrito]", True)
+            enviar_texto(numero, "Recebi seu áudio mas não consegui entender o que foi dito, pode escrever ou mandar de novo?")
+            return {"skipped": "áudio não transcrito"}
+        registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, pessoa, f"[áudio] {texto}", True)
+    # Video no privado: ainda nao processamos pedido de video (so imagem/PDF), mas registra
+    # no historico mesmo assim, em vez de ficar completamente de fora do "sistema de defesa".
+    elif "video" in tipo_lower:
+        caption_video = message.get("videoMessage", {}).get("caption", "")
+        conteudo_video = f"[vídeo com a legenda: {caption_video}]" if caption_video else "[mandou um vídeo, sem legenda]"
+        registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, pessoa, conteudo_video, True)
+        enviar_texto(numero, "Recebi o vídeo! Só não processo vídeo diretamente por aqui ainda (só imagem e PDF) - mas já fica registrado.")
+        return {"video_registrado": True}
+    else:
+        texto = message.get("conversation", "")
+        if not texto:
+            # Qualquer outro tipo de mensagem que a gente ainda nao trata explicitamente
+            # (figurinha, localizacao, contato, enquete, etc) - registra ao menos que algo
+            # chegou, em vez de sumir completamente do historico.
+            registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, pessoa, f"[mandou uma mensagem do tipo '{message_type}', não suportada ainda]", True)
+            return {"skipped": "DM de tipo não tratado nesta versão, mas registrado no histórico"}
+        registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, pessoa, texto, True)
 
     # Palavra-chave "regra:" tem prioridade maxima sobre qualquer outra logica - e como
     # Torres/Luan ensinam uma instrucao permanente de atendimento, que passa a valer pra
