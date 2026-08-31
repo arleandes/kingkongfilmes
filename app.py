@@ -1692,7 +1692,34 @@ def revisar_peca(imagem_base64, pdf_base64, caption):
     return bool(resultado.get("tem_erro")), texto_resp, resultado
 
 
-def revisar_arte_dm(numero, key, data, message_type):
+def _identificar_cliente_para_conferencia_dm(caption, grupo_jid_dm):
+    """Tenta identificar de qual cliente se trata uma arte enviada no PRIVADO de Torres/Luan,
+    pra poder rodar a conferencia de conteudo completa (nao so a revisao de ortografia) - o
+    mesmo "gatilho arte + cliente" que ja funciona no grupo Tripa. Primeiro tenta pela legenda
+    da propria imagem (ex: "Arte Terapia"); se a legenda nao citar nenhum cliente, olha as
+    ultimas mensagens dessa conversa privada (ex: Torres perguntou "confere essa arte do
+    Terapia" antes de mandar a foto, ou "analisa essa peça" logo depois de falar do cliente).
+    Nunca escolhe um cliente sozinho quando ha ambiguidade real (mais de um candidato) - nesse
+    caso devolve None e so a revisao de ortografia acontece, sem risco de comparar com o pedido
+    de outro cliente por engano."""
+    cliente_nome = extrair_cliente_da_legenda(caption)
+    if cliente_nome:
+        return cliente_nome
+    historico_dm = buscar_mensagens_recentes_grupo(grupo_jid_dm, limite=6)
+    texto_recente = "\n".join(m["conteudo"] for m in historico_dm)
+    candidatos = identificar_grupos_candidatos(texto_recente)
+    if len(candidatos) == 1:
+        return GRUPOS[candidatos[0]]["nome"]
+    return None
+
+
+def revisar_arte_dm(numero, key, data, message_type, grupo_jid_dm=None):
+    """No privado de Torres/Luan: revisa a ortografia da arte (igual ao Tripa) e, se der pra
+    identificar o cliente (pela legenda "Arte <cliente>" ou pelo contexto recente da conversa,
+    ex: "confere essa arte do Terapia"), TAMBEM roda a conferencia de conteudo completa contra
+    o pedido pendente daquele cliente - o gatilho "arte + cliente" só existe aqui e no grupo
+    Tripa, nunca em grupo de cliente nem em qualquer outro grupo (isso é garantido lá em cima,
+    no dispatch do webhook: só TRIPA_DESIGNER_JID e DM chamam essas funções de revisão)."""
     imagem_base64, pdf_base64, caption, aviso = extrair_midia_para_revisao(key, data, message_type)
     if aviso:
         enviar_texto(numero, aviso)
@@ -1705,7 +1732,36 @@ def revisar_arte_dm(numero, key, data, message_type):
         return {"erro_claude": str(e)}
 
     enviar_texto(numero, texto_resp)
-    return {"resultado": resultado}
+
+    resultado_comparacao = None
+    cliente_nome = None
+    if grupo_jid_dm:
+        cliente_nome = _identificar_cliente_para_conferencia_dm(caption, grupo_jid_dm)
+        if cliente_nome:
+            conferencia = _rodar_conferencia_de_conteudo(cliente_nome, imagem_base64, pdf_base64, "revisar_arte_dm")
+            if conferencia:
+                pedido, bate, texto_comparacao, resultado_comparacao = (
+                    conferencia["pedido"], conferencia["bate"], conferencia["texto_comparacao"], conferencia["resultado"]
+                )
+                if resultado_comparacao.get("duvida_ambigua"):
+                    # A duvida ja esta indo direto pra pessoa que mandou a arte (estamos no
+                    # privado dela) - nunca escolhe sozinho, so pergunta.
+                    pergunta = resultado_comparacao.get("pergunta_duvida") or (
+                        f"Estou conferindo essa arte do cliente {cliente_nome} e encontrei uma "
+                        "informação que não consegui confirmar com segurança no histórico. Pode "
+                        "confirmar?"
+                    )
+                    enviar_texto(numero, f"❓ {pergunta}")
+                else:
+                    enviar_texto(numero, texto_comparacao)
+                    if pedido.get("tarefa_id"):
+                        novo_status = STATUS_CONCLUIDO if bate else STATUS_AGUARDANDO_CORRECAO
+                        adicionar_evento_tarefa(
+                            pedido["tarefa_id"], "entrega", texto_comparacao,
+                            autor="designer", novo_status=novo_status,
+                        )
+
+    return {"resultado": resultado, "cliente_identificado": cliente_nome, "comparacao": resultado_comparacao}
 
 
 # --------------------------------------------------------------------------
@@ -2047,6 +2103,39 @@ def _extrair_texto_log_tripa(data, message_type):
     return None
 
 
+def _rodar_conferencia_de_conteudo(cliente_nome, imagem_base64, pdf_base64, log_prefixo):
+    """Busca o pedido pendente daquele cliente e roda a conferencia de conteudo
+    (comparar_arte_com_pedido) contra o historico da conversa dele. So faz a ANALISE - devolve
+    um dict com pedido/bate/texto_comparacao/resultado, ou None se nao havia pedido pendente
+    pra esse cliente (ou deu erro). Quem chama decide pra onde mandar o veredito (grupo Tripa,
+    privado, etc) - a conferencia em si e a mesma, o destino do aviso e que muda conforme o
+    lugar de onde a arte foi enviada (usado tanto pelo grupo Tripa quanto pelo privado de
+    Torres/Luan, que sao os UNICOS lugares onde a conferencia de arte pode acontecer)."""
+    pedido = buscar_pedido_pendente(cliente_nome)
+    if not pedido:
+        print(f"[{log_prefixo}] legenda citou '{cliente_nome}' mas nao achei pedido pendente pra comparar", flush=True)
+        return None
+    # Busca o historico recente da conversa do cliente (grupo dele) - pode conter
+    # correcoes/alteracoes enviadas DEPOIS que o pedido ja tinha sido encaminhado pro
+    # designer (por texto ou audio, do cliente ou da equipe), que o "pedido_texto"
+    # congelado sozinho nao capturaria. Isso e o que permite reconstruir o briefing
+    # final de verdade antes de conferir a arte, em vez de comparar so com a primeira
+    # versao do pedido.
+    historico_texto = ""
+    grupo_jid_cliente = pedido.get("grupo_jid")
+    if grupo_jid_cliente:
+        historico_cliente = buscar_mensagens_recentes_grupo(grupo_jid_cliente, limite=20)
+        historico_texto = "\n".join(f"- {m['autor']}: {m['conteudo']}" for m in historico_cliente)
+    try:
+        bate, texto_comparacao, resultado_comparacao = comparar_arte_com_pedido(
+            pedido["pedido_texto"], imagem_base64, pdf_base64, historico_texto=historico_texto
+        )
+    except Exception as e:
+        print(f"[{log_prefixo}] erro na comparacao com pedido: {e}", flush=True)
+        return None
+    return {"pedido": pedido, "bate": bate, "texto_comparacao": texto_comparacao, "resultado": resultado_comparacao}
+
+
 def processar_revisao_grupo_designer(remote_jid, key, data):
     """No grupo Tripa Designer: se alguem postar uma foto/PDF de peca, revisa a ortografia
     e SEMPRE avisa no grupo o resultado (bateu ou nao bateu). Se a legenda citar o nome de
@@ -2082,55 +2171,34 @@ def processar_revisao_grupo_designer(remote_jid, key, data):
     resultado_comparacao = None
     cliente_nome = extrair_cliente_da_legenda(caption)
     if cliente_nome:
-        pedido = buscar_pedido_pendente(cliente_nome)
-        if pedido:
-            # Busca o historico recente da conversa do cliente (grupo dele) - pode conter
-            # correcoes/alteracoes enviadas DEPOIS que o pedido ja tinha sido encaminhado pro
-            # designer (por texto ou audio, do cliente ou da equipe), que o "pedido_texto"
-            # congelado sozinho nao capturaria. Isso e o que permite reconstruir o briefing
-            # final de verdade antes de conferir a arte, em vez de comparar so com a primeira
-            # versao do pedido.
-            historico_texto = ""
-            grupo_jid_cliente = pedido.get("grupo_jid")
-            if grupo_jid_cliente:
-                historico_cliente = buscar_mensagens_recentes_grupo(grupo_jid_cliente, limite=20)
-                historico_texto = "\n".join(f"- {m['autor']}: {m['conteudo']}" for m in historico_cliente)
-            try:
-                bate, texto_comparacao, resultado_comparacao = comparar_arte_com_pedido(
-                    pedido["pedido_texto"], imagem_base64, pdf_base64, historico_texto=historico_texto
-                )
-            except Exception as e:
-                print(f"[processar_revisao_grupo_designer] erro na comparacao com pedido: {e}", flush=True)
-            else:
-                if resultado_comparacao.get("duvida_ambigua"):
-                    # Nunca escolhe uma informacao em duvida por conta propria - so pergunta pra
-                    # Torres/Luan em privado, sem postar nenhum veredito (certo/errado) no Tripa
-                    # enquanto a duvida nao for resolvida por um humano.
-                    pergunta = resultado_comparacao.get("pergunta_duvida") or (
-                        f"Estou conferindo uma arte do cliente {cliente_nome} e encontrei uma "
-                        "informação que não consegui confirmar com segurança no histórico. Pode "
-                        "dar uma olhada?"
-                    )
-                    for numero in TEAM_NUMBERS:
-                        enviar_texto(numero, f"❓ Dúvida na conferência de conteúdo ({cliente_nome}):\n\n{pergunta}")
-                else:
-                    enviar_texto(remote_jid, texto_comparacao)
-                    # Quando o pedido veio do banco (tem tarefa_id), atualiza o status da
-                    # tarefa de acordo com o resultado da conferencia: concluida se bateu
-                    # tudo certo, ou aguardando correcao se faltou/tem algo errado - assim a
-                    # mesma tarefa continua aberta pra receber a proxima rodada corrigida.
-                    if pedido.get("tarefa_id"):
-                        novo_status = STATUS_CONCLUIDO if bate else STATUS_AGUARDANDO_CORRECAO
-                        adicionar_evento_tarefa(
-                            pedido["tarefa_id"], "entrega", texto_comparacao,
-                            autor="designer", novo_status=novo_status,
-                        )
-        else:
-            print(
-                f"[processar_revisao_grupo_designer] legenda citou '{cliente_nome}' mas nao "
-                "achei pedido pendente pra comparar",
-                flush=True,
+        conferencia = _rodar_conferencia_de_conteudo(cliente_nome, imagem_base64, pdf_base64, "processar_revisao_grupo_designer")
+        if conferencia:
+            pedido, bate, texto_comparacao, resultado_comparacao = (
+                conferencia["pedido"], conferencia["bate"], conferencia["texto_comparacao"], conferencia["resultado"]
             )
+            if resultado_comparacao.get("duvida_ambigua"):
+                # Nunca escolhe uma informacao em duvida por conta propria - so pergunta pra
+                # Torres/Luan em privado, sem postar nenhum veredito (certo/errado) no Tripa
+                # enquanto a duvida nao for resolvida por um humano.
+                pergunta = resultado_comparacao.get("pergunta_duvida") or (
+                    f"Estou conferindo uma arte do cliente {cliente_nome} e encontrei uma "
+                    "informação que não consegui confirmar com segurança no histórico. Pode "
+                    "dar uma olhada?"
+                )
+                for numero in TEAM_NUMBERS:
+                    enviar_texto(numero, f"❓ Dúvida na conferência de conteúdo ({cliente_nome}):\n\n{pergunta}")
+            else:
+                enviar_texto(remote_jid, texto_comparacao)
+                # Quando o pedido veio do banco (tem tarefa_id), atualiza o status da
+                # tarefa de acordo com o resultado da conferencia: concluida se bateu
+                # tudo certo, ou aguardando correcao se faltou/tem algo errado - assim a
+                # mesma tarefa continua aberta pra receber a proxima rodada corrigida.
+                if pedido.get("tarefa_id"):
+                    novo_status = STATUS_CONCLUIDO if bate else STATUS_AGUARDANDO_CORRECAO
+                    adicionar_evento_tarefa(
+                        pedido["tarefa_id"], "entrega", texto_comparacao,
+                        autor="designer", novo_status=novo_status,
+                    )
 
     return {"resultado": resultado, "cliente_identificado": cliente_nome, "comparacao": resultado_comparacao}
 
@@ -2705,7 +2773,7 @@ def processar_dm(remote_jid, key, data):
     # Foto ou PDF no privado = pedido de revisao de peca (nao de lembrete).
     if "image" in tipo_lower or "document" in tipo_lower:
         registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, pessoa, "[enviou imagem/PDF pra revisão de arte]", True)
-        return revisar_arte_dm(numero, key, data, message_type)
+        return revisar_arte_dm(numero, key, data, message_type, grupo_jid_dm=grupo_jid_dm)
 
     # Audio/PTT no privado: transcreve e trata como se fosse uma mensagem de texto normal
     # dali pra frente (pode ser um pedido de lembrete, uma regra, uma pergunta, etc) - antes
