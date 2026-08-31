@@ -733,7 +733,7 @@ def transcrever_audio(caminho_arquivo):
     return resp.json().get("text", "")
 
 
-def chamar_claude(system_prompt, conteudo_usuario, imagem_base64=None, pdf_base64=None):
+def chamar_claude(system_prompt, conteudo_usuario, imagem_base64=None, pdf_base64=None, max_tokens=1500, timeout=30):
     messages_content = []
     if imagem_base64:
         messages_content.append({
@@ -760,11 +760,11 @@ def chamar_claude(system_prompt, conteudo_usuario, imagem_base64=None, pdf_base6
         headers=headers,
         json={
             "model": "claude-sonnet-5",
-            "max_tokens": 1500,
+            "max_tokens": max_tokens,
             "system": system_prompt,
             "messages": [{"role": "user", "content": messages_content}],
         },
-        timeout=30,
+        timeout=timeout,
     )
     if resp.status_code >= 400:
         print(f"[chamar_claude] ERRO {resp.status_code}: {resp.text[:1000]}", flush=True)
@@ -1603,8 +1603,9 @@ def parece_confirmacao(texto: str):
     novo so pra isso. Devolve True (confirma), False (cancela), ou None (ambiguo/nao e
     uma resposta de confirmacao, trata como mensagem nova)."""
     t = normalizar_texto(texto).strip()
-    afirmativos = {"sim", "pode", "pode mandar", "confirma", "confirmado", "manda",
-                   "isso mesmo", "isso", "ok", "beleza", "pode enviar", "manda sim"}
+    afirmativos = {"sim", "pode", "posso", "pode mandar", "confirma", "confirmado", "manda",
+                   "isso mesmo", "isso", "ok", "beleza", "pode enviar", "manda sim", "claro",
+                   "com certeza", "pode sim", "manda ai"}
     negativos = {"nao", "cancela", "cancelar", "espera", "pera", "para", "deixa quieto"}
     if t in afirmativos:
         return True
@@ -2226,9 +2227,14 @@ def montar_briefing_cliente(pessoa_nome, grupo_jid, grupo_nome, assunto):
         .replace("{assunto}", assunto or "(não especificado - use a solicitação mais recente/relevante)")
     )
     try:
-        return chamar_claude(prompt_sistema, f"HISTÓRICO DA CONVERSA DO CLIENTE:\n{historico}")
+        # Essa chamada e mais pesada que as outras (ate 60 mensagens de historico + raciocinio
+        # sobre possiveis varios pedidos distintos) - usa timeout e max_tokens maiores que o
+        # padrao (30s/1500) pra reduzir o risco de cortar a resposta ou estourar o tempo antes
+        # do modelo terminar de responder. O worker do gunicorn aguenta ate 90s por requisicao
+        # (Procfile: --timeout 90), entao 70s de timeout aqui ainda deixa margem de sobra.
+        return chamar_claude(prompt_sistema, f"HISTÓRICO DA CONVERSA DO CLIENTE:\n{historico}", max_tokens=5000, timeout=70)
     except Exception as e:
-        print(f"[montar_briefing_cliente] erro: {e}", flush=True)
+        print(f"[montar_briefing_cliente] erro ({type(e).__name__}): {e}", flush=True)
         return {"duvida_ambigua": True, "pergunta_duvida": "Tive um problema técnico tentando montar esse briefing, pode pedir de novo daqui a pouco?"}
 
 
