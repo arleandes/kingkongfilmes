@@ -518,8 +518,11 @@ def numero_bate(remote_jid: str, numero_completo: str) -> bool:
     return bate
 
 
+BAHIA_TZ = timezone(timedelta(hours=-3))
+
+
 def horario_bahia_agora() -> datetime:
-    return datetime.now(timezone.utc) - timedelta(hours=3)
+    return datetime.now(BAHIA_TZ)
 
 
 def dentro_do_horario_comercial() -> bool:
@@ -1744,10 +1747,18 @@ def processar_dm(remote_jid, key, data):
         confirma = parece_confirmacao(texto)
         if confirma is True:
             enviar_texto(TRIPA_DESIGNER_JID, pendente["mensagem_tripa"])
+            aviso_cobranca = ""
             if pendente.get("tem_cobranca") and pendente.get("horario_cobranca"):
+                # Se o horario combinado ja passou entre a previa e a confirmacao (ex: a
+                # pessoa demorou pra responder "sim"), avisa que a cobranca vai sair agora em
+                # vez de deixar isso acontecer silenciosamente sem explicar o motivo.
+                if pendente["horario_cobranca"] <= datetime.now(timezone.utc):
+                    aviso_cobranca = " Como o horário combinado já passou, vou perguntar pra Tripa agora mesmo."
+                else:
+                    aviso_cobranca = " Vou cobrar eles no horário combinado."
                 agendar_cobranca_tripa(pendente["horario_cobranca"], pendente["pergunta_cobranca"])
             _comandos_pendentes.pop(pessoa, None)
-            enviar_texto(numero, "Show, encaminhei pra Tripa! ✅" + (" Vou cobrar eles no horário combinado." if pendente.get("tem_cobranca") else ""))
+            enviar_texto(numero, "Show, encaminhei pra Tripa! ✅" + aviso_cobranca)
             return {"comando_tripa_confirmado": True}
         elif confirma is False:
             _comandos_pendentes.pop(pessoa, None)
@@ -1858,7 +1869,17 @@ def processar_dm(remote_jid, key, data):
         if tem_cobranca and resultado.get("horario_cobranca_iso"):
             try:
                 horario_cobranca = datetime.fromisoformat(resultado["horario_cobranca_iso"])
-                preview_cobranca = f"\n\n⏰ Vou cobrar a Tripa às {horario_cobranca.strftime('%H:%M')} perguntando: \"{pergunta_cobranca}\""
+                if horario_cobranca <= datetime.now(timezone.utc):
+                    # O horario pedido (ex: "9h40") ja passou no momento em que a mensagem foi
+                    # mandada/processada - avisa isso ja na previa, em vez de deixar a pessoa
+                    # confirmar sem saber que a cobranca vai sair quase na hora, e nao no
+                    # horario que ela pediu.
+                    preview_cobranca = (
+                        f"\n\n⚠️ O horário de cobrança que ficou combinado ({horario_cobranca.strftime('%H:%M')}) "
+                        "já passou - se confirmar, eu já pergunto pra Tripa agora mesmo, em vez de esperar."
+                    )
+                else:
+                    preview_cobranca = f"\n\n⏰ Vou cobrar a Tripa às {horario_cobranca.strftime('%H:%M')} perguntando: \"{pergunta_cobranca}\""
             except Exception:
                 tem_cobranca = False
         _comandos_pendentes[pessoa] = {
