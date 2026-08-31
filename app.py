@@ -619,7 +619,7 @@ def chamar_claude(system_prompt, conteudo_usuario, imagem_base64=None, pdf_base6
         "https://api.anthropic.com/v1/messages",
         headers=headers,
         json={
-            "model": "claude-haiku-4-5",
+            "model": "claude-sonnet-5",
             "max_tokens": 1500,
             "system": system_prompt,
             "messages": [{"role": "user", "content": messages_content}],
