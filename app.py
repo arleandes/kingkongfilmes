@@ -619,8 +619,8 @@ def chamar_claude(system_prompt, conteudo_usuario, imagem_base64=None, pdf_base6
         "https://api.anthropic.com/v1/messages",
         headers=headers,
         json={
-            "model": "claude-sonnet-5",
-            "max_tokens": 800,
+            "model": "claude-haiku-4-5",
+            "max_tokens": 1500,
             "system": system_prompt,
             "messages": [{"role": "user", "content": messages_content}],
         },
@@ -629,15 +629,32 @@ def chamar_claude(system_prompt, conteudo_usuario, imagem_base64=None, pdf_base6
     if resp.status_code >= 400:
         print(f"[chamar_claude] ERRO {resp.status_code}: {resp.text[:1000]}", flush=True)
         raise RuntimeError(f"Claude API {resp.status_code}: {resp.text[:500]}")
-    texto = resp.json()["content"][0]["text"].strip()
+    resp_json = resp.json()
+    stop_reason = resp_json.get("stop_reason")
+    if stop_reason == "max_tokens":
+        # A resposta foi cortada antes de terminar (estourou o limite de tokens) - o JSON
+        # com certeza vai vir incompleto/invalido. Loga isso claramente pra facilitar
+        # diagnostico, em vez de deixar isso aparecer só como um JSONDecodeError generico.
+        print(f"[chamar_claude] AVISO: resposta cortada por max_tokens (stop_reason=max_tokens)", flush=True)
+    texto = resp_json["content"][0]["text"].strip()
     # As vezes o modelo embrulha o JSON num bloco de codigo markdown - remove isso.
     if texto.startswith("```"):
         texto = re.sub(r"^```(?:json)?\s*", "", texto)
         texto = re.sub(r"\s*```$", "", texto)
+    texto = texto.strip()
+    # Alguns modelos podem escrever um comentario antes/depois do JSON mesmo quando
+    # instruidos a nao fazer isso - extrai so o objeto JSON de verdade (do primeiro "{" ao
+    # ultimo "}") antes de tentar decodificar, em vez de exigir que a resposta comece
+    # exatamente com "{".
+    if not texto.startswith("{"):
+        inicio = texto.find("{")
+        fim = texto.rfind("}")
+        if inicio != -1 and fim != -1 and fim > inicio:
+            texto = texto[inicio:fim + 1]
     try:
         return json.loads(texto)
     except json.JSONDecodeError:
-        print(f"[chamar_claude] resposta nao-JSON do Claude: {texto[:500]}", flush=True)
+        print(f"[chamar_claude] resposta nao-JSON do Claude (stop_reason={stop_reason}): {texto[:800]}", flush=True)
         raise
 
 
