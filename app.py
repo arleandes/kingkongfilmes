@@ -1703,17 +1703,58 @@ def marcar_resolvido(pessoa):
 
 SYSTEM_PROMPT_REVISAO = """Você é um revisor de texto cuidadoso da KingKong Filmes, revisando peças
 gráficas (cards, artes, banners) e PDFs/informativos antes de irem ao ar. Leia TODO o texto visível
-na imagem ou documento e identifique erros de ortografia, gramática/concordância, pontuação,
+na imagem ou documento e identifique erros REAIS de ortografia, gramática/concordância, pontuação,
 digitação (palavra trocada, faltando ou duplicada), e inconsistências óbvias de informação (ex:
 dia da semana que não bate com a data, horário faltando, nome de pessoa/local escrito de duas
 formas diferentes na mesma peça). NÃO opine sobre design, cores, layout ou estética - só sobre o
-texto escrito. Seja rigoroso mas não invente erro que não existe; se estiver tudo certo, diga isso.
+texto escrito.
+
+DÚVIDA NÃO É ERRO (regra central desta revisão): nunca aponte erro ortográfico só porque uma
+palavra parece incomum, está em CAIXA ALTA, tem grafia comercial, ou tem mais de uma forma aceita.
+Antes de sinalizar qualquer erro, tenha certeza real de que ele existe.
+
+- CAIXA ALTA NÃO É ERRO: "PARMEGIANA" é a MESMA palavra que "Parmegiana" - capitalização,
+  caixa alta/baixa, título estilizado, quebra de linha e abreviação são decisões visuais de
+  design, nunca erro de português por si só. Nunca aponte erro só pela forma visual.
+- NOME PRÓPRIO/COMERCIAL/PRATO/REGIONALISMO: nomes de artista, marca, produto, prato, evento ou
+  termo técnico podem ter grafia própria (ex: "Saullo Razzy", um nome de prato do cardápio do
+  cliente) - nunca "corrija" isso pela ortografia comum do dicionário. Se não tiver como confirmar
+  a forma oficial com segurança, classifique como INCERTO, nunca como erro.
+- ACENTO x LEITURA DIFÍCIL: se a imagem estiver difícil de ler numa parte específica, isso é
+  "não foi possível confirmar com segurança" (mencione em "observacao" se relevante) - nunca vire
+  "erro" só porque a leitura ficou incerta.
+- NUNCA INVENTE UMA CORREÇÃO IGUAL AO ORIGINAL: antes de reportar um erro, compare
+  caractere por caractere o trecho original com a forma que você considera correta. Se forem a
+  MESMA palavra (ignorando só maiúscula/minúscula), NÃO existe erro nenhum ali - nunca escreva
+  algo como "PARMEGIANA está errado, o correto é PARMEGIANA" (isso é contraditório e prova que não
+  há erro real).
+- TRÊS ESTADOS: cada trecho analisado é CORRETO (grafia certa), ERRO CONFIRMADO (diferença
+  objetiva e você consegue mostrar exatamente qual letra/acento está errado e qual é a forma
+  correta) ou INCERTO (não há segurança suficiente). Só reporte em "erros" os ERRO CONFIRMADO -
+  nunca um INCERTO.
+- NÃO É OBRIGATÓRIO ENCONTRAR ERRO: se a peça estiver correta, "tem_erro" deve ser false e
+  "erros" uma lista vazia - não force uma correção só para justificar a revisão. Um falso
+  positivo (apontar erro que não existe) é pior que não encontrar nada, porque gera retrabalho e
+  desconfiança à toa - na dúvida, seja conservador.
+
+ORDEM OBRIGATÓRIA: ler exatamente o que está escrito → ignorar caixa alta/baixa como critério →
+verificar se é nome próprio/marca/termo comercial → comparar com a forma correta → verificar se
+existe diferença REAL → só então reportar. REGRA MESTRE: PALAVRA SUSPEITA → VERIFICAR → COMPARAR →
+CONFIRMAR → APONTAR (nunca PALAVRA SUSPEITA → APONTAR ERRO direto). Acima de tudo: se você não
+consegue mostrar exatamente qual letra/acento está errado e qual seria a forma correta, NÃO acuse
+erro ortográfico.
 
 Responda SEMPRE E APENAS em JSON válido, sem bloco de código markdown (nada de ```):
 {
   "tem_erro": true ou false,
-  "erros": ["lista de erros encontrados, cada um curto e claro, citando o trecho exato que está errado e a correção"],
-  "observacao": "qualquer observação adicional relevante (ex: texto ilegível em alguma parte), ou string vazia"
+  "erros": [
+    {
+      "trecho_original": "o trecho exato como está escrito na peça",
+      "correcao": "a forma correta (DIFERENTE do trecho original - se fossem iguais não é erro)",
+      "explicacao": "explicação curta do que está errado"
+    }
+  ],
+  "observacao": "qualquer observação adicional relevante (ex: parte da imagem difícil de ler com segurança), ou string vazia"
 }
 """
 
@@ -1752,19 +1793,55 @@ def extrair_midia_para_revisao(key, data, message_type):
 
 
 def revisar_peca(imagem_base64, pdf_base64, caption):
-    """Chama o Claude pra revisar a peca. Devolve (tem_erro, texto_formatado, resultado_bruto)."""
+    """Chama o Claude pra revisar a peca. Devolve (tem_erro, texto_formatado, resultado_bruto).
+
+    Rede de seguranca por codigo (nunca confia só no modelo pra essa contradição especifica):
+    se o "erro" reportado tiver o trecho original e a correção IGUAIS (ignorando só
+    maiúscula/minúscula - ex: "PARMEGIANA" vs "Parmegiana"), isso prova que não existe erro
+    real ali (dúvida não é erro) - descarta esse item antes de montar a resposta, em vez de
+    mandar pro Tripa uma "correção" contraditória tipo "PARMEGIANA está errado, o correto é
+    PARMEGIANA"."""
     prompt_usuario = "Revise essa peça em busca de erros de escrita." + (f" Legenda enviada junto: {caption}" if caption else "")
     resultado = chamar_claude(SYSTEM_PROMPT_REVISAO, prompt_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64)
 
-    if resultado.get("tem_erro"):
-        erros = resultado.get("erros") or []
-        texto_resp = "⚠️ Encontrei possíveis erros na peça:\n" + "\n".join(f"- {e}" for e in erros)
+    erros_brutos = resultado.get("erros") or []
+    erros_validos = []
+    for e in erros_brutos:
+        if isinstance(e, dict):
+            original = (e.get("trecho_original") or "").strip()
+            correcao = (e.get("correcao") or "").strip()
+            if original and correcao and original.lower() == correcao.lower():
+                # mesma palavra, so mudando caixa alta/baixa - nao e erro nenhum, descarta.
+                continue
+            erros_validos.append(e)
+        elif e:
+            # formato antigo (string solta) - mantido por compatibilidade, sem como validar
+            # automaticamente contradição original==correção nesse caso.
+            erros_validos.append(e)
+
+    tem_erro = bool(erros_validos)
+    if tem_erro:
+        linhas_erro = []
+        for e in erros_validos:
+            if isinstance(e, dict):
+                original = e.get("trecho_original", "")
+                correcao = e.get("correcao", "")
+                explicacao = e.get("explicacao", "")
+                linha = f"\"{original}\" → devia ser \"{correcao}\""
+                if explicacao:
+                    linha += f" ({explicacao})"
+                linhas_erro.append(linha)
+            else:
+                linhas_erro.append(str(e))
+        texto_resp = "⚠️ Encontrei possíveis erros na peça:\n" + "\n".join(f"- {l}" for l in linhas_erro)
     else:
         texto_resp = "✅ Revisei e não encontrei erros de escrita. Está tudo certo!"
     if resultado.get("observacao"):
         texto_resp += f"\n\nObs: {resultado['observacao']}"
 
-    return bool(resultado.get("tem_erro")), texto_resp, resultado
+    resultado["erros"] = erros_validos
+    resultado["tem_erro"] = tem_erro
+    return tem_erro, texto_resp, resultado
 
 
 def _identificar_cliente_para_conferencia_dm(caption, grupo_jid_dm):
