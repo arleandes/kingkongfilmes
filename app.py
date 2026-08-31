@@ -775,6 +775,24 @@ A agência atende três tipos de demanda: pedidos de arte (peças gráficas), pe
 (vídeos/filmagens) e dúvidas gerais (status, prazos, etc). A empresa só presta atendimento,
 nunca tenta vender nada na resposta.
 
+COMO INTERPRETAR A CONVERSA (muito importante): uma mensagem isolada raramente conta a história
+toda. No WhatsApp é comum a pessoa dividir uma única ideia em várias mensagens seguidas ("preciso
+de um card" / "pro evento de sexta" / "começa às 20h" / "usa a foto que mandei ontem") - isso NÃO
+são 4 pedidos, é 1 só. Quando você receber várias mensagens da mesma leva (vêm numeradas numa
+lista abaixo), trate-as como fragmentos da MESMA fala, salvo se ficar claro que mudou de assunto de
+verdade no meio (ex: termina de pedir a arte e depois, sem relação, comenta sobre um vídeo antigo -
+aí são dois assuntos). Antes de responder/organizar o pedido, reconstrua mentalmente: (1) qual
+assunto está sendo discutido; (2) a mensagem é um PEDIDO NOVO, um COMPLEMENTO/correção de algo que
+já estava sendo pedido (ex: cliente disse "Heineken" e depois "melhor Brahma" - o pedido final é
+Brahma, a informação mais recente substitui a anterior, não soma as duas), ou uma APROVAÇÃO do que
+a equipe já entregou (ex: "perfeito", "pode postar" depois de um card enviado - isso não é um pedido
+novo)? (3) existe alguma referência implícita ("esse", "aquele", "o de ontem", "igual à semana
+passada", "só muda a data/preço") que só faz sentido olhando pro HISTÓRICO RECENTE DO GRUPO (se
+vier preenchido abaixo)? Tente resolver a referência usando esse histórico; se não conseguir
+identificar com razoável confiança do que se trata, NUNCA invente - marque "duvida_geral" true e,
+em "resposta_cliente", confirme o recebimento de forma neutra (a equipe vai esclarecer), sem
+inventar a que a referência se refere.
+
 ESCOPO DE SERVIÇO: a Correria é uma agência de marketing digital que atende empresas
 (conteúdo de redes sociais, vídeos, artes, campanhas). Ela NÃO faz cobertura de eventos sociais
 pessoais como casamento, aniversário de família, formatura, etc. Se o cliente perguntar sobre um
@@ -1116,6 +1134,17 @@ def _finalizar_processamento_grupo(chave):
             "junto:\n" + "\n".join(f"{i+1}) {t}" for i, t in enumerate(textos))
         )
 
+    # Mensagens anteriores desse mesmo grupo (excluindo a leva atual, que ja esta em
+    # conteudo_texto) - da pro modelo condicoes de resolver referencias tipo "aquele",
+    # "o de ontem", "igual a semana passada", em vez de tentar adivinhar sem contexto.
+    historico_grupo = buscar_mensagens_recentes_grupo(remote_jid, limite=12 + len(textos))
+    historico_grupo = historico_grupo[:-len(textos)] if len(historico_grupo) > len(textos) else []
+    bloco_historico = (
+        "HISTÓRICO RECENTE DO GRUPO (mais antigo primeiro, pra ajudar a entender referências\n"
+        "a pedidos/materiais anteriores):\n"
+        + "\n".join(f"- {m['autor']}: {m['conteudo']}" for m in historico_grupo) + "\n\n"
+    ) if historico_grupo else ""
+
     dentro_horario = dentro_do_horario_comercial()
     regras_extras = listar_regras()
     bloco_regras = ""
@@ -1127,6 +1156,7 @@ def _finalizar_processamento_grupo(chave):
         )
     prompt_usuario = (
         f"{bloco_regras}"
+        f"{bloco_historico}"
         f"Nome do cliente: {sender_name}\n"
         f"Grupo: {grupo['nome']}\n"
         f"Está dentro do horário comercial agora? {'sim' if dentro_horario else 'não'}\n"
@@ -1142,6 +1172,7 @@ def _finalizar_processamento_grupo(chave):
     resposta_cliente = resultado.get("resposta_cliente", "")
     if resposta_cliente:
         enviar_texto(remote_jid, resposta_cliente)
+        registrar_mensagem_grupo(remote_jid, grupo["nome"], "Cintia", resposta_cliente, True)
 
     # Pedido de arte: organiza e encaminha pro grupo Tripa Designer, junto com
     # todas as fotos/PDFs que o cliente mandou nessa leva de mensagens (se tiver).
@@ -1210,7 +1241,7 @@ SYSTEM_PROMPT_LEMBRETE = """Você é a Cintia, assistente virtual da Correria, f
 DM de WhatsApp com {pessoa_nome}, sócio/responsável da agência. A data/hora atual é: {agora_iso}
 (horário de Brasília, America/Bahia).
 
-{contexto_fatos}Classifique a mensagem em UM dos tipos abaixo (o mais específico que se aplicar -
+{contexto_conversa}{contexto_fatos}Classifique a mensagem em UM dos tipos abaixo (o mais específico que se aplicar -
 um pedido de lembrete não é um comando pro Tripa, um fato pra guardar não é um lembrete, etc):
 
 1) PEDIDO DE NOVO LEMBRETE (ex: "me lembra de ligar pro cliente X às 15h", "lembra eu de mandar o
@@ -1276,13 +1307,30 @@ um pedido de lembrete não é um comando pro Tripa, um fato pra guardar não é 
    -03:00). IMPORTANTE: você NUNCA agenda isso direto - só organiza os dados, quem confirma o
    agendamento de verdade é sempre {pessoa_nome} (vai ver um preview antes).
 
+8) PERGUNTA SOBRE MÉTRICAS/DESEMPENHO DE ALGUM CLIENTE NO METRICOOL (ex: "como estão os
+   seguidores esse mês do Zurca no metricool", "me manda o desempenho do instagram da Terapia essa
+   semana", "como foram os posts do Latidos e Miados no facebook no último mês", "quantas pessoas
+   os reels da Zurca alcançaram") - {pessoa_nome} quer CONSULTAR dados/métricas reais de alguma
+   rede social de cliente, gravados no Metricool (diferente do tipo 7, que é pra AGENDAR/publicar
+   algo novo). Marque "eh_pergunta_metricool_metricas" como true e preencha
+   "metricool_metrica_cliente" com o nome do cliente/marca mencionado (o mais parecido possível com
+   o nome real), "metricool_metrica_rede" com "instagram" ou "facebook" (se a pessoa não disser
+   qual rede, assuma "instagram"; métricas de Google Business Profile ainda não são suportadas -
+   nesse caso deixe "eh_pergunta_metricool_metricas" false e explique em "resposta_conversa" que
+   por enquanto só dá pra consultar Instagram e Facebook), "metricool_metrica_tipo" com
+   "seguidores", "reels" ou "posts" (o mais parecido com o que foi pedido - assuma "posts" se a
+   pessoa só pediu "desempenho"/"como está indo" de forma genérica) e "metricool_metrica_dias" com
+   o número de dias do período pedido (ex: "essa semana" = 7, "esse mês"/"último mês" = 30, "hoje" =
+   1 - assuma 30 se não ficar claro).
+
 5) QUALQUER OUTRA COISA (comentário, resposta a um lembrete anterior, pedido/comando que não se
    encaixa nos tipos acima) - preencha "resposta_conversa" com uma resposta natural e útil, como
    uma colega de equipe responderia no privado. Se os FATOS QUE VOCÊ JÁ SABE (se houver, no topo
    deste prompt) tiverem a resposta pra uma pergunta, use-os pra responder direto. Se for um
    pedido/comando que você ainda não tem como executar automaticamente, confirme que entendeu e que
    vai anotar/repassar, sem inventar que já fez algo que não fez. Nunca deixe esse campo vazio
-   quando nenhum dos tipos 1/2/3/4/6/7 acima se aplicar - toda mensagem privada precisa de resposta.
+   quando nenhum dos tipos 1/2/3/4/6/7/8 acima se aplicar - toda mensagem privada precisa de
+   resposta.
 
 IMPORTANTE sobre datas/horários: qualquer campo "*_iso" deve conter APENAS a data/hora em formato
 ISO 8601 com fuso -03:00 (exemplo: 2026-08-29T15:00:00-03:00), sem nenhum texto explicativo junto,
@@ -1306,7 +1354,7 @@ pergunta de ambiguidade anterior sua.
 Responda SEMPRE E APENAS em JSON válido, numa única linha por valor, neste formato exato,
 sem usar bloco de código markdown (nada de ```) e sem quebras de linha dentro dos valores. Inclua
 TODAS as chaves sempre, mesmo vazias/false quando não se aplicarem:
-{"eh_pedido_de_lembrete": true ou false, "destinatario_lembrete": "torres, luan ou tripa - quem deve receber o lembrete", "eh_recorrente": true ou false, "recorrencia_dia_mes": "dia do mes (1-31) se for recorrente mensal, ou string vazia", "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_pergunta_sobre_grupo": true ou false, "grupo_perguntado": "nome do grupo mencionado, ou string vazia", "eh_pergunta_atividade_geral": true ou false, "eh_comando_para_tripa": true ou false, "mensagem_tripa": "texto pronto pra encaminhar pro grupo Tripa, ou string vazia", "tem_cobranca": true ou false, "horario_cobranca_iso": "horario ISO da cobranca, ou string vazia", "pergunta_cobranca": "pergunta curta pra mandar na cobranca, ou string vazia", "eh_comando_metricool": true ou false, "metricool_cliente": "nome do cliente/marca, ou string vazia", "metricool_redes": ["instagram"], "metricool_tipo": "feed, story ou reel", "metricool_link_media": "link publico da midia, ou string vazia", "metricool_texto": "legenda do post, ou string vazia", "metricool_data_hora_iso": "horario ISO pra publicar, ou string vazia", "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/3/4/6/7 acima for verdadeiro"}
+{"eh_pedido_de_lembrete": true ou false, "destinatario_lembrete": "torres, luan ou tripa - quem deve receber o lembrete", "eh_recorrente": true ou false, "recorrencia_dia_mes": "dia do mes (1-31) se for recorrente mensal, ou string vazia", "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_pergunta_sobre_grupo": true ou false, "grupo_perguntado": "nome do grupo mencionado, ou string vazia", "eh_pergunta_atividade_geral": true ou false, "eh_comando_para_tripa": true ou false, "mensagem_tripa": "texto pronto pra encaminhar pro grupo Tripa, ou string vazia", "tem_cobranca": true ou false, "horario_cobranca_iso": "horario ISO da cobranca, ou string vazia", "pergunta_cobranca": "pergunta curta pra mandar na cobranca, ou string vazia", "eh_comando_metricool": true ou false, "metricool_cliente": "nome do cliente/marca, ou string vazia", "metricool_redes": ["instagram"], "metricool_tipo": "feed, story ou reel", "metricool_link_media": "link publico da midia, ou string vazia", "metricool_texto": "legenda do post, ou string vazia", "metricool_data_hora_iso": "horario ISO pra publicar, ou string vazia", "eh_pergunta_metricool_metricas": true ou false, "metricool_metrica_cliente": "nome do cliente/marca, ou string vazia", "metricool_metrica_rede": "instagram ou facebook", "metricool_metrica_tipo": "seguidores, reels ou posts", "metricool_metrica_dias": 30, "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/3/4/6/7/8 acima for verdadeiro"}
 """
 
 
@@ -2037,6 +2085,125 @@ def metricool_agendar_post(blog_id, redes, tipo_generico, texto, media_url, data
         return False, "Não consegui falar com o Metricool agora, tenta de novo daqui a pouco?"
 
 
+def _metricool_periodo(dias):
+    """Calcula o inicio/fim (hoje, horario de Bahia) de um periodo de N dias pra
+    consulta de metricas, devolvendo tanto o formato YYYY-MM-DD (usado pelos
+    endpoints /stats/*) quanto o ISO completo (usado pelos endpoints /v2/analytics/*)."""
+    fim = horario_bahia_agora()
+    inicio = fim - timedelta(days=max(dias, 1))
+    return inicio, fim
+
+
+def metricool_seguidores(blog_id, rede, dias):
+    """Evolucao de seguidores no periodo, via /stats/timeling/{metrica} - confirmado
+    na documentacao oficial do Metricool só pra Instagram (metrica "igFollowers");
+    outras redes ainda nao tem a metrica confirmada, entao avisamos a limitacao em
+    vez de arriscar um endpoint que pode nem existir."""
+    if rede != "instagram":
+        return False, "Por enquanto só consigo consultar evolução de seguidores pro Instagram - Facebook ainda não está disponível."
+    inicio, fim = _metricool_periodo(dias)
+    try:
+        resp = requests.get(
+            f"{METRICOOL_BASE_URL}/stats/timeling/igFollowers",
+            headers=metricool_headers(),
+            params={
+                "userId": METRICOOL_USER_ID, "blogId": blog_id,
+                "start": inicio.strftime("%Y%m%d"), "end": fim.strftime("%Y%m%d"),
+            },
+            timeout=20,
+        )
+        if resp.status_code >= 400:
+            print(f"[metricool_seguidores] ERRO {resp.status_code}: {resp.text[:800]}", flush=True)
+            return False, f"O Metricool não conseguiu me dar essa informação agora (erro {resp.status_code})."
+        corpo = resp.json()
+        pontos = corpo.get("data", corpo) if isinstance(corpo, dict) else corpo
+        if not pontos:
+            return True, f"Não encontrei dados de seguidores do Instagram nos últimos {dias} dias."
+        primeiro = pontos[0].get("value", pontos[0].get("y"))
+        ultimo = pontos[-1].get("value", pontos[-1].get("y"))
+        if primeiro is None or ultimo is None:
+            return True, f"Encontrei dados de seguidores, mas não consegui ler os números direito - dá uma conferida direto no Metricool pra garantir."
+        diferenca = ultimo - primeiro
+        sinal = "+" if diferenca >= 0 else ""
+        return True, (
+            f"Seguidores no Instagram nos últimos {dias} dias: {int(ultimo)} agora "
+            f"({sinal}{int(diferenca)} em relação a {inicio.strftime('%d/%m')})."
+        )
+    except Exception as e:
+        print(f"[metricool_seguidores] falhou: {e}", flush=True)
+        return False, "Não consegui falar com o Metricool agora, tenta de novo daqui a pouco?"
+
+
+def _somar_metricas_posts(lista_posts):
+    """Soma os campos numericos mais comuns que os posts do Metricool trazem -
+    escrito de forma tolerante a variacao de nome de campo entre versoes da API
+    (ex: "shares" vs "shareCount"), ja que nao tenho o schema oficial completo."""
+    def pegar(post, *chaves):
+        for chave in chaves:
+            valor = post.get(chave)
+            if isinstance(valor, (int, float)):
+                return valor
+        return 0
+
+    totais = {"likes": 0, "comentarios": 0, "compartilhamentos": 0, "alcance": 0, "impressoes": 0}
+    for post in lista_posts:
+        totais["likes"] += pegar(post, "likes", "likeCount")
+        totais["comentarios"] += pegar(post, "comments", "commentCount")
+        totais["compartilhamentos"] += pegar(post, "shares", "shareCount")
+        totais["alcance"] += pegar(post, "reach", "reachCount")
+        totais["impressoes"] += pegar(post, "impressions", "impressionCount")
+    return totais
+
+
+def metricool_resumo_posts_ou_reels(blog_id, rede, tipo, dias):
+    """Busca posts ou reels publicados no periodo (/v2/analytics/posts|reels/{rede})
+    e devolve um resumo agregado em texto. Endpoints confirmados: reels/instagram
+    (doc oficial do Metricool); posts/{rede} e reels/facebook seguem o mesmo padrao
+    de URL, mas ainda nao foram testados em produção - se a API recusar, avisamos
+    o erro real em vez de inventar um numero."""
+    inicio, fim = _metricool_periodo(dias)
+    caminho = "reels" if tipo == "reels" else "posts"
+    try:
+        resp = requests.get(
+            f"{METRICOOL_BASE_URL}/v2/analytics/{caminho}/{rede}",
+            headers=metricool_headers(),
+            params={
+                "userId": METRICOOL_USER_ID, "blogId": blog_id,
+                "from": inicio.strftime("%Y-%m-%dT00:00:00"), "to": fim.strftime("%Y-%m-%dT23:59:59"),
+            },
+            timeout=20,
+        )
+        if resp.status_code >= 400:
+            print(f"[metricool_resumo_posts_ou_reels] ERRO {resp.status_code}: {resp.text[:800]}", flush=True)
+            return False, f"O Metricool não conseguiu me dar essa informação agora (erro {resp.status_code})."
+        corpo = resp.json()
+        lista = corpo.get("data", corpo) if isinstance(corpo, dict) else corpo
+        if not lista:
+            return True, f"Não teve nenhum {'reel' if tipo == 'reels' else 'post'} publicado nos últimos {dias} dias."
+        totais = _somar_metricas_posts(lista)
+        nome_tipo = "reels" if tipo == "reels" else "posts"
+        return True, (
+            f"{len(lista)} {nome_tipo} nos últimos {dias} dias: {totais['likes']} curtidas, "
+            f"{totais['comentarios']} comentários, {totais['compartilhamentos']} compartilhamentos, "
+            f"alcance de {totais['alcance']} e {totais['impressoes']} impressões (somados)."
+        )
+    except Exception as e:
+        print(f"[metricool_resumo_posts_ou_reels] falhou: {e}", flush=True)
+        return False, "Não consegui falar com o Metricool agora, tenta de novo daqui a pouco?"
+
+
+def metricool_responder_metricas(marca, rede, tipo, dias):
+    """Ponto de entrada unico pra qualquer pergunta de metrica: escolhe a funcao
+    certa pelo tipo pedido e devolve o texto pronto pra mandar no WhatsApp."""
+    blog_id = marca["id"]
+    if tipo == "seguidores":
+        sucesso, texto = metricool_seguidores(blog_id, rede, dias)
+    else:
+        sucesso, texto = metricool_resumo_posts_ou_reels(blog_id, rede, tipo, dias)
+    prefixo = f"📊 *{marca['label']}* ({rede}):\n" if sucesso else ""
+    return f"{prefixo}{texto}"
+
+
 # Comando de agendamento Metricool pendente de confirmacao, por pessoa (torres/luan) -
 # mesmo padrao ja usado pro comando de repassar pro Tripa (mostra preview, so agenda
 # de verdade depois do "sim").
@@ -2057,6 +2224,15 @@ def processar_dm(remote_jid, key, data):
     # defesa contra falha/esquecimento, nao so pra lembrete/fato/comando reconhecido.
     grupo_jid_dm = f"dm_{pessoa}"
     grupo_nome_dm = "Privado - Torres" if pessoa == "torres" else "Privado - Luan"
+
+    def responder(texto_resposta):
+        """Manda a resposta pro WhatsApp e guarda ela tambem no historico do DM, do
+        mesmo jeito que a mensagem recebida - assim a proxima mensagem da pessoa (e
+        qualquer consulta de historico) enxerga os dois lados da conversa, nao so o
+        que ela escreveu. Sem isso, um "isso"/"está público"/"foi isso mesmo" logo
+        depois de uma pergunta da Cintia nao tinha como ser entendido."""
+        registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", texto_resposta, False)
+        enviar_texto(numero, texto_resposta)
 
     message = data.get("message", {})
     message_type = data.get("messageType", "")
@@ -2082,7 +2258,7 @@ def processar_dm(remote_jid, key, data):
             texto = ""
         if not texto:
             registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, pessoa, "[mandou um áudio que não pôde ser transcrito]", True)
-            enviar_texto(numero, "Recebi seu áudio mas não consegui entender o que foi dito, pode escrever ou mandar de novo?")
+            responder("Recebi seu áudio mas não consegui entender o que foi dito, pode escrever ou mandar de novo?")
             return {"skipped": "áudio não transcrito"}
         registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, pessoa, f"[áudio] {texto}", True)
     # Video no privado: ainda nao processamos pedido de video (so imagem/PDF), mas registra
@@ -2091,7 +2267,7 @@ def processar_dm(remote_jid, key, data):
         caption_video = message.get("videoMessage", {}).get("caption", "")
         conteudo_video = f"[vídeo com a legenda: {caption_video}]" if caption_video else "[mandou um vídeo, sem legenda]"
         registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, pessoa, conteudo_video, True)
-        enviar_texto(numero, "Recebi o vídeo! Só não processo vídeo diretamente por aqui ainda (só imagem e PDF) - mas já fica registrado.")
+        responder("Recebi o vídeo! Só não processo vídeo diretamente por aqui ainda (só imagem e PDF) - mas já fica registrado.")
         return {"video_registrado": True}
     else:
         texto = message.get("conversation", "")
@@ -2110,10 +2286,10 @@ def processar_dm(remote_jid, key, data):
         texto_regra = texto.split(":", 1)[1].strip()
         if texto_regra:
             salvar_regra(pessoa, texto_regra)
-            enviar_texto(numero, f'Anotado! ✅ Vou seguir essa regra a partir de agora: "{texto_regra}"')
+            responder(f'Anotado! ✅ Vou seguir essa regra a partir de agora: "{texto_regra}"')
             return {"regra_salva": texto_regra, "autor": pessoa}
         else:
-            enviar_texto(numero, "Entendi que é uma regra nova, mas não veio nenhum texto depois de \"regra:\". Pode mandar de novo com a instrução?")
+            responder("Entendi que é uma regra nova, mas não veio nenhum texto depois de \"regra:\". Pode mandar de novo com a instrução?")
             return {"skipped": "regra vazia"}
 
     # Pedido de correção de texto ("corrija o texto com o tom formal/cordial: ...") tem
@@ -2140,11 +2316,11 @@ def processar_dm(remote_jid, key, data):
                     aviso_cobranca = " Vou cobrar eles no horário combinado."
                 agendar_cobranca_tripa(pendente["horario_cobranca"], pendente["pergunta_cobranca"])
             _comandos_pendentes.pop(pessoa, None)
-            enviar_texto(numero, "Show, encaminhei pra Tripa! ✅" + aviso_cobranca)
+            responder("Show, encaminhei pra Tripa! ✅" + aviso_cobranca)
             return {"comando_tripa_confirmado": True}
         elif confirma is False:
             _comandos_pendentes.pop(pessoa, None)
-            enviar_texto(numero, "Beleza, não mandei nada. Se quiser, me manda de novo do jeito certo.")
+            responder("Beleza, não mandei nada. Se quiser, me manda de novo do jeito certo.")
             return {"comando_tripa_cancelado": True}
         # confirma is None: nao pareceu sim/nem nao, segue o fluxo normal (pode ser uma
         # mensagem nova, ou uma correcao ao comando pendente - nesse caso o comando antigo
@@ -2165,13 +2341,13 @@ def processar_dm(remote_jid, key, data):
             )
             _comandos_metricool_pendentes.pop(pessoa, None)
             if sucesso:
-                enviar_texto(numero, f"Agendado! ✅ {pendente_metricool['resumo']}")
+                responder(f"Agendado! ✅ {pendente_metricool['resumo']}")
             else:
-                enviar_texto(numero, f"Não consegui agendar: {mensagem_resultado}")
+                responder(f"Não consegui agendar: {mensagem_resultado}")
             return {"metricool_agendamento_confirmado": sucesso}
         elif confirma_metricool is False:
             _comandos_metricool_pendentes.pop(pessoa, None)
-            enviar_texto(numero, "Beleza, não agendei nada.")
+            responder("Beleza, não agendei nada.")
             return {"metricool_agendamento_cancelado": True}
         # None: segue o fluxo normal, o agendamento pendente continua ate o TTL expirar.
 
@@ -2186,11 +2362,11 @@ def processar_dm(remote_jid, key, data):
         if confirma_promessa is True:
             promessa = _promessas_pendentes.pop(0)
             salvar_fato(pessoa, promessa["texto"])
-            enviar_texto(numero, f"Anotado! ✅ Vou guardar: \"{promessa['texto']}\"")
+            responder(f"Anotado! ✅ Vou guardar: \"{promessa['texto']}\"")
             return {"promessa_guardada": promessa["texto"]}
         elif confirma_promessa is False:
             _promessas_pendentes.pop(0)
-            enviar_texto(numero, "Beleza, não guardei nada.")
+            responder("Beleza, não guardei nada.")
             return {"promessa_descartada": True}
         # None: nao pareceu confirmacao, segue o fluxo normal - a promessa continua na fila
         # esperando ate o TTL expirar ou alguem confirmar/recusar.
@@ -2204,12 +2380,25 @@ def processar_dm(remote_jid, key, data):
         "FATOS QUE VOCÊ JÁ SABE (use quando fizer sentido pra responder):\n"
         + "\n".join(f"- {f}" for f in fatos) + "\n\n"
     ) if fatos else ""
+    # Ultimas mensagens trocadas nesse DM (dos dois lados, ja que agora a Cintia
+    # tambem registra o que ela mesma responde) - sem isso, cada mensagem era
+    # classificada isolada, sem noção do que tinha acabado de ser perguntado/
+    # combinado, e por isso um "sim"/"isso"/"está público" solto não fazia sentido
+    # pra ela fora do fluxo de confirmação pendente.
+    historico_dm = buscar_mensagens_recentes_grupo(grupo_jid_dm, limite=13)[:-1]
+    contexto_conversa = (
+        "ÚLTIMAS MENSAGENS DESSA CONVERSA (mais antiga primeiro - use pra entender o\n"
+        "contexto, ex: se \"isso\"/\"esse\"/\"sim\" está se referindo a algo que você acabou\n"
+        "de perguntar ou a um pedido de poucas mensagens atrás):\n"
+        + "\n".join(f"- {m['autor']}: {m['conteudo']}" for m in historico_dm) + "\n\n"
+    ) if historico_dm else ""
     lista_grupos = "\n".join(
         f"- {info['nome']}" for info in GRUPOS.values() if not info.get("interno")
     )
     prompt_sistema = (
         SYSTEM_PROMPT_LEMBRETE
         .replace("{agora_iso}", agora.isoformat())
+        .replace("{contexto_conversa}", contexto_conversa)
         .replace("{contexto_fatos}", contexto_fatos)
         .replace("{pessoa_nome}", "Torres" if pessoa == "torres" else "Luan")
         .replace("{lista_grupos}", lista_grupos)
@@ -2217,14 +2406,14 @@ def processar_dm(remote_jid, key, data):
     try:
         resultado = chamar_claude(prompt_sistema, texto)
     except Exception as e:
-        enviar_texto(numero, "Tive um problema pra processar sua mensagem agora, pode mandar de novo?")
+        responder("Tive um problema pra processar sua mensagem agora, pode mandar de novo?")
         return {"erro_claude": str(e), "lembrete_anterior_resolvido": tinha_pendente}
 
     if resultado.get("eh_pedido_de_lembrete"):
         try:
             alvo = datetime.fromisoformat(resultado["data_hora_alvo_iso"])
         except Exception:
-            enviar_texto(numero, "Entendi que você quer um lembrete, mas não consegui identificar o horário certinho. Pode me falar de novo com a hora?")
+            responder("Entendi que você quer um lembrete, mas não consegui identificar o horário certinho. Pode me falar de novo com a hora?")
             return {"erro": "não conseguiu parsear data_hora_alvo_iso", "resultado": resultado}
 
         texto_lembrete = resultado.get("texto_lembrete", texto)
@@ -2248,15 +2437,15 @@ def processar_dm(remote_jid, key, data):
             quando = f"às {alvo.strftime('%H:%M')}" if not repetir else "10 min antes"
 
         if quem_recebe == "você":
-            enviar_texto(numero, f"Combinado! Vou te lembrar {quando}: \"{texto_lembrete}\" 👍")
+            responder(f"Combinado! Vou te lembrar {quando}: \"{texto_lembrete}\" 👍")
         else:
-            enviar_texto(numero, f"Combinado! Vou lembrar {quem_recebe} {quando}: \"{texto_lembrete}\" 👍")
+            responder(f"Combinado! Vou lembrar {quem_recebe} {quando}: \"{texto_lembrete}\" 👍")
     elif resultado.get("eh_fato_para_lembrar") and resultado.get("fato_texto"):
         salvar_fato(pessoa, resultado["fato_texto"])
-        enviar_texto(numero, f"Anotado! ✅ Vou lembrar: \"{resultado['fato_texto']}\"")
+        responder(f"Anotado! ✅ Vou lembrar: \"{resultado['fato_texto']}\"")
     elif resultado.get("eh_pergunta_atividade_geral"):
         pessoa_nome_geral = "Torres" if pessoa == "torres" else "Luan"
-        enviar_texto(numero, responder_atividade_geral_hoje(pessoa_nome_geral))
+        responder(responder_atividade_geral_hoje(pessoa_nome_geral))
     elif resultado.get("eh_pergunta_sobre_grupo") and resultado.get("grupo_perguntado"):
         grupo_jid_pergunta = identificar_grupo_mencionado(resultado["grupo_perguntado"])
         if not grupo_jid_pergunta:
@@ -2269,7 +2458,7 @@ def processar_dm(remote_jid, key, data):
             grupo_nome_pergunta = GRUPOS[grupo_jid_pergunta]["nome"]
             pessoa_nome = "Torres" if pessoa == "torres" else "Luan"
             resposta = responder_pergunta_sobre_grupo(pessoa_nome, texto, grupo_jid_pergunta, grupo_nome_pergunta)
-            enviar_texto(numero, resposta)
+            responder(resposta)
     elif resultado.get("eh_comando_para_tripa") and resultado.get("mensagem_tripa"):
         mensagem_tripa = resultado["mensagem_tripa"]
         tem_cobranca = bool(resultado.get("tem_cobranca"))
@@ -2318,18 +2507,18 @@ def processar_dm(remote_jid, key, data):
                 "essa marca cadastrada no Metricool. Pode confirmar o nome certinho?",
             )
         elif not redes_pedidas:
-            enviar_texto(numero, "Entendi o pedido, mas não ficou claro em qual rede (Instagram, Facebook ou Google) - pode me confirmar?")
+            responder("Entendi o pedido, mas não ficou claro em qual rede (Instagram, Facebook ou Google) - pode me confirmar?")
         elif not link_media:
-            enviar_texto(numero, "Beleza, só falta o link da mídia (Drive ou outro link público) - pode mandar?")
+            responder("Beleza, só falta o link da mídia (Drive ou outro link público) - pode mandar?")
         elif not data_hora_str:
-            enviar_texto(numero, "Beleza, só falta o dia e horário pra publicar - pode me confirmar?")
+            responder("Beleza, só falta o dia e horário pra publicar - pode me confirmar?")
         else:
             try:
                 dt_preview = datetime.fromisoformat(data_hora_str)
             except Exception:
                 dt_preview = None
             if not dt_preview:
-                enviar_texto(numero, "Não consegui entender o horário certinho pra esse agendamento, pode confirmar de novo?")
+                responder("Não consegui entender o horário certinho pra esse agendamento, pode confirmar de novo?")
             else:
                 tipo_pedido = (resultado.get("metricool_tipo") or "feed").lower()
                 texto_legenda = resultado.get("metricool_texto") or ""
@@ -2355,13 +2544,27 @@ def processar_dm(remote_jid, key, data):
                     f"Vou agendar isso no Metricool:\n\n{resumo}{preview_legenda}\n🔗 Mídia: {link_media}\n\n"
                     "Confirma? (responde \"sim\" ou \"não\")",
                 )
+    elif resultado.get("eh_pergunta_metricool_metricas"):
+        nome_cliente_metrica = resultado.get("metricool_metrica_cliente") or ""
+        marca_metrica = metricool_identificar_marca(nome_cliente_metrica)
+        rede_metrica = resultado.get("metricool_metrica_rede") or "instagram"
+        tipo_metrica = resultado.get("metricool_metrica_tipo") or "posts"
+        dias_metrica = resultado.get("metricool_metrica_dias") or 30
+        if not marca_metrica:
+            enviar_texto(
+                numero,
+                f"Entendi que é sobre métricas do cliente \"{nome_cliente_metrica}\", mas não achei "
+                "essa marca cadastrada no Metricool. Pode confirmar o nome certinho?",
+            )
+        else:
+            responder(metricool_responder_metricas(marca_metrica, rede_metrica, tipo_metrica, dias_metrica))
     elif tinha_pendente:
-        enviar_texto(numero, "Combinado, marquei como resolvido! ✅")
+        responder("Combinado, marquei como resolvido! ✅")
     else:
         # Nao e pedido de lembrete nem resposta fechando uma pendencia - mesmo assim,
         # toda mensagem no privado precisa de alguma resposta (nunca ficar em silencio).
         resposta_conversa = resultado.get("resposta_conversa") or "Beleza, recebi aqui! 👍"
-        enviar_texto(numero, resposta_conversa)
+        responder(resposta_conversa)
 
     return {"resultado": resultado, "lembrete_anterior_resolvido": tinha_pendente}
 
