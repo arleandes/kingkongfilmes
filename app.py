@@ -376,6 +376,29 @@ def identificar_grupo_mencionado(texto):
     return melhor
 
 
+def identificar_grupos_candidatos(texto):
+    """Parecido com identificar_grupo_mencionado, mas devolve TODOS os grupos de cliente cujo
+    nome aparece mencionado no texto (nao so o "melhor" match) - usado quando precisamos saber
+    se uma mencao e ambigua (bate com mais de um cliente) antes de agir, em vez de escolher um
+    silenciosamente. Ex: se um dia existirem "Terapia Beach" e "Terapia Eventos", mencionar so
+    "Terapia" deve gerar uma pergunta de confirmacao, nunca uma escolha arbitraria."""
+    texto_norm = normalizar_texto(texto)
+    candidatos = []
+    for jid, info in GRUPOS.items():
+        if info.get("interno"):
+            continue
+        nome_norm = normalizar_texto(info["nome"])
+        bateu = bool(nome_norm) and nome_norm in texto_norm
+        if not bateu:
+            for palavra in nome_norm.split():
+                if len(palavra) >= 4 and palavra not in _STOPWORDS_NOME_CLIENTE and palavra in texto_norm:
+                    bateu = True
+                    break
+        if bateu:
+            candidatos.append(jid)
+    return candidatos
+
+
 def _mensagem_de_hoje(mensagem_criado_em, inicio_dia):
     """Compara o timestamp (string ISO, do fallback em memoria) de uma mensagem registrada
     com o inicio do dia atual (horario de Bahia), pra saber se ela e de hoje."""
@@ -1379,6 +1402,23 @@ um pedido de lembrete não é um comando pro Tripa, um fato pra guardar não é 
    IMPORTANTE: você NUNCA envia isso direto - só organiza o conteúdo, quem decide se confirma o
    envio é sempre {pessoa_nome} (vai ver um preview antes).
 
+9) COMANDO PRA ANALISAR A CONVERSA DE UM CLIENTE E MONTAR UM BRIEFING PRA TRIPA (ex: "Cintia,
+   analise o pedido do Terapia e passa pra Tripa", "veja o que ficou decidido com o Zurca sobre a
+   promoção e manda pro designer", "pega tudo que foi resolvido no grupo do Terapia sobre o
+   executivo e organiza pra criação", "passa isso pra Tripa" logo depois de vocês terem comentado
+   sobre um cliente específico nas ÚLTIMAS MENSAGENS acima) - diferente do tipo 4: aqui {pessoa_nome}
+   NÃO está ditando o conteúdo a ser mandado, está pedindo pra você IR NA CONVERSA do cliente,
+   entender o que foi decidido (inclusive juntando correções que vieram depois, por texto ou
+   áudio) e montar o pedido organizado sozinha. Marque "eh_comando_briefing_cliente" como true e
+   preencha: "briefing_cliente_nome" com o nome do cliente/grupo mencionado (pode vir só pelo nome
+   do cliente, tipo "Terapia", "Zurca" - não precisa ser o nome completo do grupo; se não foi
+   mencionado na mensagem atual mas ficou claro pelas ÚLTIMAS MENSAGENS acima que vocês estavam
+   falando de um cliente específico, use esse nome); e "briefing_assunto" com uma pista curta do
+   assunto/tema que {pessoa_nome} quer que seja analisado (ex: "promoção do prato executivo"), ou
+   string vazia se ele não especificou (nesse caso, o assunto mais recente/relevante da conversa é
+   usado). Você NÃO gera o conteúdo do briefing aqui - só identifica a intenção e o cliente/assunto,
+   quem monta o briefing de verdade é outra etapa que já tem acesso ao histórico completo.
+
 8) PERGUNTA SOBRE MÉTRICAS/DESEMPENHO DE ALGUM CLIENTE NO METRICOOL (ex: "como estão os
    seguidores esse mês do Zurca no metricool", "me manda o desempenho do instagram da Terapia essa
    semana", "como foram os posts do Latidos e Miados no facebook no último mês", "quantas pessoas
@@ -1400,7 +1440,7 @@ um pedido de lembrete não é um comando pro Tripa, um fato pra guardar não é 
    deste prompt) tiverem a resposta pra uma pergunta, use-os pra responder direto. Se for um
    pedido/comando que você ainda não tem como executar automaticamente, confirme que entendeu e que
    vai anotar/repassar, sem inventar que já fez algo que não fez. Nunca deixe esse campo vazio
-   quando nenhum dos tipos 1/2/3/4/6/8 acima se aplicar - toda mensagem privada precisa de
+   quando nenhum dos tipos 1/2/3/4/6/8/9 acima se aplicar - toda mensagem privada precisa de
    resposta. IMPORTANTE: se {pessoa_nome} estiver claramente selecionando/pedindo de volta algo
    que VOCÊ (Cintia) apresentou nas ÚLTIMAS MENSAGENS acima (ex: "gostei da segunda", "manda só a
    número 2", "essa aí mesmo", "manda de novo"), REUTILIZE o conteúdo exato que você já mandou -
@@ -1428,7 +1468,7 @@ pergunta de ambiguidade anterior sua.
 Responda SEMPRE E APENAS em JSON válido, numa única linha por valor, neste formato exato,
 sem usar bloco de código markdown (nada de ```) e sem quebras de linha dentro dos valores. Inclua
 TODAS as chaves sempre, mesmo vazias/false quando não se aplicarem:
-{"eh_pedido_de_lembrete": true ou false, "destinatario_lembrete": "torres, luan ou tripa - quem deve receber o lembrete", "eh_recorrente": true ou false, "recorrencia_dia_mes": "dia do mes (1-31) se for recorrente mensal, ou string vazia", "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_pergunta_sobre_grupo": true ou false, "grupo_perguntado": "nome do grupo mencionado, ou string vazia", "eh_pergunta_atividade_geral": true ou false, "eh_comando_para_tripa": true ou false, "mensagem_tripa": "texto pronto pra encaminhar pro grupo Tripa, ou string vazia", "tem_cobranca": true ou false, "horario_cobranca_iso": "horario ISO da cobranca, ou string vazia", "pergunta_cobranca": "pergunta curta pra mandar na cobranca, ou string vazia", "eh_pergunta_metricool_metricas": true ou false, "metricool_metrica_cliente": "nome do cliente/marca, ou string vazia", "metricool_metrica_rede": "instagram ou facebook", "metricool_metrica_tipo": "seguidores, reels ou posts", "metricool_metrica_dias": 30, "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/3/4/6/8 acima for verdadeiro"}
+{"eh_pedido_de_lembrete": true ou false, "destinatario_lembrete": "torres, luan ou tripa - quem deve receber o lembrete", "eh_recorrente": true ou false, "recorrencia_dia_mes": "dia do mes (1-31) se for recorrente mensal, ou string vazia", "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_pergunta_sobre_grupo": true ou false, "grupo_perguntado": "nome do grupo mencionado, ou string vazia", "eh_pergunta_atividade_geral": true ou false, "eh_comando_para_tripa": true ou false, "mensagem_tripa": "texto pronto pra encaminhar pro grupo Tripa, ou string vazia", "tem_cobranca": true ou false, "horario_cobranca_iso": "horario ISO da cobranca, ou string vazia", "pergunta_cobranca": "pergunta curta pra mandar na cobranca, ou string vazia", "eh_comando_briefing_cliente": true ou false, "briefing_cliente_nome": "nome do cliente/grupo mencionado (ou inferido do contexto), ou string vazia", "briefing_assunto": "pista curta do assunto a analisar, ou string vazia", "eh_pergunta_metricool_metricas": true ou false, "metricool_metrica_cliente": "nome do cliente/marca, ou string vazia", "metricool_metrica_rede": "instagram ou facebook", "metricool_metrica_tipo": "seguidores, reels ou posts", "metricool_metrica_dias": 30, "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/3/4/6/8/9 acima for verdadeiro"}
 """
 
 
@@ -2099,6 +2139,76 @@ def responder_pergunta_sobre_grupo(pessoa_nome, pergunta, grupo_jid, grupo_nome)
         return "Tive um problema pra consultar o histórico desse grupo agora, tenta de novo daqui a pouco?"
 
 
+SYSTEM_PROMPT_BRIEFING_CLIENTE = """Você é a Cintia, assistente virtual da Correria. {pessoa_nome} te
+pediu pra analisar a conversa do cliente "{grupo_nome}" e transformar o que foi decidido num
+briefing pronto pra encaminhar pro designer (grupo Criações/Gravações • Tripa • Correria).
+
+Você NÃO deve usar só a última mensagem, nem só a primeira - use TODO o histórico abaixo como
+memória, mas foque no assunto pedido (se {pessoa_nome} mencionou um assunto específico: "{assunto}").
+Ignore partes do histórico que claramente sejam sobre outro assunto sem relação nenhuma com esse
+pedido (ex: uma conversa antiga sobre um evento diferente).
+
+COMO RECONSTRUIR O ESTADO FINAL (muito importante): uma solicitação pode evoluir ao longo da
+conversa - o cliente pede algo, depois manda um áudio corrigindo um valor, a equipe complementa,
+o cliente confirma ou corrige de novo. Áudio (já vem transcrito no histórico) tem o MESMO peso que
+texto - nunca ignore uma alteração só porque veio por áudio. A informação MAIS RECENTE E CONFIRMADA
+sempre vale sobre a mais antiga (ex: "Brahma" depois "melhor Heineken" depois "volta pra Brahma" =
+o estado final é Brahma). Respostas curtas como "isso", "esses", "pode", "sim" só fazem sentido
+lidas junto com a mensagem anterior a que respondem - use o histórico pra entender a que elas se
+referem, nunca comente sobre elas soltas.
+
+O QUE O BRIEFING PRECISA TER (sempre que existir na conversa): produto/material, objetivo, formato
+da peça, texto/título, valores, datas, dias da semana, horários, nomes próprios, condições,
+exceções/restrições, referências (ex: "usar a arte anterior como referência visual"), e qualquer
+outra informação concreta que o cliente ou a equipe confirmaram. O designer precisa conseguir
+trabalhar SÓ com esse briefing, sem precisar voltar no grupo do cliente - transforme a conversa em
+decisões organizadas, não narre a conversa inteira (nunca escreva algo como "primeiro o cliente
+disse X, depois mandou áudio, depois Torres respondeu..." a menos que isso seja realmente
+necessário pra entender uma mudança importante).
+
+SE HOUVER CONFLITO/DÚVIDA REAL: se encontrar duas informações que parecem se contradizer e não der
+pra saber com segurança qual é a mais recente/confirmada (ex: um valor no texto e outro numa
+transcrição de áudio, sem deixar claro qual venceu), NÃO escolha um dos dois por conta própria e
+não invente. Marque "duvida_ambigua" como true e preencha "pergunta_duvida" com uma pergunta
+objetiva pra {pessoa_nome} resolver, citando as duas informações em conflito.
+
+SE NÃO ENCONTRAR NADA RELACIONADO AO ASSUNTO PEDIDO: marque "duvida_ambigua" como true e explique
+em "pergunta_duvida" que não achou uma solicitação clara sobre esse assunto nessa conversa.
+
+Responda SEMPRE E APENAS em JSON válido, sem bloco de código markdown (nada de ```):
+{
+  "duvida_ambigua": true ou false,
+  "pergunta_duvida": "pergunta objetiva pra {pessoa_nome} quando houver conflito ou nada encontrado, ou string vazia",
+  "assunto_identificado": "resumo bem curto do assunto/pedido que foi analisado",
+  "tipo_peca": "classificação curta do material (Card, Story, Carrossel, Banner, Flyer, Selo...), ou string vazia se não for uma peça",
+  "descricao_briefing": "as informações finais confirmadas, organizadas em lista clara e objetiva pro designer, já considerando todas as alterações da conversa",
+  "resumo_curto": "1 frase curta resumindo o que vai ser encaminhado, pra {pessoa_nome} confirmar antes de mandar"
+}
+"""
+
+
+def montar_briefing_cliente(pessoa_nome, grupo_jid, grupo_nome, assunto):
+    """Analisa o historico da conversa de UM cliente (nao so a ultima mensagem) e monta um
+    briefing consolidado pronto pra mandar pro Tripa - reconstruindo o estado final do pedido
+    a partir de toda a evolucao da conversa (correcoes por texto E audio incluidas), em vez de
+    usar so a primeira ou a ultima mensagem sobre o assunto."""
+    mensagens = buscar_mensagens_recentes_grupo(grupo_jid, limite=60)
+    if not mensagens:
+        return {"duvida_ambigua": True, "pergunta_duvida": f"Ainda não tenho nenhum histórico registrado do grupo \"{grupo_nome}\" pra montar um briefing."}
+    historico = "\n".join(f"- {m['autor']}: {m['conteudo']}" for m in mensagens)
+    prompt_sistema = (
+        SYSTEM_PROMPT_BRIEFING_CLIENTE
+        .replace("{pessoa_nome}", pessoa_nome)
+        .replace("{grupo_nome}", grupo_nome)
+        .replace("{assunto}", assunto or "(não especificado - use a solicitação mais recente/relevante)")
+    )
+    try:
+        return chamar_claude(prompt_sistema, f"HISTÓRICO DA CONVERSA DO CLIENTE:\n{historico}")
+    except Exception as e:
+        print(f"[montar_briefing_cliente] erro: {e}", flush=True)
+        return {"duvida_ambigua": True, "pergunta_duvida": "Tive um problema técnico tentando montar esse briefing, pode pedir de novo daqui a pouco?"}
+
+
 SYSTEM_PROMPT_ATIVIDADE_GERAL = """Você é a Cintia, assistente virtual da Correria. {pessoa_nome}
 perguntou quais grupos (de cliente ou o grupo interno Tripa) tiveram atividade hoje, pra ter um
 panorama geral sem precisar abrir grupo por grupo. Abaixo está, pra cada grupo que teve pelo menos
@@ -2609,6 +2719,58 @@ def processar_dm(remote_jid, key, data):
             f"Ficou assim pra encaminhar pra Tripa:\n\n{mensagem_tripa}{preview_cobranca}\n\n"
             "Confirma que posso mandar? (responde \"sim\" ou \"não\")",
         )
+    elif resultado.get("eh_comando_briefing_cliente") and resultado.get("briefing_cliente_nome"):
+        pessoa_nome_briefing = "Torres" if pessoa == "torres" else "Luan"
+        nome_mencionado = resultado["briefing_cliente_nome"]
+        candidatos = identificar_grupos_candidatos(nome_mencionado)
+        if not candidatos:
+            responder(
+                f"Entendi que é pra analisar a conversa do cliente \"{nome_mencionado}\", mas não "
+                "achei esse cliente cadastrado. Pode confirmar o nome certinho?"
+            )
+        elif len(candidatos) > 1:
+            # Nunca escolhe sozinho quando mais de um cliente/grupo bate com a mesma mencao -
+            # pergunta qual e o certo, em vez de arriscar montar o briefing do cliente errado.
+            nomes_candidatos = ", ".join(GRUPOS[jid]["nome"] for jid in candidatos)
+            responder(
+                f"Encontrei mais de um cliente relacionado a \"{nome_mencionado}\": {nomes_candidatos}. "
+                "Qual deles você quer que eu analise?"
+            )
+        else:
+            grupo_jid_briefing = candidatos[0]
+            grupo_nome_briefing = GRUPOS[grupo_jid_briefing]["nome"]
+            briefing = montar_briefing_cliente(
+                pessoa_nome_briefing, grupo_jid_briefing, grupo_nome_briefing,
+                resultado.get("briefing_assunto") or "",
+            )
+            if briefing.get("duvida_ambigua"):
+                pergunta = briefing.get("pergunta_duvida") or (
+                    f"Analisei a conversa do {grupo_nome_briefing}, mas encontrei algo que não "
+                    "consegui confirmar com segurança antes de montar o briefing. Pode me ajudar?"
+                )
+                responder(pergunta)
+            else:
+                tipo_peca_briefing = briefing.get("tipo_peca") or "Arte"
+                descricao_briefing = briefing.get("descricao_briefing") or ""
+                mensagem_tripa_briefing = (
+                    f"*CLIENTE:* {grupo_nome_briefing}\n"
+                    f"*SOLICITAÇÃO:* {tipo_peca_briefing}\n"
+                    f"*DESCRIÇÃO:* {descricao_briefing}\n\n"
+                    "_Já considera as alterações feitas durante a conversa com o cliente._"
+                )
+                _comandos_pendentes[pessoa] = {
+                    "mensagem_tripa": mensagem_tripa_briefing,
+                    "tem_cobranca": False,
+                    "horario_cobranca": None,
+                    "pergunta_cobranca": "",
+                    "criado_em": time.time(),
+                }
+                resumo_curto = briefing.get("resumo_curto") or f"Briefing do {grupo_nome_briefing} pronto."
+                responder(
+                    f"Analisei a conversa do {grupo_nome_briefing}! {resumo_curto}\n\n"
+                    f"Ficou assim pra encaminhar pra Tripa:\n\n{mensagem_tripa_briefing}\n\n"
+                    "Confirma que posso mandar? (responde \"sim\" ou \"não\")"
+                )
     elif resultado.get("eh_pergunta_metricool_metricas"):
         nome_cliente_metrica = resultado.get("metricool_metrica_cliente") or ""
         marca_metrica = metricool_identificar_marca(nome_cliente_metrica)
