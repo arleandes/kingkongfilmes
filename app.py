@@ -853,6 +853,33 @@ identificar com razoável confiança do que se trata, NUNCA invente - marque "du
 em "resposta_cliente", confirme o recebimento de forma neutra (a equipe vai esclarecer), sem
 inventar a que a referência se refere.
 
+QUANDO NÃO RESPONDER (muito importante - inteligência aqui significa saber quando ficar em
+silêncio, não responder a tudo): antes de escrever "resposta_cliente", decida primeiro se essa
+mensagem REALMENTE precisa de uma resposta sua. Use o HISTÓRICO RECENTE DO GRUPO acima (quando
+vier preenchido) pra entender pra quem a mensagem foi dirigida e se alguém da equipe (Torres,
+Luan, ou qualquer nome que não seja o cliente) já respondeu. Marque "precisa_responder" como false
+(e deixe "resposta_cliente" como string vazia "") quando a mensagem for, por exemplo:
+- um agradecimento/despedida dirigido claramente a Torres, Luan ou outro nome da equipe que já
+  apareceu resolvendo aquilo no histórico (ex: Torres disse "já ajustei", cliente respondeu "valeu,
+  Torres!" - a conversa já tem destinatário e já está encerrada, você não precisa aparecer);
+- um comentário, elogio ou brincadeira que não pede nem pergunta nada, e que não tem ação nenhuma
+  esperada de você;
+- uma conversa que claramente é entre duas outras pessoas (cliente e Torres/Luan conversando
+  diretamente), onde você entraria por cima sem necessidade;
+- algo que a equipe (Torres/Luan) já respondeu no histórico recente e não sobrou nada novo pra
+  você confirmar ou agir.
+Marque "precisa_responder" como true nos casos normais: pedido novo, pergunta que você está
+autorizada a responder, confirmação de recebimento que ainda não foi dada por ninguém, dúvida real
+do cliente, ou qualquer situação coberta pelas regras de atendimento abaixo. Não decida pela
+palavra isolada ("obrigado", "arte", "gravação" sozinhas não decidem nada) - decida pelo
+CONTEXTO da conversa. Nunca marque "precisa_responder" como false se "chateado" ou
+"duvida_geral"/"duvida_urgente" forem true - cliente insatisfeito ou caso de dúvida sempre precisam
+de uma resposta sua (mesmo que só uma confirmação genérica), nunca fique em silêncio nesses casos.
+Mesmo quando "precisa_responder" for false, continue preenchendo normalmente os outros campos
+(resumo_interno, descricao_midia, tipo, pedido_organizado_designer, eh_promessa, etc.) com base em
+tudo que você entendeu da mensagem - ficar em silêncio pro cliente nunca significa deixar de
+registrar/entender o que aconteceu, só significa não mandar nada novo no grupo.
+
 ESCOPO DE SERVIÇO: a Correria é uma agência de marketing digital que atende empresas
 (conteúdo de redes sociais, vídeos, artes, campanhas). Ela NÃO faz cobertura de eventos sociais
 pessoais como casamento, aniversário de família, formatura, etc. Se o cliente perguntar sobre um
@@ -1035,7 +1062,8 @@ expliquei que não, que a Correria é só marketing digital." Exemplo ruim (evit
 Responda SEMPRE E APENAS em JSON válido, neste formato exato, sem nenhum texto fora do JSON e SEM usar bloco de código markdown (nada de ```):
 {
   "tipo": "arte" | "gravacao" | "duvida" | "outro",
-  "resposta_cliente": "texto da mensagem a ser enviada de volta ao cliente no grupo",
+  "precisa_responder": true ou false,
+  "resposta_cliente": "texto da mensagem a ser enviada de volta ao cliente no grupo, ou string vazia se precisa_responder for false",
   "chateado": true ou false,
   "duvida_geral": true ou false,
   "duvida_urgente": true ou false,
@@ -1275,8 +1303,15 @@ def _finalizar_processamento_grupo(chave):
         print(f"[_finalizar_processamento_grupo] erro claude: {e}", flush=True)
         return
 
+    # "Inteligência contextual nos grupos de clientes": nem toda mensagem exige resposta - um
+    # agradecimento dirigido a Torres/Luan, uma conversa entre outras pessoas, ou algo que a
+    # equipe já resolveu não precisam de uma nova mensagem sua no grupo. Mas nunca fica em
+    # silêncio quando há sinal real de cliente insatisfeito ou dúvida (rede de segurança por
+    # código, nunca confia só na decisão do modelo nesses dois casos).
+    duvida_geral = resultado.get("duvida_geral") or resultado.get("duvida_urgente")
+    precisa_responder = resultado.get("precisa_responder", True) or resultado.get("chateado") or duvida_geral
     resposta_cliente = resultado.get("resposta_cliente", "")
-    if resposta_cliente:
+    if precisa_responder and resposta_cliente:
         enviar_texto(remote_jid, resposta_cliente)
         registrar_mensagem_grupo(remote_jid, grupo["nome"], "Cintia", resposta_cliente, True)
 
@@ -1313,8 +1348,9 @@ def _finalizar_processamento_grupo(chave):
         registrar_pedido_pendente(grupo["nome"], pedido_designer, grupo_jid=remote_jid, tipo_peca=tipo_peca)
 
     # Avisa Torres e Luan sobre TODO atendimento feito no grupo (nao so os chateados),
-    # pra eles ficarem sempre por dentro do que o robo respondeu. Sem anexar foto/PDF aqui.
-    duvida_geral = resultado.get("duvida_geral") or resultado.get("duvida_urgente")
+    # pra eles ficarem sempre por dentro do que o robo fez - inclusive quando ficou em
+    # silencio de proposito, pra distinguir de uma mensagem que passou batido/nao foi
+    # processada. Sem anexar foto/PDF aqui.
     urgente = resultado.get("chateado") or duvida_geral
     if urgente:
         motivo = []
@@ -1323,6 +1359,8 @@ def _finalizar_processamento_grupo(chave):
         if duvida_geral:
             motivo.append("robô não teve certeza de como responder - só mandei uma confirmação genérica pro cliente")
         prefixo = f"🚨 Atenção ({' + '.join(motivo)})"
+    elif not precisa_responder:
+        prefixo = "🤫 Fiquei em silêncio (não precisava de resposta)"
     else:
         prefixo = "📩 Novo atendimento automático"
 
