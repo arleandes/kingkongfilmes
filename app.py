@@ -2193,16 +2193,42 @@ encaminhada.
 SE NÃO ENCONTRAR NADA RELACIONADO AO ASSUNTO PEDIDO: marque "duvida_ambigua" como true e explique
 em "pergunta_duvida" que não achou uma solicitação clara sobre esse assunto nessa conversa.
 
+PADRÃO DE BRIEFING CURTO PARA O DESIGNER (muito importante): o designer só precisa do necessário
+pra executar a arte - ele NÃO precisa receber toda a história da conversa, justificativas,
+explicações longas, informações sobre tráfego pago/impulsionamento, quem aprovou internamente,
+detalhes de como a decisão foi tomada, nem observações que não mudam a criação. Sua função é
+transformar uma conversa longa (30 mensagens, áudios, imagens, idas e vindas) num briefing curto,
+direto e visualmente fácil de entender. Pra cada pedido, responda internamente só a: o que fazer?
+qual informação colocar? qual informação NÃO colocar? qual referência usar? Nada além disso, salvo
+se for realmente necessário.
+- NUNCA repita a mesma informação de formas diferentes (ex: não escreva "valor a destacar: R$ 39,90"
+  e depois "usar a chamada a partir de R$ 39,90" - escolha uma forma só e consolide).
+- NUNCA inclua informação interna que não ajuda o designer a montar a peça (ex: "vai receber
+  impulsionamento pago", "usar budget de tráfego", "aprovado por Torres e Luciano").
+- NUNCA explique o que já está resolvido (ex: "não R$ 99,00, valor corrigido pelo cliente" - o
+  designer só precisa saber o valor certo, R$ 39,90, sem conhecer o erro/correção anterior).
+- Use frases de EXECUÇÃO ("Criar arte para divulgação do Prato Executivo.", "Usar as fotos enviadas
+  pelo cliente.", "Incluir horário: 11h30 às 15h.") em vez de frases narrativas/justificativas
+  ("O objetivo desta peça é...", "Foi definido na conversa que...", "O cliente gostaria que...") -
+  o briefing deve soar como instrução de produção, não como resumo de conversa.
+- Limite: cada pedido deve ter uma ação principal (1 frase de execução) + no máximo 3 a 6 itens de
+  instrução (informações concretas: texto, valores, datas, horários, nomes, referências). Se passar
+  disso, revise e corte o que não for essencial pra executar a peça.
+- Pense: "se eu fosse o designer, eu entenderia o que fazer em menos de 20 segundos?" Se a resposta
+  for não, o briefing está longo/confuso demais - priorize CURTO + CLARO + EXECUTÁVEL, nunca
+  HISTÓRICO + JUSTIFICATIVA + EXPLICAÇÃO LONGA.
+
 Responda SEMPRE E APENAS em JSON válido, sem bloco de código markdown (nada de ```):
 {
   "duvida_ambigua": true ou false,
   "pergunta_duvida": "pergunta objetiva pra {pessoa_nome} quando houver conflito ou nada encontrado, ou string vazia",
-  "resumo_curto": "1 frase curta resumindo quantos pedidos foram identificados e o que vai ser encaminhado, pra {pessoa_nome} confirmar antes de mandar",
+  "resumo_curto": "1 frase curta resumindo quantos pedidos foram identificados e o que vai ser encaminhado pra Tripa",
   "pedidos": [
     {
       "titulo": "nome curto do pedido (ex: 'Prato Executivo', 'Programação de sábado')",
       "tipo_peca": "classificação curta do material (Card, Story, Carrossel, Banner, Flyer, Selo...), ou string vazia se não for uma peça gráfica",
-      "descricao_briefing": "as informações finais confirmadas desse pedido específico, organizadas em lista clara e objetiva pro designer, já considerando todas as alterações/correções da conversa"
+      "acao_principal": "1 frase curta de execução dizendo o que fazer (ex: 'Criar arte para divulgação do Prato Executivo.', 'Atualizar a arte da programação de sábado.')",
+      "itens": ["lista de 1 a 6 instruções curtas, cada uma 1 informação concreta e objetiva (texto/valor/data/horário/nome/referência/o que NÃO colocar), sem repetir a mesma informação de outra forma, sem contexto interno, sem justificativa"]
     }
   ]
 }
@@ -2790,42 +2816,29 @@ def processar_dm(remote_jid, key, data):
                 pedidos = briefing["pedidos"]
                 # Uma conversa pode conter mais de um pedido distinto (ex: a arte de uma promoção
                 # E, separadamente, incluir um artista na programação) - cada um vira sua propria
-                # secao no briefing, nunca misturados; com um pedido so, mantem o formato simples
-                # ja usado no resto do sistema (CLIENTE/SOLICITAÇÃO/DESCRIÇÃO).
-                if len(pedidos) == 1:
-                    p = pedidos[0]
-                    mensagem_tripa_briefing = (
-                        f"*CLIENTE:* {grupo_nome_briefing}\n"
-                        f"*SOLICITAÇÃO:* {p.get('tipo_peca') or 'Arte'}\n"
-                        f"*DESCRIÇÃO:* {p.get('descricao_briefing') or ''}\n\n"
-                        "_Já considera as alterações feitas durante a conversa com o cliente._"
-                    )
-                else:
-                    secoes = []
-                    for i, p in enumerate(pedidos, start=1):
-                        secoes.append(
-                            f"{i}. *{p.get('titulo') or f'Pedido {i}'}*"
-                            + (f" ({p.get('tipo_peca')})" if p.get("tipo_peca") else "")
-                            + f"\n{p.get('descricao_briefing') or ''}"
-                        )
-                    mensagem_tripa_briefing = (
-                        f"*CLIENTE:* {grupo_nome_briefing}\n"
-                        f"Temos {len(pedidos)} solicitações confirmadas na conversa:\n\n"
-                        + "\n\n".join(secoes)
-                        + "\n\n_Já considera as alterações feitas durante a conversa com o cliente._"
-                    )
-                _comandos_pendentes[pessoa] = {
-                    "mensagem_tripa": mensagem_tripa_briefing,
-                    "tem_cobranca": False,
-                    "horario_cobranca": None,
-                    "pergunta_cobranca": "",
-                    "criado_em": time.time(),
-                }
+                # secao "PEDIDO N | titulo", nunca misturados. Cada secao traz so a acao de
+                # execucao + os itens objetivos (ja filtrados pra excluir contexto interno,
+                # justificativa e repeticao) - o designer nao precisa do historico da conversa.
+                secoes = []
+                for i, p in enumerate(pedidos, start=1):
+                    titulo = p.get("titulo") or f"Pedido {i}"
+                    tipo_peca = f" ({p['tipo_peca']})" if p.get("tipo_peca") else ""
+                    acao = p.get("acao_principal") or ""
+                    itens = [str(item).strip() for item in (p.get("itens") or []) if str(item).strip()]
+                    linhas_itens = "\n".join(f"• {item}" for item in itens)
+                    secao = f"*PEDIDO {i} | {titulo}*{tipo_peca}\n{acao}"
+                    if linhas_itens:
+                        secao += f"\n{linhas_itens}"
+                    secoes.append(secao)
+                mensagem_tripa_briefing = f"*CLIENTE:* {grupo_nome_briefing}\n\n" + "\n\n".join(secoes)
+                # "Analisa e passa pra Tripa" ja e a autorizacao pra encaminhar - so pergunta antes
+                # se sobrar duvida real (tratada acima via duvida_ambigua), nunca depois do briefing
+                # pronto. Manda direto, sem pedir "confirma que posso mandar?" de novo.
+                enviar_texto(TRIPA_DESIGNER_JID, mensagem_tripa_briefing)
                 resumo_curto = briefing.get("resumo_curto") or f"Briefing do {grupo_nome_briefing} pronto."
                 responder(
                     f"Analisei a conversa do {grupo_nome_briefing}! {resumo_curto}\n\n"
-                    f"Ficou assim pra encaminhar pra Tripa:\n\n{mensagem_tripa_briefing}\n\n"
-                    "Confirma que posso mandar? (responde \"sim\" ou \"não\")"
+                    f"Mandei isso pra Tripa:\n\n{mensagem_tripa_briefing}"
                 )
     elif resultado.get("eh_pergunta_metricool_metricas"):
         nome_cliente_metrica = resultado.get("metricool_metrica_cliente") or ""
