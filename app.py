@@ -1833,7 +1833,7 @@ def revisar_peca(imagem_base64, pdf_base64, caption):
                 linhas_erro.append(linha)
             else:
                 linhas_erro.append(str(e))
-        texto_resp = "⚠️ Encontrei possíveis erros na peça:\n" + "\n".join(f"- {l}" for l in linhas_erro)
+        texto_resp = "⚠️ Encontrei erro(s) na peça:\n" + "\n".join(f"- {l}" for l in linhas_erro)
     else:
         texto_resp = "✅ Revisei e não encontrei erros de escrita. Está tudo certo!"
     if resultado.get("observacao"):
@@ -1842,6 +1842,44 @@ def revisar_peca(imagem_base64, pdf_base64, caption):
     resultado["erros"] = erros_validos
     resultado["tem_erro"] = tem_erro
     return tem_erro, texto_resp, resultado
+
+
+def _formatar_pontos_ortografia(resultado_ortografia):
+    """Formata os erros JÁ VALIDADOS de ortografia (resultado["erros"], depois do filtro de
+    contradição em revisar_peca) como pontos curtos, pra entrar no veredito combinado."""
+    pontos = []
+    for e in (resultado_ortografia.get("erros") or []):
+        if isinstance(e, dict):
+            original = e.get("trecho_original", "")
+            correcao = e.get("correcao", "")
+            pontos.append(f"\"{original}\" → \"{correcao}\"")
+        elif e:
+            pontos.append(str(e))
+    return pontos
+
+
+def _montar_veredito_curto(pontos_ortografia, resultado_comparacao=None):
+    """Monta UMA mensagem curta e objetiva de veredito da conferência (ortografia + conteúdo,
+    quando aplicável) - "Padrão curto de resposta": a análise por trás pode ser completa, mas
+    a resposta final nunca deve virar um relatório explicando tudo que já está certo. Se não
+    há nada a ajustar: "Conferido. Tudo certo. ✅". Se há algo, só os pontos que realmente
+    precisam de ajuste, sem repetir o que está correto."""
+    pontos = list(pontos_ortografia)
+    if resultado_comparacao is not None and not resultado_comparacao.get("duvida_ambigua"):
+        if not resultado_comparacao.get("bate_com_pedido"):
+            resposta_curta = resultado_comparacao.get("resposta_curta")
+            if resposta_curta:
+                pontos.append(resposta_curta)
+            else:
+                # compatibilidade com o formato anterior (problemas + resumo em texto livre)
+                pontos.extend(resultado_comparacao.get("problemas") or [])
+                if resultado_comparacao.get("resumo"):
+                    pontos.append(resultado_comparacao["resumo"])
+    if not pontos:
+        return "Conferido. Tudo certo. ✅"
+    if len(pontos) == 1:
+        return f"⚠️ Ajustar: {pontos[0]}"
+    return "⚠️ Ajustar:\n" + "\n".join(f"- {p}" for p in pontos)
 
 
 def _identificar_cliente_para_conferencia_dm(caption, grupo_jid_dm):
@@ -1883,7 +1921,7 @@ def revisar_arte_dm(numero, key, data, message_type, grupo_jid_dm=None):
         enviar_texto(numero, "Tive um problema pra revisar esse arquivo agora, pode tentar de novo em instantes?")
         return {"erro_claude": str(e)}
 
-    enviar_texto(numero, texto_resp)
+    pontos_ortografia = _formatar_pontos_ortografia(resultado)
 
     resultado_comparacao = None
     cliente_nome = None
@@ -1897,7 +1935,9 @@ def revisar_arte_dm(numero, key, data, message_type, grupo_jid_dm=None):
                 )
                 if resultado_comparacao.get("duvida_ambigua"):
                     # A duvida ja esta indo direto pra pessoa que mandou a arte (estamos no
-                    # privado dela) - nunca escolhe sozinho, so pergunta.
+                    # privado dela) - nunca escolhe sozinho, so pergunta. A ortografia (ja
+                    # conferida com certeza) pode falar normalmente nesse meio tempo.
+                    enviar_texto(numero, _montar_veredito_curto(pontos_ortografia))
                     pergunta = resultado_comparacao.get("pergunta_duvida") or (
                         f"Estou conferindo essa arte do cliente {cliente_nome} e encontrei uma "
                         "informação que não consegui confirmar com segurança no histórico. Pode "
@@ -1905,13 +1945,20 @@ def revisar_arte_dm(numero, key, data, message_type, grupo_jid_dm=None):
                     )
                     enviar_texto(numero, f"❓ {pergunta}")
                 else:
-                    enviar_texto(numero, texto_comparacao)
+                    # Padrão curto de resposta: ortografia + conteúdo viram UMA mensagem só.
+                    enviar_texto(numero, _montar_veredito_curto(pontos_ortografia, resultado_comparacao))
                     if pedido.get("tarefa_id"):
                         novo_status = STATUS_CONCLUIDO if bate else STATUS_AGUARDANDO_CORRECAO
                         adicionar_evento_tarefa(
                             pedido["tarefa_id"], "entrega", texto_comparacao,
                             autor="designer", novo_status=novo_status,
                         )
+            else:
+                enviar_texto(numero, _montar_veredito_curto(pontos_ortografia))
+        else:
+            enviar_texto(numero, _montar_veredito_curto(pontos_ortografia))
+    else:
+        enviar_texto(numero, _montar_veredito_curto(pontos_ortografia))
 
     return {"resultado": resultado, "cliente_identificado": cliente_nome, "comparacao": resultado_comparacao}
 
@@ -2134,9 +2181,14 @@ VALIDAÇÃO DE CALENDÁRIO (datas, dias da semana e anos) - NUNCA use memória, 
 mental pra isso. Um erro real em produção já aconteceu assim: a IA assumiu sozinha que uma data
 sem ano era de 2025 (quando na verdade era 2026) e apontou uma "divergência" de dia da semana que
 não existia - isso gera retrabalho pro designer e derruba a confiança no sistema. Regras:
-- NUNCA ASSUME O ANO: quando a arte mostrar uma data sem ano (ex: "03 setembro", "quinta 03
-  setembro"), o ano correto vem do contexto (data de hoje, histórico da conversa, programação
-  informada pelo cliente) - nunca escolha um ano por conta própria sem essa base.
+- ANO OPERACIONAL ATUAL: {ano_atual}. Essa é uma regra fixa - ao analisar datas, dias da semana,
+  programação, eventos, promoções, gravações ou cronogramas, considere sempre o ano {ano_atual},
+  SALVO se a própria conversa ou o material informar explicitamente outro ano. É PROIBIDO usar um
+  ano anterior a {ano_atual} como padrão - isso já causou o erro real descrito acima.
+- NUNCA ASSUME O ANO por conta própria fora dessa regra fixa: quando a arte mostrar uma data sem
+  ano (ex: "03 setembro", "quinta 03 setembro"), o ano correto é {ano_atual} (ver regra acima),
+  confirmado pelo contexto (histórico da conversa, programação informada pelo cliente) quando
+  houver - nunca escolha um ano diferente sem evidência clara.
 - Junto com essa mensagem você pode receber um bloco "VALIDAÇÃO DE CALENDÁRIO" calculado por
   CÓDIGO (não pelo modelo) mostrando, pra cada data mencionada na conversa, o dia da semana REAL
   em cada ano plausível (ex: "03/09/2026 = quinta-feira"). Esse bloco é a ÚNICA fonte confiável pra
@@ -2185,11 +2237,26 @@ REGRA MESTRE: ENCONTRAR DIFERENÇA → INVESTIGAR (tem fonte clara?) → VALIDAR
 inclusive calendário quando for data) → só ENTÃO apontar. Nunca ENCONTRAR DIFERENÇA → SUPOR →
 APONTAR ERRO. Se não tiver certeza, não acusa - trata como dúvida.
 
+PADRÃO CURTO DE RESPOSTA (muito importante): a ANÁLISE por trás pode ser completa - conferir
+histórico, briefing, nomes, datas, horários, valores - mas a RESPOSTA final (campo
+"resposta_curta") deve ser sempre curta e objetiva, nunca um relatório.
+- Se bateu tudo: "resposta_curta" é só algo como "Tudo certo." ou "Conferido. Sem divergências." -
+  NUNCA explique o que está certo (nunca liste "os nomes estão corretos, os horários estão
+  corretos..." - isso polui o grupo à toa).
+- Se houver 1 problema real: "resposta_curta" cita só esse ajuste, de forma direta (ex: "Ajustar
+  apenas o horário de Roberto Neves: na conversa está 15h30, na arte está 16h."), sem explicar o
+  resto que já está certo.
+- Se houver mais de um problema: liste só os pontos que precisam de ajuste, curto, sem textão.
+- NUNCA use "possíveis erros"/"pode ser que"/"talvez esteja" quando o problema já é um ERRO
+  CONFIRMADO (com fonte clara) - nesse caso é um erro, não uma possibilidade. Dúvida real vira
+  "duvida_ambigua" (ver acima), nunca uma "resposta_curta" incerta.
+
 Responda SEMPRE E APENAS em JSON válido, sem bloco de código markdown (nada de ```):
 {
   "bate_com_pedido": true ou false,
   "problemas": ["lista de itens faltando ou diferentes do briefing final, cada um citando o valor/informação pedida e o que está na arte"],
-  "resumo": "1 frase confirmando que bateu tudo, ou resumindo o principal problema",
+  "resumo": "1 frase confirmando que bateu tudo, ou resumindo o principal problema (uso interno)",
+  "resposta_curta": "a mensagem curta e pronta pra postar no grupo/privado, seguindo o PADRÃO CURTO DE RESPOSTA acima - nunca um relatório longo",
   "duvida_ambigua": true ou false,
   "pergunta_duvida": "pergunta objetiva pra Torres/Luan quando houver conflito não resolvido no histórico, ou string vazia"
 }
@@ -2211,7 +2278,11 @@ def comparar_arte_com_pedido(pedido_texto, imagem_base64, pdf_base64, historico_
         f"{bloco_historico}{bloco_calendario}"
         f"\n\nFaça a conferência de conteúdo dessa arte anexada contra o briefing final."
     )
-    resultado = chamar_claude(SYSTEM_PROMPT_COMPARACAO_PEDIDO, prompt_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64)
+    # Ano operacional atual calculado por CODIGO (nunca hardcoded) - reforca a regra fixa do
+    # prompt sem arriscar ficar desatualizado quando o ano virar.
+    ano_atual = str(horario_bahia_agora().year)
+    prompt_sistema = SYSTEM_PROMPT_COMPARACAO_PEDIDO.replace("{ano_atual}", ano_atual)
+    resultado = chamar_claude(prompt_sistema, prompt_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64)
 
     if resultado.get("duvida_ambigua"):
         bate = False
@@ -2318,7 +2389,7 @@ def processar_revisao_grupo_designer(remote_jid, key, data):
         print(f"[processar_revisao_grupo_designer] erro claude: {e}", flush=True)
         return {"erro_claude": str(e)}
 
-    enviar_texto(remote_jid, texto_resp)
+    pontos_ortografia = _formatar_pontos_ortografia(resultado)
 
     resultado_comparacao = None
     cliente_nome = extrair_cliente_da_legenda(caption)
@@ -2331,7 +2402,9 @@ def processar_revisao_grupo_designer(remote_jid, key, data):
             if resultado_comparacao.get("duvida_ambigua"):
                 # Nunca escolhe uma informacao em duvida por conta propria - so pergunta pra
                 # Torres/Luan em privado, sem postar nenhum veredito (certo/errado) no Tripa
-                # enquanto a duvida nao for resolvida por um humano.
+                # enquanto a duvida nao for resolvida por um humano. A ortografia (que ja foi
+                # conferida com certeza) pode falar normalmente no Tripa nesse meio tempo.
+                enviar_texto(remote_jid, _montar_veredito_curto(pontos_ortografia))
                 pergunta = resultado_comparacao.get("pergunta_duvida") or (
                     f"Estou conferindo uma arte do cliente {cliente_nome} e encontrei uma "
                     "informação que não consegui confirmar com segurança no histórico. Pode "
@@ -2340,17 +2413,26 @@ def processar_revisao_grupo_designer(remote_jid, key, data):
                 for numero in TEAM_NUMBERS:
                     enviar_texto(numero, f"❓ Dúvida na conferência de conteúdo ({cliente_nome}):\n\n{pergunta}")
             else:
-                enviar_texto(remote_jid, texto_comparacao)
+                # Padrão curto de resposta: ortografia + conteúdo viram UMA mensagem objetiva
+                # só, em vez de dois avisos separados repetindo "tudo certo".
+                enviar_texto(remote_jid, _montar_veredito_curto(pontos_ortografia, resultado_comparacao))
                 # Quando o pedido veio do banco (tem tarefa_id), atualiza o status da
                 # tarefa de acordo com o resultado da conferencia: concluida se bateu
                 # tudo certo, ou aguardando correcao se faltou/tem algo errado - assim a
-                # mesma tarefa continua aberta pra receber a proxima rodada corrigida.
+                # mesma tarefa continua aberta pra receber a proxima rodada corrigida. O
+                # historico da tarefa guarda o texto completo da conferencia (nao o curto).
                 if pedido.get("tarefa_id"):
                     novo_status = STATUS_CONCLUIDO if bate else STATUS_AGUARDANDO_CORRECAO
                     adicionar_evento_tarefa(
                         pedido["tarefa_id"], "entrega", texto_comparacao,
                         autor="designer", novo_status=novo_status,
                     )
+        else:
+            # Legenda citou um cliente mas nao ha pedido pendente pra comparar - so a
+            # ortografia mesmo (ja aconteceu antes, comportamento preservado).
+            enviar_texto(remote_jid, _montar_veredito_curto(pontos_ortografia))
+    else:
+        enviar_texto(remote_jid, _montar_veredito_curto(pontos_ortografia))
 
     return {"resultado": resultado, "cliente_identificado": cliente_nome, "comparacao": resultado_comparacao}
 
