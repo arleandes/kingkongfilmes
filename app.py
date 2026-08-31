@@ -2157,20 +2157,37 @@ o estado final é Brahma). Respostas curtas como "isso", "esses", "pode", "sim" 
 lidas junto com a mensagem anterior a que respondem - use o histórico pra entender a que elas se
 referem, nunca comente sobre elas soltas.
 
-O QUE O BRIEFING PRECISA TER (sempre que existir na conversa): produto/material, objetivo, formato
-da peça, texto/título, valores, datas, dias da semana, horários, nomes próprios, condições,
+O QUE CADA BRIEFING PRECISA TER (sempre que existir na conversa): produto/material, objetivo,
+formato da peça, texto/título, valores, datas, dias da semana, horários, nomes próprios, condições,
 exceções/restrições, referências (ex: "usar a arte anterior como referência visual"), e qualquer
 outra informação concreta que o cliente ou a equipe confirmaram. O designer precisa conseguir
-trabalhar SÓ com esse briefing, sem precisar voltar no grupo do cliente - transforme a conversa em
+trabalhar SÓ com o briefing, sem precisar voltar no grupo do cliente - transforme a conversa em
 decisões organizadas, não narre a conversa inteira (nunca escreva algo como "primeiro o cliente
 disse X, depois mandou áudio, depois Torres respondeu..." a menos que isso seja realmente
 necessário pra entender uma mudança importante).
 
-SE HOUVER CONFLITO/DÚVIDA REAL: se encontrar duas informações que parecem se contradizer e não der
-pra saber com segurança qual é a mais recente/confirmada (ex: um valor no texto e outro numa
-transcrição de áudio, sem deixar claro qual venceu), NÃO escolha um dos dois por conta própria e
-não invente. Marque "duvida_ambigua" como true e preencha "pergunta_duvida" com uma pergunta
-objetiva pra {pessoa_nome} resolver, citando as duas informações em conflito.
+UMA CONVERSA PODE TER MAIS DE UM PEDIDO (muito importante - NUNCA assuma "uma conversa = um
+pedido"): antes de montar o(s) briefing(s), pergunte-se internamente se existe UMA solicitação ou
+VÁRIAS solicitações diferentes na conversa analisada. O critério é o OBJETIVO/ENTREGA: se duas
+partes da conversa pedem materiais ou ações diferentes (ex: atualizar a arte da promoção do prato
+executivo E incluir um artista na programação de sábado), são DOIS pedidos separados, mesmo que
+tenham sido mencionados na mesma conversa ou até na mesma leva de mensagens - NUNCA misture os dois
+num briefing só. Já um COMPLEMENTO (ex: "inclui Roberto Neves sábado" seguido de "às 15h30") ou uma
+CORREÇÃO (ex: "às 15h30" depois "na verdade 16h") do mesmo objetivo continuam sendo o MESMO pedido -
+NUNCA crie um pedido novo pra cada complemento/correção, sempre absorva no pedido que já existe e
+mantenha só o estado final. Preste atenção especial em pedidos curtos/rápidos no MEIO ou no FIM de
+uma conversa longa sobre outro assunto (ex: uma mensagem pequena e direta depois de várias mensagens
+sobre um assunto totalmente diferente) - NUNCA deixe passar um pedido só porque ele é curto ou veio
+"escondido" no meio/fim de uma conversa mais longa sobre outra coisa.
+
+SE HOUVER CONFLITO/DÚVIDA REAL EM ALGUM PEDIDO: se encontrar duas informações que parecem se
+contradizer e não der pra saber com segurança qual é a mais recente/confirmada (ex: um valor no
+texto e outro numa transcrição de áudio, sem deixar claro qual venceu; ou não souber com segurança
+qual material/arte antiga um pedido de alteração se refere), NÃO escolha um dos dois por conta
+própria e não invente. Marque "duvida_ambigua" como true e preencha "pergunta_duvida" com uma
+pergunta objetiva pra {pessoa_nome} resolver, citando o pedido e as informações em conflito. Nesse
+caso pode deixar "pedidos" vazio ou parcial - a dúvida é resolvida antes de qualquer coisa ser
+encaminhada.
 
 SE NÃO ENCONTRAR NADA RELACIONADO AO ASSUNTO PEDIDO: marque "duvida_ambigua" como true e explique
 em "pergunta_duvida" que não achou uma solicitação clara sobre esse assunto nessa conversa.
@@ -2179,11 +2196,17 @@ Responda SEMPRE E APENAS em JSON válido, sem bloco de código markdown (nada de
 {
   "duvida_ambigua": true ou false,
   "pergunta_duvida": "pergunta objetiva pra {pessoa_nome} quando houver conflito ou nada encontrado, ou string vazia",
-  "assunto_identificado": "resumo bem curto do assunto/pedido que foi analisado",
-  "tipo_peca": "classificação curta do material (Card, Story, Carrossel, Banner, Flyer, Selo...), ou string vazia se não for uma peça",
-  "descricao_briefing": "as informações finais confirmadas, organizadas em lista clara e objetiva pro designer, já considerando todas as alterações da conversa",
-  "resumo_curto": "1 frase curta resumindo o que vai ser encaminhado, pra {pessoa_nome} confirmar antes de mandar"
+  "resumo_curto": "1 frase curta resumindo quantos pedidos foram identificados e o que vai ser encaminhado, pra {pessoa_nome} confirmar antes de mandar",
+  "pedidos": [
+    {
+      "titulo": "nome curto do pedido (ex: 'Prato Executivo', 'Programação de sábado')",
+      "tipo_peca": "classificação curta do material (Card, Story, Carrossel, Banner, Flyer, Selo...), ou string vazia se não for uma peça gráfica",
+      "descricao_briefing": "as informações finais confirmadas desse pedido específico, organizadas em lista clara e objetiva pro designer, já considerando todas as alterações/correções da conversa"
+    }
+  ]
 }
+Inclua em "pedidos" UM item pra cada solicitação distinta que você identificou (pode ser 1 item, ou
+vários) - nunca junte pedidos com objetivos diferentes no mesmo item da lista.
 """
 
 
@@ -2749,15 +2772,42 @@ def processar_dm(remote_jid, key, data):
                     "consegui confirmar com segurança antes de montar o briefing. Pode me ajudar?"
                 )
                 responder(pergunta)
-            else:
-                tipo_peca_briefing = briefing.get("tipo_peca") or "Arte"
-                descricao_briefing = briefing.get("descricao_briefing") or ""
-                mensagem_tripa_briefing = (
-                    f"*CLIENTE:* {grupo_nome_briefing}\n"
-                    f"*SOLICITAÇÃO:* {tipo_peca_briefing}\n"
-                    f"*DESCRIÇÃO:* {descricao_briefing}\n\n"
-                    "_Já considera as alterações feitas durante a conversa com o cliente._"
+            elif not briefing.get("pedidos"):
+                # Nenhum pedido identificado e o modelo nao marcou duvida_ambigua explicitamente -
+                # nunca manda algo vazio/inventado pro Tripa, so avisa que nao achou nada claro.
+                responder(
+                    f"Analisei a conversa do {grupo_nome_briefing}, mas não consegui identificar "
+                    "nenhuma solicitação clara pra encaminhar. Pode confirmar o que você quer que "
+                    "eu procure?"
                 )
+            else:
+                pedidos = briefing["pedidos"]
+                # Uma conversa pode conter mais de um pedido distinto (ex: a arte de uma promoção
+                # E, separadamente, incluir um artista na programação) - cada um vira sua propria
+                # secao no briefing, nunca misturados; com um pedido so, mantem o formato simples
+                # ja usado no resto do sistema (CLIENTE/SOLICITAÇÃO/DESCRIÇÃO).
+                if len(pedidos) == 1:
+                    p = pedidos[0]
+                    mensagem_tripa_briefing = (
+                        f"*CLIENTE:* {grupo_nome_briefing}\n"
+                        f"*SOLICITAÇÃO:* {p.get('tipo_peca') or 'Arte'}\n"
+                        f"*DESCRIÇÃO:* {p.get('descricao_briefing') or ''}\n\n"
+                        "_Já considera as alterações feitas durante a conversa com o cliente._"
+                    )
+                else:
+                    secoes = []
+                    for i, p in enumerate(pedidos, start=1):
+                        secoes.append(
+                            f"{i}. *{p.get('titulo') or f'Pedido {i}'}*"
+                            + (f" ({p.get('tipo_peca')})" if p.get("tipo_peca") else "")
+                            + f"\n{p.get('descricao_briefing') or ''}"
+                        )
+                    mensagem_tripa_briefing = (
+                        f"*CLIENTE:* {grupo_nome_briefing}\n"
+                        f"Temos {len(pedidos)} solicitações confirmadas na conversa:\n\n"
+                        + "\n\n".join(secoes)
+                        + "\n\n_Já considera as alterações feitas durante a conversa com o cliente._"
+                    )
                 _comandos_pendentes[pessoa] = {
                     "mensagem_tripa": mensagem_tripa_briefing,
                     "tem_cobranca": False,
