@@ -349,6 +349,50 @@ def identificar_grupo_mencionado(texto):
     return melhor
 
 
+def _mensagem_de_hoje(mensagem_criado_em, inicio_dia):
+    """Compara o timestamp (string ISO, do fallback em memoria) de uma mensagem registrada
+    com o inicio do dia atual (horario de Bahia), pra saber se ela e de hoje."""
+    try:
+        quando = datetime.fromisoformat(mensagem_criado_em)
+    except Exception:
+        return False
+    return quando >= inicio_dia
+
+
+def listar_grupos_com_atividade_hoje():
+    """Retorna {grupo_jid: {"nome": ..., "mensagens": [...]}} pra todo grupo que teve pelo
+    menos uma mensagem registrada hoje (horario de Bahia) - grupos de cliente e o grupo Tripa,
+    mas NUNCA os DMs privados de Torres/Luan (esses nao contam como "grupo"). Usado pra
+    responder perguntas do tipo "quais grupos tiveram atividade hoje"."""
+    inicio_dia = horario_bahia_agora().replace(hour=0, minute=0, second=0, microsecond=0)
+    grupos_ativos = {}
+    if DATABASE_URL:
+        try:
+            with db_cursor() as cur:
+                cur.execute(
+                    "SELECT grupo_jid, grupo_nome, autor, eh_equipe, conteudo FROM mensagens_grupo "
+                    "WHERE criado_em >= %s AND grupo_jid NOT LIKE 'dm_%%' ORDER BY grupo_jid, criado_em",
+                    (inicio_dia,),
+                )
+                for row in cur.fetchall():
+                    info = grupos_ativos.setdefault(row["grupo_jid"], {"nome": row["grupo_nome"], "mensagens": []})
+                    info["mensagens"].append({
+                        "autor": row["autor"], "conteudo": row["conteudo"], "eh_equipe": row["eh_equipe"],
+                    })
+            return grupos_ativos
+        except Exception as e:
+            print(f"[listar_grupos_com_atividade_hoje] erro no banco, usando fallback em memoria: {e}", flush=True)
+    with _mensagens_grupo_lock:
+        for grupo_jid, mensagens in _mensagens_grupo_memoria.items():
+            if grupo_jid.startswith("dm_"):
+                continue
+            mensagens_hoje = [m for m in mensagens if _mensagem_de_hoje(m.get("criado_em", ""), inicio_dia)]
+            if mensagens_hoje:
+                nome = GRUPOS.get(grupo_jid, {}).get("nome", grupo_jid)
+                grupos_ativos[grupo_jid] = {"nome": nome, "mensagens": mensagens_hoje}
+    return grupos_ativos
+
+
 def criar_tarefa(cliente_nome, grupo_jid, tipo_peca, descricao, autor="cliente"):
     """Cria uma tarefa nova no banco (pedido original) e registra o primeiro evento no
     historico. Devolve o id da tarefa criada, ou None se o banco nao estiver disponivel
@@ -1129,13 +1173,19 @@ um pedido de lembrete não é um comando pro Tripa, um fato pra guardar não é 
    pedido de ação, só algo que deve ficar guardado pra ser usado depois quando fizer sentido
    (inclusive pra responder perguntas futuras tipo "do que o Luan gosta?").
 
-3) PERGUNTA SOBRE O QUE ACONTECEU EM ALGUM GRUPO DE CLIENTE (ex: "o que rolou no grupo do Terapia
-   hoje?", "tem pedido pendente lá na Chicafé?", "o cliente Zurca já respondeu?") - {pessoa_nome}
-   quer SABER/CONSULTAR algo sobre uma conversa de um grupo específico, SEM pedir nenhuma ação nova
-   (isso é diferente do tipo 4: se a mensagem pede pra REPASSAR/ENCAMINHAR algo pro Tripa, mesmo que
-   cite o nome de um cliente, é tipo 4, não tipo 3). Preencha "grupo_perguntado" com o nome do grupo
-   mencionado, o mais parecido possível com um destes grupos de cliente conhecidos:
+3) PERGUNTA SOBRE O QUE ACONTECEU EM ALGUM GRUPO DE CLIENTE ESPECÍFICO (ex: "o que rolou no grupo
+   do Terapia hoje?", "tem pedido pendente lá na Chicafé?", "o cliente Zurca já respondeu?") -
+   {pessoa_nome} quer SABER/CONSULTAR algo sobre a conversa de UM grupo nomeado, SEM pedir nenhuma
+   ação nova (isso é diferente do tipo 4: se a mensagem pede pra REPASSAR/ENCAMINHAR algo pro Tripa,
+   mesmo que cite o nome de um cliente, é tipo 4, não tipo 3). Preencha "grupo_perguntado" com o
+   nome do grupo mencionado, o mais parecido possível com um destes grupos de cliente conhecidos:
    {lista_grupos}
+
+6) PERGUNTA SOBRE ATIVIDADE GERAL, EM TODOS OS GRUPOS (ex: "algum grupo teve atividade hoje?",
+   "quais grupos tiveram movimento hoje?", "teve alguma coisa acontecendo hoje?") - diferente do
+   tipo 3, aqui {pessoa_nome} NÃO cita um grupo específico - quer um panorama geral de TODOS os
+   grupos de uma vez. Marque "eh_pergunta_atividade_geral" como true nesse caso (e deixe
+   "grupo_perguntado" vazio, já que não é um grupo específico).
 
 4) COMANDO PRA REPASSAR ALGO PRO GRUPO TRIPA (ex: "passa pra Tripa fazer isso até amanhã 10h e
    cobra ele às 9h40 perguntando se já fez", "avisa a Tripa que vai ter essa promoção: ...") -
@@ -1156,7 +1206,7 @@ um pedido de lembrete não é um comando pro Tripa, um fato pra guardar não é 
    deste prompt) tiverem a resposta pra uma pergunta, use-os pra responder direto. Se for um
    pedido/comando que você ainda não tem como executar automaticamente, confirme que entendeu e que
    vai anotar/repassar, sem inventar que já fez algo que não fez. Nunca deixe esse campo vazio
-   quando nenhum dos tipos 1/2/3/4 acima se aplicar - toda mensagem privada precisa de resposta.
+   quando nenhum dos tipos 1/2/3/4/6 acima se aplicar - toda mensagem privada precisa de resposta.
 
 IMPORTANTE sobre datas/horários: qualquer campo "*_iso" deve conter APENAS a data/hora em formato
 ISO 8601 com fuso -03:00 (exemplo: 2026-08-29T15:00:00-03:00), sem nenhum texto explicativo junto,
@@ -1180,7 +1230,7 @@ pergunta de ambiguidade anterior sua.
 Responda SEMPRE E APENAS em JSON válido, numa única linha por valor, neste formato exato,
 sem usar bloco de código markdown (nada de ```) e sem quebras de linha dentro dos valores. Inclua
 TODAS as chaves sempre, mesmo vazias/false quando não se aplicarem:
-{"eh_pedido_de_lembrete": true ou false, "destinatario_lembrete": "torres, luan ou tripa - quem deve receber o lembrete", "eh_recorrente": true ou false, "recorrencia_dia_mes": "dia do mes (1-31) se for recorrente mensal, ou string vazia", "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_pergunta_sobre_grupo": true ou false, "grupo_perguntado": "nome do grupo mencionado, ou string vazia", "eh_comando_para_tripa": true ou false, "mensagem_tripa": "texto pronto pra encaminhar pro grupo Tripa, ou string vazia", "tem_cobranca": true ou false, "horario_cobranca_iso": "horario ISO da cobranca, ou string vazia", "pergunta_cobranca": "pergunta curta pra mandar na cobranca, ou string vazia", "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/3/4 acima for verdadeiro"}
+{"eh_pedido_de_lembrete": true ou false, "destinatario_lembrete": "torres, luan ou tripa - quem deve receber o lembrete", "eh_recorrente": true ou false, "recorrencia_dia_mes": "dia do mes (1-31) se for recorrente mensal, ou string vazia", "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_pergunta_sobre_grupo": true ou false, "grupo_perguntado": "nome do grupo mencionado, ou string vazia", "eh_pergunta_atividade_geral": true ou false, "eh_comando_para_tripa": true ou false, "mensagem_tripa": "texto pronto pra encaminhar pro grupo Tripa, ou string vazia", "tem_cobranca": true ou false, "horario_cobranca_iso": "horario ISO da cobranca, ou string vazia", "pergunta_cobranca": "pergunta curta pra mandar na cobranca, ou string vazia", "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/3/4/6 acima for verdadeiro"}
 """
 
 
@@ -1734,6 +1784,57 @@ def responder_pergunta_sobre_grupo(pessoa_nome, pergunta, grupo_jid, grupo_nome)
         return "Tive um problema pra consultar o histórico desse grupo agora, tenta de novo daqui a pouco?"
 
 
+SYSTEM_PROMPT_ATIVIDADE_GERAL = """Você é a Cintia, assistente virtual da Correria. {pessoa_nome}
+perguntou quais grupos (de cliente ou o grupo interno Tripa) tiveram atividade hoje, pra ter um
+panorama geral sem precisar abrir grupo por grupo. Abaixo está, pra cada grupo que teve pelo menos
+uma mensagem hoje, um trecho do que foi registrado.
+
+Pra CADA grupo listado, escreva um resumo BEM curto (uma frase só) do que rolou lá, com base
+SOMENTE nas mensagens mostradas - sem inventar nada que não esteja ali. Se o grupo só teve
+mensagem da própria equipe (sem nada de cliente), pode dizer isso também.
+
+ATIVIDADE DE HOJE POR GRUPO:
+{blocos_grupos}
+
+Responda SEMPRE E APENAS em JSON válido, sem bloco de código markdown (nada de ```), neste
+formato exato:
+{"resumos": [{"grupo": "nome do grupo", "resumo": "resumo de uma frase do que rolou nesse grupo"}]}
+"""
+
+
+def responder_atividade_geral_hoje(pessoa_nome):
+    grupos_ativos = listar_grupos_com_atividade_hoje()
+    if not grupos_ativos:
+        return "Hoje ainda não teve nenhuma atividade registrada em nenhum grupo (nem de cliente, nem no Tripa)."
+
+    blocos = []
+    for info in grupos_ativos.values():
+        linhas = []
+        for m in info["mensagens"][-15:]:
+            quem = "equipe" if m.get("eh_equipe") else (m.get("autor") or "cliente")
+            linhas.append(f"  - {quem}: {m.get('conteudo', '')}")
+        blocos.append(f"Grupo \"{info['nome']}\":\n" + "\n".join(linhas))
+    blocos_grupos = "\n\n".join(blocos)
+
+    prompt_sistema = (
+        SYSTEM_PROMPT_ATIVIDADE_GERAL
+        .replace("{pessoa_nome}", pessoa_nome)
+        .replace("{blocos_grupos}", blocos_grupos)
+    )
+    try:
+        resultado = chamar_claude(prompt_sistema, "Quais grupos tiveram atividade hoje?")
+        resumos = resultado.get("resumos") or []
+        if not resumos:
+            nomes = ", ".join(info["nome"] for info in grupos_ativos.values())
+            return f"Hoje tiveram atividade: {nomes}."
+        linhas_resposta = [f"• *{r.get('grupo', '')}*: {r.get('resumo', '')}" for r in resumos]
+        return "Hoje tiveram atividade nesses grupos:\n\n" + "\n".join(linhas_resposta)
+    except Exception as e:
+        print(f"[responder_atividade_geral_hoje] erro: {e}", flush=True)
+        nomes = ", ".join(info["nome"] for info in grupos_ativos.values())
+        return f"Tive um problema pra resumir, mas hoje tiveram atividade nesses grupos: {nomes}."
+
+
 def processar_dm(remote_jid, key, data):
     if numero_bate(remote_jid, TORRES_NUMBER):
         pessoa, numero = "torres", TORRES_NUMBER
@@ -1888,6 +1989,9 @@ def processar_dm(remote_jid, key, data):
     elif resultado.get("eh_fato_para_lembrar") and resultado.get("fato_texto"):
         salvar_fato(pessoa, resultado["fato_texto"])
         enviar_texto(numero, f"Anotado! ✅ Vou lembrar: \"{resultado['fato_texto']}\"")
+    elif resultado.get("eh_pergunta_atividade_geral"):
+        pessoa_nome_geral = "Torres" if pessoa == "torres" else "Luan"
+        enviar_texto(numero, responder_atividade_geral_hoje(pessoa_nome_geral))
     elif resultado.get("eh_pergunta_sobre_grupo") and resultado.get("grupo_perguntado"):
         grupo_jid_pergunta = identificar_grupo_mencionado(resultado["grupo_perguntado"])
         if not grupo_jid_pergunta:
