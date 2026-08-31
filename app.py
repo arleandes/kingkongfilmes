@@ -1701,7 +1701,10 @@ def registrar_pedido_pendente(cliente_nome, pedido_texto, grupo_jid=None, tipo_p
     chave = normalizar_texto(cliente_nome)
     with _pedidos_lock:
         fila = _pedidos_pendentes_designer.setdefault(chave, [])
-        fila.append({"cliente_nome": cliente_nome, "pedido_texto": pedido_texto, "timestamp": time.time()})
+        fila.append({
+            "cliente_nome": cliente_nome, "pedido_texto": pedido_texto,
+            "grupo_jid": grupo_jid, "timestamp": time.time(),
+        })
 
 
 _STOPWORDS_NOME_CLIENTE = {"de", "do", "da", "e", "dr", "dra", "grupo"}
@@ -1740,6 +1743,7 @@ def buscar_pedido_pendente(cliente_nome):
                 "tarefa_id": tarefa["id"],
                 "cliente_nome": tarefa["cliente_nome"],
                 "pedido_texto": tarefa["descricao"],
+                "grupo_jid": tarefa.get("grupo_jid"),
             }
         return None
     chave = normalizar_texto(cliente_nome)
@@ -1756,32 +1760,72 @@ def buscar_pedido_pendente(cliente_nome):
         return pedido
 
 
-SYSTEM_PROMPT_COMPARACAO_PEDIDO = """Você compara uma peça gráfica finalizada com o pedido original
-que o cliente fez, pra conferir se a arte contempla todas as informações pedidas.
+SYSTEM_PROMPT_COMPARACAO_PEDIDO = """Você faz a CONFERÊNCIA DE CONTEÚDO de uma peça gráfica finalizada
+antes dela sair pro cliente - essa conferência é uma camada de qualidade separada da revisão de
+português, e existe SÓ internamente (nunca é vista pelo cliente). Você não está aqui pra corrigir
+ortografia (isso já é feito em outra etapa) - você está aqui pra checar se a INFORMAÇÃO da arte
+bate exatamente com o que o cliente pediu de verdade, na versão mais atual/confirmada do pedido.
 
-Você vai receber (1) o pedido original organizado (evento, data, horário, textos, nomes etc que o
-cliente pediu) e (2) a imagem ou PDF da arte finalizada. Leia todo o texto visível na arte e
-compare com cada item do pedido original.
+FONTE DA VERDADE: o "pedido original organizado" que você vai receber já é a versão consolidada do
+pedido no momento em que foi encaminhado pro designer. Mas, junto com ele, você também pode receber
+um HISTÓRICO RECENTE DO CLIENTE (mensagens de texto, áudio já transcrito, e observações da equipe)
+que pode conter CORREÇÕES OU ALTERAÇÕES enviadas DEPOIS que o pedido já tinha sido encaminhado pro
+designer (pelo próprio cliente, por Torres ou por Luan) - texto e áudio têm o MESMO peso, nunca
+ignore uma alteração só porque veio por áudio. Se o histórico mostrar uma informação mais recente
+que contradiz o pedido original organizado (ex: pedido dizia "R$ 37,90" mas depois alguém confirmou
+"pode manter R$ 39,90 mesmo"), a informação MAIS RECENTE E CONFIRMADA é que vale - reconstrua
+mentalmente esse "briefing final" antes de comparar com a arte. Nunca use só a primeira mensagem
+nem ignore uma correção posterior.
 
-Aponte:
-- Informação que estava no pedido e NÃO aparece na arte (ex: faltou o horário, faltou um nome).
-- Informação que aparece na arte mas está DIFERENTE do que foi pedido (ex: data errada, nome
-  escrito diferente do pedido, dia da semana que não bate com a data).
-Não aponte diferença de design, cores, layout ou estética - só conteúdo/informação. Se a arte
-contempla tudo que foi pedido corretamente, diga isso claramente.
+O QUE CONFERIR (compare a arte, item por item, com o briefing final reconstruído): nome do
+cliente/empresa/produto/pessoa, valores (preço original e promocional), datas, dias da semana,
+horários, condições, exceções/restrições (ex: "exceto tal item"), endereço, telefone, e qualquer
+outra informação concreta que o cliente forneceu.
+
+REGRAS DE PRECISÃO (não flexibilize nenhuma delas):
+- Valores: compare o número exato. R$ 39,90 e R$ 39,99 são DIFERENTES - isso é erro, não uma
+  escolha estética do designer. Nunca arredonde, nunca trate como equivalente.
+- Nomes próprios: compare a grafia exata contra o que está confirmado no histórico/pedido (ex:
+  "Terapia Beach" vs "Terapia Bech", ou "Fellipe" vs "Felipe" - mesmo uma letra de diferença é erro).
+- Datas/dias da semana/horários: confira dia, dia da semana e horário um a um.
+- Exceções e condições (ex: "exceto salmão e moqueca"): se o pedido exigia essa informação e ela
+  não aparece na arte, isso é uma falha de conteúdo mesmo que o resto (preço, título) esteja certo -
+  nunca aprove só porque a parte principal bateu.
+- NUNCA aprove só pela aparência/design da arte estar bonita - sempre extraia as informações da
+  arte e compare com o briefing final reconstruído antes de decidir.
+
+QUANDO HOUVER DÚVIDA (ex: uma transcrição de áudio no histórico não ficou clara sobre qual valor
+vale, ou duas mensagens parecem se contradizer sem dar pra saber qual é a mais recente/confirmada):
+NÃO escolha uma das opções por conta própria e não invente. Marque "duvida_ambigua" como true e
+preencha "pergunta_duvida" com uma pergunta objetiva pra Torres ou Luan resolverem, citando as duas
+informações em conflito e o cliente/peça em questão.
 
 Responda SEMPRE E APENAS em JSON válido, sem bloco de código markdown (nada de ```):
 {
   "bate_com_pedido": true ou false,
-  "problemas": ["lista de itens faltando ou diferentes do pedido, cada um curto e claro"],
-  "resumo": "1 frase confirmando que bateu tudo, ou resumindo o principal problema"
+  "problemas": ["lista de itens faltando ou diferentes do briefing final, cada um citando o valor/informação pedida e o que está na arte"],
+  "resumo": "1 frase confirmando que bateu tudo, ou resumindo o principal problema",
+  "duvida_ambigua": true ou false,
+  "pergunta_duvida": "pergunta objetiva pra Torres/Luan quando houver conflito não resolvido no histórico, ou string vazia"
 }
 """
 
 
-def comparar_arte_com_pedido(pedido_texto, imagem_base64, pdf_base64):
-    prompt_usuario = f"Pedido original do cliente:\n{pedido_texto}\n\nCompare esse pedido com a arte anexada."
+def comparar_arte_com_pedido(pedido_texto, imagem_base64, pdf_base64, historico_texto=""):
+    bloco_historico = (
+        f"\n\nHISTÓRICO RECENTE DO CLIENTE (mais antigo primeiro - pode conter correções enviadas "
+        f"DEPOIS do pedido original acima; a informação mais recente e confirmada é que vale):\n{historico_texto}"
+    ) if historico_texto else ""
+    prompt_usuario = (
+        f"Pedido original organizado (no momento em que foi encaminhado pro designer):\n{pedido_texto}"
+        f"{bloco_historico}\n\nFaça a conferência de conteúdo dessa arte anexada contra o briefing final."
+    )
     resultado = chamar_claude(SYSTEM_PROMPT_COMPARACAO_PEDIDO, prompt_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64)
+
+    if resultado.get("duvida_ambigua"):
+        bate = False
+        texto_resp = ""  # a duvida vai só pro privado de Torres/Luan, nunca pro grupo Tripa como se fosse erro confirmado
+        return bate, texto_resp, resultado
 
     bate = bool(resultado.get("bate_com_pedido"))
     if bate:
@@ -1857,24 +1901,47 @@ def processar_revisao_grupo_designer(remote_jid, key, data):
     if cliente_nome:
         pedido = buscar_pedido_pendente(cliente_nome)
         if pedido:
+            # Busca o historico recente da conversa do cliente (grupo dele) - pode conter
+            # correcoes/alteracoes enviadas DEPOIS que o pedido ja tinha sido encaminhado pro
+            # designer (por texto ou audio, do cliente ou da equipe), que o "pedido_texto"
+            # congelado sozinho nao capturaria. Isso e o que permite reconstruir o briefing
+            # final de verdade antes de conferir a arte, em vez de comparar so com a primeira
+            # versao do pedido.
+            historico_texto = ""
+            grupo_jid_cliente = pedido.get("grupo_jid")
+            if grupo_jid_cliente:
+                historico_cliente = buscar_mensagens_recentes_grupo(grupo_jid_cliente, limite=20)
+                historico_texto = "\n".join(f"- {m['autor']}: {m['conteudo']}" for m in historico_cliente)
             try:
                 bate, texto_comparacao, resultado_comparacao = comparar_arte_com_pedido(
-                    pedido["pedido_texto"], imagem_base64, pdf_base64
+                    pedido["pedido_texto"], imagem_base64, pdf_base64, historico_texto=historico_texto
                 )
             except Exception as e:
                 print(f"[processar_revisao_grupo_designer] erro na comparacao com pedido: {e}", flush=True)
             else:
-                enviar_texto(remote_jid, texto_comparacao)
-                # Quando o pedido veio do banco (tem tarefa_id), atualiza o status da
-                # tarefa de acordo com o resultado da conferencia: concluida se bateu
-                # tudo certo, ou aguardando correcao se faltou/tem algo errado - assim a
-                # mesma tarefa continua aberta pra receber a proxima rodada corrigida.
-                if pedido.get("tarefa_id"):
-                    novo_status = STATUS_CONCLUIDO if bate else STATUS_AGUARDANDO_CORRECAO
-                    adicionar_evento_tarefa(
-                        pedido["tarefa_id"], "entrega", texto_comparacao,
-                        autor="designer", novo_status=novo_status,
+                if resultado_comparacao.get("duvida_ambigua"):
+                    # Nunca escolhe uma informacao em duvida por conta propria - so pergunta pra
+                    # Torres/Luan em privado, sem postar nenhum veredito (certo/errado) no Tripa
+                    # enquanto a duvida nao for resolvida por um humano.
+                    pergunta = resultado_comparacao.get("pergunta_duvida") or (
+                        f"Estou conferindo uma arte do cliente {cliente_nome} e encontrei uma "
+                        "informação que não consegui confirmar com segurança no histórico. Pode "
+                        "dar uma olhada?"
                     )
+                    for numero in TEAM_NUMBERS:
+                        enviar_texto(numero, f"❓ Dúvida na conferência de conteúdo ({cliente_nome}):\n\n{pergunta}")
+                else:
+                    enviar_texto(remote_jid, texto_comparacao)
+                    # Quando o pedido veio do banco (tem tarefa_id), atualiza o status da
+                    # tarefa de acordo com o resultado da conferencia: concluida se bateu
+                    # tudo certo, ou aguardando correcao se faltou/tem algo errado - assim a
+                    # mesma tarefa continua aberta pra receber a proxima rodada corrigida.
+                    if pedido.get("tarefa_id"):
+                        novo_status = STATUS_CONCLUIDO if bate else STATUS_AGUARDANDO_CORRECAO
+                        adicionar_evento_tarefa(
+                            pedido["tarefa_id"], "entrega", texto_comparacao,
+                            autor="designer", novo_status=novo_status,
+                        )
         else:
             print(
                 f"[processar_revisao_grupo_designer] legenda citou '{cliente_nome}' mas nao "
