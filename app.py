@@ -63,6 +63,14 @@ TEAM_NUMBERS = [TORRES_NUMBER, LUAN_NUMBER]
 OUTRO_AGENTE_IA_NUMBER = os.environ.get("OUTRO_AGENTE_IA_NUMBER", "5571984224897")
 NUMEROS_SEM_AUTO_RESPOSTA_EM_GRUPO = [TORRES_NUMBER, LUAN_NUMBER, OUTRO_AGENTE_IA_NUMBER]
 
+# Integracao com o Metricool (consulta de metricas e agendamento de post via link do
+# Drive) - disponivel SOMENTE no privado de Torres/Luan, nunca pra clientes. O userId
+# da conta ja e conhecido (nao e segredo), mas o userToken e uma credencial e deve ser
+# configurado so como variavel de ambiente no Railway, nunca escrito no codigo.
+METRICOOL_BASE_URL = "https://app.metricool.com/api"
+METRICOOL_USER_ID = os.environ.get("METRICOOL_USER_ID", "4956967")
+METRICOOL_USER_TOKEN = os.environ.get("METRICOOL_USER_TOKEN", "")
+
 # Grupos monitorados: id -> {"nome": ..., "interno": True/False}
 GRUPOS = {
     "120363409281934368@g.us": {"nome": "Terapia", "interno": False},
@@ -1252,13 +1260,29 @@ um pedido de lembrete não é um comando pro Tripa, um fato pra guardar não é 
    IMPORTANTE: você NUNCA envia isso direto - só organiza o conteúdo, quem decide se confirma o
    envio é sempre {pessoa_nome} (vai ver um preview antes).
 
+7) COMANDO PRA AGENDAR POST NO METRICOOL (ex: "agenda esse story do instagram da Terapia amanhã
+   às 10h: <link do drive>", "posta isso no feed do instagram e facebook do Zurca dia 5 às 14h:
+   <link>", legenda incluída ou não) - {pessoa_nome} quer publicar/agendar uma peça pronta (foto
+   ou vídeo, por um link público - geralmente do Google Drive) numa rede social de algum cliente,
+   através do Metricool. Marque "eh_comando_metricool" como true e preencha "metricool_cliente"
+   com o nome do cliente/marca mencionado (o
+   mais parecido possível com o nome real do cliente), "metricool_redes" com a lista das redes
+   pedidas usando EXATAMENTE estes valores: "instagram", "facebook" e/ou "gmb" (gmb = Google
+   Business Profile/Google Meu Negócio - use esse valor quando a pessoa disser "google" ou
+   "google meu negócio"), "metricool_tipo" com "feed", "story" ou "reel" (o mais parecido com o
+   que foi pedido - assuma "feed" se não ficar claro), "metricool_link_media" com o link público
+   da mídia (Drive ou outro), "metricool_texto" com a legenda (se tiver sido informada, senão
+   string vazia) e "metricool_data_hora_iso" com a data/hora pedida pra publicar (ISO 8601, fuso
+   -03:00). IMPORTANTE: você NUNCA agenda isso direto - só organiza os dados, quem confirma o
+   agendamento de verdade é sempre {pessoa_nome} (vai ver um preview antes).
+
 5) QUALQUER OUTRA COISA (comentário, resposta a um lembrete anterior, pedido/comando que não se
    encaixa nos tipos acima) - preencha "resposta_conversa" com uma resposta natural e útil, como
    uma colega de equipe responderia no privado. Se os FATOS QUE VOCÊ JÁ SABE (se houver, no topo
    deste prompt) tiverem a resposta pra uma pergunta, use-os pra responder direto. Se for um
    pedido/comando que você ainda não tem como executar automaticamente, confirme que entendeu e que
    vai anotar/repassar, sem inventar que já fez algo que não fez. Nunca deixe esse campo vazio
-   quando nenhum dos tipos 1/2/3/4/6 acima se aplicar - toda mensagem privada precisa de resposta.
+   quando nenhum dos tipos 1/2/3/4/6/7 acima se aplicar - toda mensagem privada precisa de resposta.
 
 IMPORTANTE sobre datas/horários: qualquer campo "*_iso" deve conter APENAS a data/hora em formato
 ISO 8601 com fuso -03:00 (exemplo: 2026-08-29T15:00:00-03:00), sem nenhum texto explicativo junto,
@@ -1271,7 +1295,7 @@ PASSADO, é bem provável que a pessoa quis dizer o outro turno do dia (ex: "ago
 disse "9h40" - ela quase certamente quis dizer 21h40 de hoje à noite, não 9h40 da manhã, que já
 passou faz muito tempo). NUNCA simplesmente aceite um horário que já passou sem questionar - isso é
 sinal de ambiguidade, não uma instrução válida pra agendar algo no passado. Nesses casos: marque
-"eh_pedido_de_lembrete" e "eh_comando_para_tripa" como false (não agende nada ainda), e em
+"eh_pedido_de_lembrete", "eh_comando_para_tripa" e "eh_comando_metricool" como false (não agende nada ainda), e em
 "resposta_conversa" pergunte de forma natural qual horário a pessoa quis dizer, oferecendo as duas
 opções explícitas (ex: "Você quis dizer 9h40 da manhã (que já passou) ou 21h40 de hoje à noite?").
 Só preencha um campo "*_iso" quando o horário pretendido estiver inequívoco - pela própria mensagem
@@ -1282,7 +1306,7 @@ pergunta de ambiguidade anterior sua.
 Responda SEMPRE E APENAS em JSON válido, numa única linha por valor, neste formato exato,
 sem usar bloco de código markdown (nada de ```) e sem quebras de linha dentro dos valores. Inclua
 TODAS as chaves sempre, mesmo vazias/false quando não se aplicarem:
-{"eh_pedido_de_lembrete": true ou false, "destinatario_lembrete": "torres, luan ou tripa - quem deve receber o lembrete", "eh_recorrente": true ou false, "recorrencia_dia_mes": "dia do mes (1-31) se for recorrente mensal, ou string vazia", "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_pergunta_sobre_grupo": true ou false, "grupo_perguntado": "nome do grupo mencionado, ou string vazia", "eh_pergunta_atividade_geral": true ou false, "eh_comando_para_tripa": true ou false, "mensagem_tripa": "texto pronto pra encaminhar pro grupo Tripa, ou string vazia", "tem_cobranca": true ou false, "horario_cobranca_iso": "horario ISO da cobranca, ou string vazia", "pergunta_cobranca": "pergunta curta pra mandar na cobranca, ou string vazia", "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/3/4/6 acima for verdadeiro"}
+{"eh_pedido_de_lembrete": true ou false, "destinatario_lembrete": "torres, luan ou tripa - quem deve receber o lembrete", "eh_recorrente": true ou false, "recorrencia_dia_mes": "dia do mes (1-31) se for recorrente mensal, ou string vazia", "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_pergunta_sobre_grupo": true ou false, "grupo_perguntado": "nome do grupo mencionado, ou string vazia", "eh_pergunta_atividade_geral": true ou false, "eh_comando_para_tripa": true ou false, "mensagem_tripa": "texto pronto pra encaminhar pro grupo Tripa, ou string vazia", "tem_cobranca": true ou false, "horario_cobranca_iso": "horario ISO da cobranca, ou string vazia", "pergunta_cobranca": "pergunta curta pra mandar na cobranca, ou string vazia", "eh_comando_metricool": true ou false, "metricool_cliente": "nome do cliente/marca, ou string vazia", "metricool_redes": ["instagram"], "metricool_tipo": "feed, story ou reel", "metricool_link_media": "link publico da midia, ou string vazia", "metricool_texto": "legenda do post, ou string vazia", "metricool_data_hora_iso": "horario ISO pra publicar, ou string vazia", "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/3/4/6/7 acima for verdadeiro"}
 """
 
 
@@ -1887,6 +1911,139 @@ def responder_atividade_geral_hoje(pessoa_nome):
         return f"Tive um problema pra resumir, mas hoje tiveram atividade nesses grupos: {nomes}."
 
 
+# --------------------------------------------------------------------------
+# Parte 6: integracao com o Metricool (so no privado de Torres/Luan)
+# --------------------------------------------------------------------------
+#
+# Duas funcoes: (1) consultar metricas de alguma marca/cliente cadastrado no
+# Metricool, e (2) agendar um post (feed/story/reel) a partir de um link publico
+# (Google Drive ou outro), do jeito que Torres/Luan ja fazem hoje conversando com
+# o Claude - so que agora pelo WhatsApp. NUNCA disponivel pra clientes, so
+# reconhecido dentro de processar_dm (numero ja verificado como Torres ou Luan).
+
+_marcas_metricool_cache = {"dados": None, "buscado_em": 0}
+_MARCAS_METRICOOL_CACHE_TTL = 15 * 60  # 15 min - marca nova cadastrada demora no maximo isso pra aparecer
+
+
+def metricool_headers():
+    return {"X-Mc-Auth": METRICOOL_USER_TOKEN, "Content-Type": "application/json"}
+
+
+def metricool_listar_marcas(forcar=False):
+    """Lista as marcas/clientes cadastrados no Metricool (id + nome), com cache em
+    memoria de 15 min pra nao bater na API a cada mensagem. Se a chamada falhar,
+    devolve o cache antigo (se tiver) em vez de quebrar tudo."""
+    agora = time.time()
+    if not forcar and _marcas_metricool_cache["dados"] is not None and (agora - _marcas_metricool_cache["buscado_em"]) < _MARCAS_METRICOOL_CACHE_TTL:
+        return _marcas_metricool_cache["dados"]
+    try:
+        resp = requests.get(
+            f"{METRICOOL_BASE_URL}/admin/simpleProfiles",
+            headers=metricool_headers(),
+            params={"userId": METRICOOL_USER_ID},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        marcas = body.get("data", body) if isinstance(body, dict) else body
+        _marcas_metricool_cache["dados"] = marcas
+        _marcas_metricool_cache["buscado_em"] = agora
+        return marcas
+    except Exception as e:
+        print(f"[metricool_listar_marcas] erro ao buscar marcas: {e}", flush=True)
+        return _marcas_metricool_cache["dados"] or []
+
+
+def metricool_identificar_marca(texto):
+    """Acha, pelo nome mencionado na mensagem, a marca/cliente correspondente no
+    Metricool (comparacao sem acento/case, por substring - mesmo criterio usado
+    pra identificar grupo de cliente). Devolve o dict da marca (com "id" e "label")
+    ou None se nao encontrar."""
+    texto_norm = normalizar_texto(texto)
+    marcas = metricool_listar_marcas()
+    melhor = None
+    for marca in marcas:
+        nome_norm = normalizar_texto(marca.get("label", ""))
+        if nome_norm and nome_norm in texto_norm:
+            if not melhor or len(nome_norm) > len(normalizar_texto(melhor.get("label", ""))):
+                melhor = marca
+    return melhor
+
+
+def metricool_mapear_tipo(tipo_generico, rede, tem_midia):
+    """Traduz um tipo generico ("feed", "story" ou "reel", do jeito que Torres/Luan
+    falariam) pro valor que cada rede espera no formato da API do Metricool - cada
+    rede tem sua propria convencao de nomes."""
+    tipo_generico = (tipo_generico or "feed").lower()
+    if rede in ("instagram", "facebook"):
+        return {"feed": "POST", "story": "STORY", "reel": "REEL"}.get(tipo_generico, "POST")
+    if rede == "gmb":
+        # Google Business Profile so aceita midia (foto/video) no tipo "photo" - se tem
+        # midia, sempre usa esse, independente do que foi pedido.
+        return "photo" if tem_midia else "publication"
+    return tipo_generico
+
+
+def metricool_agendar_post(blog_id, redes, tipo_generico, texto, media_url, data_hora_iso, timezone_iana):
+    """Agenda um post no Metricool (POST /v2/scheduler/posts) numa ou mais redes,
+    usando um link publico de midia (Drive, Dropbox ou qualquer URL publica - o
+    proprio Metricool baixa e hospeda). Devolve (sucesso: bool, mensagem: str)."""
+    try:
+        dt = datetime.fromisoformat(data_hora_iso)
+    except Exception:
+        return False, "Data/horário do agendamento inválido."
+
+    tem_midia = bool(media_url)
+    tipo_por_rede = {rede: metricool_mapear_tipo(tipo_generico, rede, tem_midia) for rede in redes}
+    providers = [{"network": rede} for rede in redes]
+    network_data = {}
+    for rede in redes:
+        tipo = tipo_por_rede[rede]
+        if rede == "instagram":
+            network_data["instagramData"] = {"type": tipo}
+        elif rede == "facebook":
+            network_data["facebookData"] = {"type": tipo}
+        elif rede == "gmb":
+            network_data["gmbData"] = {"type": tipo}
+
+    # Stories nao tem legenda propria - so manda o texto se NENHUMA rede for story,
+    # pra nao correr o risco da API rejeitar ou ignorar o campo.
+    eh_so_story = all(tipo_por_rede[r] == "STORY" for r in redes)
+    corpo = {
+        "publicationDate": {"dateTime": dt.strftime("%Y-%m-%dT%H:%M:%S"), "timezone": timezone_iana},
+        "providers": providers,
+        "media": [media_url] if media_url else [],
+        "autoPublish": True,
+        "draft": False,
+        **network_data,
+    }
+    if texto and not eh_so_story:
+        corpo["text"] = texto
+
+    try:
+        resp = requests.post(
+            f"{METRICOOL_BASE_URL}/v2/scheduler/posts",
+            headers=metricool_headers(),
+            params={"userId": METRICOOL_USER_ID, "blogId": blog_id},
+            json=corpo,
+            timeout=30,
+        )
+        if resp.status_code >= 400:
+            print(f"[metricool_agendar_post] ERRO {resp.status_code}: {resp.text[:800]}", flush=True)
+            return False, f"O Metricool recusou o agendamento (erro {resp.status_code}). Confere se o link da mídia está público e tenta de novo."
+        return True, "Agendado com sucesso!"
+    except Exception as e:
+        print(f"[metricool_agendar_post] falhou: {e}", flush=True)
+        return False, "Não consegui falar com o Metricool agora, tenta de novo daqui a pouco?"
+
+
+# Comando de agendamento Metricool pendente de confirmacao, por pessoa (torres/luan) -
+# mesmo padrao ja usado pro comando de repassar pro Tripa (mostra preview, so agenda
+# de verdade depois do "sim").
+_comandos_metricool_pendentes = {}
+_COMANDO_METRICOOL_PENDENTE_TTL = 15 * 60
+
+
 def processar_dm(remote_jid, key, data):
     if numero_bate(remote_jid, TORRES_NUMBER):
         pessoa, numero = "torres", TORRES_NUMBER
@@ -1992,6 +2149,31 @@ def processar_dm(remote_jid, key, data):
         # confirma is None: nao pareceu sim/nem nao, segue o fluxo normal (pode ser uma
         # mensagem nova, ou uma correcao ao comando pendente - nesse caso o comando antigo
         # so expira depois do TTL, ou e substituido se essa mensagem virar um novo comando).
+
+    # Se tem um agendamento no Metricool pendente de confirmacao pra essa pessoa, confere se
+    # essa mensagem e um sim/nao antes de tratar como mensagem nova - mesmo padrao do comando
+    # pro Tripa, ja que agendar um post de verdade num cliente tambem e uma acao que nao da
+    # pra desfazer facilmente.
+    pendente_metricool = _comandos_metricool_pendentes.get(pessoa)
+    if pendente_metricool and (time.time() - pendente_metricool["criado_em"]) <= _COMANDO_METRICOOL_PENDENTE_TTL:
+        confirma_metricool = parece_confirmacao(texto)
+        if confirma_metricool is True:
+            sucesso, mensagem_resultado = metricool_agendar_post(
+                pendente_metricool["blog_id"], pendente_metricool["redes"], pendente_metricool["tipo"],
+                pendente_metricool["texto"], pendente_metricool["media_url"],
+                pendente_metricool["data_hora_iso"], pendente_metricool["timezone"],
+            )
+            _comandos_metricool_pendentes.pop(pessoa, None)
+            if sucesso:
+                enviar_texto(numero, f"Agendado! ✅ {pendente_metricool['resumo']}")
+            else:
+                enviar_texto(numero, f"Não consegui agendar: {mensagem_resultado}")
+            return {"metricool_agendamento_confirmado": sucesso}
+        elif confirma_metricool is False:
+            _comandos_metricool_pendentes.pop(pessoa, None)
+            enviar_texto(numero, "Beleza, não agendei nada.")
+            return {"metricool_agendamento_cancelado": True}
+        # None: segue o fluxo normal, o agendamento pendente continua ate o TTL expirar.
 
     # Se tem uma promessa detectada aguardando confirmacao (Torres OU Luan podem responder -
     # nao e por pessoa como o comando pro Tripa, porque os dois recebem o aviso), confere a
@@ -2122,6 +2304,57 @@ def processar_dm(remote_jid, key, data):
             f"Ficou assim pra encaminhar pra Tripa:\n\n{mensagem_tripa}{preview_cobranca}\n\n"
             "Confirma que posso mandar? (responde \"sim\" ou \"não\")",
         )
+    elif resultado.get("eh_comando_metricool"):
+        nome_cliente_pedido = resultado.get("metricool_cliente") or ""
+        marca = metricool_identificar_marca(nome_cliente_pedido)
+        redes_pedidas = [r for r in (resultado.get("metricool_redes") or []) if r in ("instagram", "facebook", "gmb")]
+        link_media = (resultado.get("metricool_link_media") or "").strip()
+        data_hora_str = resultado.get("metricool_data_hora_iso") or ""
+
+        if not marca:
+            enviar_texto(
+                numero,
+                f"Entendi que é pra agendar algo pro cliente \"{nome_cliente_pedido}\", mas não achei "
+                "essa marca cadastrada no Metricool. Pode confirmar o nome certinho?",
+            )
+        elif not redes_pedidas:
+            enviar_texto(numero, "Entendi o pedido, mas não ficou claro em qual rede (Instagram, Facebook ou Google) - pode me confirmar?")
+        elif not link_media:
+            enviar_texto(numero, "Beleza, só falta o link da mídia (Drive ou outro link público) - pode mandar?")
+        elif not data_hora_str:
+            enviar_texto(numero, "Beleza, só falta o dia e horário pra publicar - pode me confirmar?")
+        else:
+            try:
+                dt_preview = datetime.fromisoformat(data_hora_str)
+            except Exception:
+                dt_preview = None
+            if not dt_preview:
+                enviar_texto(numero, "Não consegui entender o horário certinho pra esse agendamento, pode confirmar de novo?")
+            else:
+                tipo_pedido = (resultado.get("metricool_tipo") or "feed").lower()
+                texto_legenda = resultado.get("metricool_texto") or ""
+                nomes_redes = {"instagram": "Instagram", "facebook": "Facebook", "gmb": "Google Meu Negócio"}
+                resumo = (
+                    f"{tipo_pedido.capitalize()} de *{marca['label']}* em {', '.join(nomes_redes.get(r, r) for r in redes_pedidas)} "
+                    f"às {dt_preview.strftime('%d/%m às %H:%M')}"
+                )
+                _comandos_metricool_pendentes[pessoa] = {
+                    "blog_id": marca["id"],
+                    "redes": redes_pedidas,
+                    "tipo": tipo_pedido,
+                    "texto": texto_legenda,
+                    "media_url": link_media,
+                    "data_hora_iso": data_hora_str,
+                    "timezone": marca.get("timezone") or "America/Bahia",
+                    "resumo": resumo,
+                    "criado_em": time.time(),
+                }
+                preview_legenda = f"\n📝 Legenda: {texto_legenda}" if texto_legenda else ""
+                enviar_texto(
+                    numero,
+                    f"Vou agendar isso no Metricool:\n\n{resumo}{preview_legenda}\n🔗 Mídia: {link_media}\n\n"
+                    "Confirma? (responde \"sim\" ou \"não\")",
+                )
     elif tinha_pendente:
         enviar_texto(numero, "Combinado, marquei como resolvido! ✅")
     else:
