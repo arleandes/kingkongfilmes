@@ -1419,7 +1419,12 @@ um pedido de lembrete não é um comando pro Tripa, um fato pra guardar não é 
    monta a resposta filtrada aqui - só identifica que é esse tipo de pergunta, quem realmente
    filtra e responde é outra etapa que já tem acesso ao histórico completo de cada grupo. Nunca
    confunda isso com o tipo 6: uma pergunta com critério específico (confirmação, pendência,
-   aprovação) é tipo 10; "o que rolou hoje" sem nenhum filtro é tipo 6.
+   aprovação) é tipo 10; "o que rolou hoje" sem nenhum filtro é tipo 6. IMPORTANTE: uma pergunta
+   curta que só faz sentido como CONTINUAÇÃO de uma pergunta operacional anterior nessa mesma
+   conversa (ex: você perguntou "quem confirmou gravação?", a resposta veio, e {pessoa_nome} manda
+   só "e o Zurca?" ou "e os outros?") continua sendo tipo 3 ou tipo 10, igual à pergunta original -
+   use o CONTEXTO DA CONVERSA acima pra reconhecer isso, nunca trate como pergunta solta sem
+   sentido.
 
 4) COMANDO PRA REPASSAR ALGO PRO GRUPO TRIPA (ex: "passa pra Tripa fazer isso até amanhã 10h e
    cobra ele às 9h40 perguntando se já fez", "avisa a Tripa que vai ter essa promoção: ...") -
@@ -2341,15 +2346,80 @@ def corrigir_texto_dm(numero, modo, texto_a_corrigir):
     return {"resultado": resultado}
 
 
+# --------------------------------------------------------------------------
+# "Modo de inteligência operacional" pro privado de Torres/Luan: perguntas
+# operacionais (de um cliente só ou de vários) precisam de data/hora OBJETIVA por
+# mensagem (calculada por código, nunca pelo modelo "adivinhando" se algo foi
+# hoje/ontem/essa semana), das regras já ensinadas (gerais e por cliente) e do
+# contexto da própria conversa privada (pra resolver "e o Zurca?"/"esse outro"
+# como continuação de uma pergunta anterior, não como pergunta solta).
+# --------------------------------------------------------------------------
+def _formatar_timestamp_mensagem(criado_em):
+    """Converte o campo criado_em de uma mensagem (datetime tz-aware vindo do banco, ou
+    string ISO vinda do fallback em memória) num timestamp legível em horário de Bahia.
+    Sem isso o modelo não tem como responder com segurança "hoje"/"ontem"/"essa semana"/
+    "mais recente" - ele só vê o texto da mensagem, nunca quando ela realmente aconteceu."""
+    if not criado_em:
+        return ""
+    try:
+        quando = criado_em if isinstance(criado_em, datetime) else datetime.fromisoformat(str(criado_em))
+        if quando.tzinfo is None:
+            quando = quando.replace(tzinfo=timezone.utc)
+        quando_bahia = quando.astimezone(BAHIA_TZ)
+        return f"{quando_bahia.strftime('%d/%m')} ({_dia_semana_pt(quando_bahia.date())}) {quando_bahia.strftime('%H:%M')}"
+    except Exception:
+        return ""
+
+
+def _montar_historico_com_data(mensagens, indent=""):
+    """Monta linhas de histórico COM data/hora objetiva por mensagem (nunca deixa o modelo
+    calcular sozinho se algo é de hoje, ontem ou dessa semana)."""
+    linhas = []
+    for m in mensagens:
+        quem = "equipe" if m.get("eh_equipe") else (m.get("autor") or "cliente")
+        quando = _formatar_timestamp_mensagem(m.get("criado_em"))
+        prefixo = f"[{quando}] " if quando else ""
+        linhas.append(f"{indent}- {prefixo}{quem}: {m.get('conteudo', '')}")
+    return "\n".join(linhas)
+
+
+def _bloco_regras_para_prompt(cliente=None):
+    """Monta o bloco de regras já ensinadas por Torres/Luan (gerais + específicas do cliente,
+    se informado) pra injetar numa pergunta operacional - uma orientação já dada uma vez (ex:
+    "nesse cliente só considero confirmado quando fecha dia e horário") deve valer dali pra
+    frente, nunca precisar ser repetida. Nunca aplica regra de um cliente a outro."""
+    regras = listar_regras(cliente=cliente)
+    if not regras:
+        return ""
+    linhas = "\n".join(f"- {r}" for r in regras)
+    return f"\n\nREGRAS JÁ ENSINADAS POR TORRES/LUAN (use pra interpretar, valem até serem trocadas):\n{linhas}"
+
+
 SYSTEM_PROMPT_CONSULTA_GRUPO = """Você é a Cintia, assistente virtual da Correria. {pessoa_nome} te
 perguntou algo no privado sobre o grupo de WhatsApp "{grupo_nome}", pra não precisar abrir o grupo
-pra conferir. Abaixo está o histórico recente de mensagens desse grupo que você tem disponível
-(pode ser que não cubra tudo, só o que foi registrado).
+pra conferir. Hoje é {data_hoje}. Abaixo está o histórico recente de mensagens desse grupo, cada uma
+com a data/hora real em que aconteceu (calculada por código, use isso pra qualquer recorte temporal
+tipo "hoje"/"ontem"/"essa semana"/"mais recente" - nunca calcule ou suponha sozinho).
 
-Responda a pergunta de {pessoa_nome} usando SOMENTE essas mensagens como base. Se a resposta não
-estiver clara nas mensagens disponíveis, diga isso com naturalidade (ex: "não tenho esse
-registro/isso não apareceu no que eu vi do grupo") em vez de inventar. Responda de forma natural,
-objetiva e humanizada, como uma colega de equipe contando o que viu.
+NÃO RESPONDA DE IMEDIATO: primeiro entenda exatamente o que foi perguntado (quem perguntou, sobre
+o que, de que período), depois analise o histórico abaixo relacionando as mensagens relevantes
+(inclusive as que vieram antes/depois de uma resposta curta tipo "sim"/"pode"/"fechado" pra saber a
+que ela se refere), só então responda. A informação MAIS RECENTE sempre vale sobre uma mais antiga
+(ex: cliente disse "quarta às 14h" e depois "melhor quinta às 16h" = o estado atual é quinta às
+16h, nunca cite a quarta como se ainda valesse). Entenda confirmação pelo SIGNIFICADO da frase, não
+por uma palavra fixa - "fechado", "pode vir", "combinado", "por mim pode ser" confirmam tanto
+quanto "confirmado" literalmente.
+
+Responda a pergunta de {pessoa_nome} usando SOMENTE essas mensagens (e as regras abaixo, se houver)
+como base. Antes de dizer que não sabe, verifique se já procurou o suficiente no histórico abaixo -
+só diga "não tenho esse registro" depois de realmente ter olhado. Classifique internamente cada
+informação em FATO CONFIRMADO (está escrito claramente), CONCLUSÃO CONTEXTUAL (dá pra concluir com
+segurança juntando mensagens) ou DÚVIDA (não há evidência suficiente) - nunca apresente uma dúvida
+como se fosse fato; se for dúvida, diga isso com naturalidade (ex: "encontrei uma proposta de
+horário, mas não vi uma confirmação clara do cliente, então considero pendente ainda"). Responda de
+forma natural, objetiva e humanizada, como uma colega de equipe contando o que viu - curta quando a
+pergunta for simples, com o contexto necessário quando a resposta exigir explicação pra não virar
+interpretação errada.
 
 PERGUNTA ESPECÍFICA = RESPOSTA ESPECÍFICA (nunca vire um resumo geral): {pessoa_nome} e o outro
 sócio (Torres/Luan) têm o mesmo nível de prioridade e autoridade pra esse tipo de consulta -
@@ -2359,29 +2429,36 @@ relatório geral da conversa, tráfego pago, ou outros assuntos que não têm re
 perguntado. Só acrescente informação além do que foi pedido quando for ESSENCIAL pra evitar uma
 interpretação errada (ex: avisar que o histórico disponível pode estar incompleto) - nunca só por
 completude ou gentileza.
-
+{contexto_conversa_dm}
 HISTÓRICO DO GRUPO:
 {historico}
+{regras_cliente}
 
 Responda SEMPRE E APENAS em JSON válido, sem bloco de código markdown (nada de ```):
 {"resposta": "sua resposta natural, curta e direta pra {pessoa_nome} - só o que foi perguntado"}
 """
 
 
-def responder_pergunta_sobre_grupo(pessoa_nome, pergunta, grupo_jid, grupo_nome):
+def responder_pergunta_sobre_grupo(pessoa_nome, pergunta, grupo_jid, grupo_nome, contexto_conversa_dm=""):
     mensagens = buscar_mensagens_recentes_grupo(grupo_jid)
     if not mensagens:
         return f"Ainda não tenho nenhum histórico registrado do grupo \"{grupo_nome}\" pra consultar."
-    linhas = []
-    for m in mensagens:
-        quem = "equipe" if m.get("eh_equipe") else (m.get("autor") or "cliente")
-        linhas.append(f"- {quem}: {m.get('conteudo', '')}")
-    historico = "\n".join(linhas)
+    historico = _montar_historico_com_data(mensagens)
+    agora = horario_bahia_agora()
+    data_hoje = f"{agora.strftime('%d/%m/%Y')} ({_dia_semana_pt(agora.date())})"
+    bloco_contexto_dm = (
+        f"\nCONTEXTO DA SUA CONVERSA PRIVADA COM {pessoa_nome.upper()} (use pra entender se a "
+        f"pergunta atual é continuação de algo perguntado antes, tipo \"e o outro cliente?\"):\n"
+        f"{contexto_conversa_dm}"
+    ) if contexto_conversa_dm else ""
     prompt_sistema = (
         SYSTEM_PROMPT_CONSULTA_GRUPO
         .replace("{pessoa_nome}", pessoa_nome)
         .replace("{grupo_nome}", grupo_nome)
+        .replace("{data_hoje}", data_hoje)
         .replace("{historico}", historico)
+        .replace("{contexto_conversa_dm}", bloco_contexto_dm)
+        .replace("{regras_cliente}", _bloco_regras_para_prompt(cliente=grupo_nome))
     )
     try:
         resultado = chamar_claude(prompt_sistema, pergunta)
@@ -2606,13 +2683,25 @@ def responder_atividade_geral_hoje(pessoa_nome):
 SYSTEM_PROMPT_PERGUNTA_OPERACIONAL = """Você é a Cintia, assistente virtual da Correria. {pessoa_nome}
 fez uma pergunta operacional que pode envolver vários clientes de uma vez: "{pergunta}"
 
-Abaixo está o histórico recente de cada grupo de cliente que tem conversa registrada. {pessoa_nome}
-e o outro sócio (Torres/Luan) têm o mesmo nível de prioridade e autoridade operacional pra esse tipo
-de pergunta.
+Hoje é {data_hoje}. Abaixo está o histórico recente de cada grupo de cliente que tem conversa
+registrada, cada mensagem com a data/hora real em que aconteceu (calculada por código - use isso
+pra qualquer recorte temporal tipo "hoje"/"ontem"/"essa semana"/"mais recente"/"ainda", nunca
+calcule ou suponha sozinho). {pessoa_nome} e o outro sócio (Torres/Luan) têm o mesmo nível de
+prioridade e autoridade operacional pra esse tipo de pergunta.
 
-REGRA MESTRE: ENTENDER A PERGUNTA → ANALISAR O HISTÓRICO DE CADA GRUPO → FILTRAR SÓ O QUE SE
-ENCAIXA NO CRITÉRIO → RESPONDER EXATAMENTE O QUE FOI PEDIDO. Nunca vire uma pergunta específica
-(ex: "quais clientes confirmaram a gravação?") num resumo geral de tudo que está acontecendo.
+NÃO RESPONDA DE IMEDIATO: primeiro entenda exatamente o que foi perguntado (o critério, o período,
+se é sobre todos os clientes ou um grupo específico deles), depois analise o histórico de cada
+grupo relacionando mensagens entre si (uma resposta curta tipo "sim"/"pode"/"fechado" só faz
+sentido lida junto com a pergunta a que ela responde), só então filtre e responda. A informação
+MAIS RECENTE de cada cliente sempre vale sobre uma mais antiga (ex: "quarta às 14h" depois "melhor
+quinta às 16h" = o estado atual daquele cliente é quinta às 16h). Entenda confirmação pelo
+SIGNIFICADO da frase, não por uma palavra fixa - "fechado", "pode vir", "combinado", "por mim pode
+ser" confirmam tanto quanto "confirmado" literalmente.
+
+REGRA MESTRE: ENTENDER A PERGUNTA → ANALISAR O HISTÓRICO DE CADA GRUPO → RELACIONAR AS MENSAGENS →
+FILTRAR SÓ O QUE SE ENCAIXA NO CRITÉRIO → VALIDAR → RESPONDER EXATAMENTE O QUE FOI PEDIDO. Nunca
+vire uma pergunta específica (ex: "quais clientes confirmaram a gravação?") num resumo geral de
+tudo que está acontecendo.
 
 REGRAS OBRIGATÓRIAS:
 - Inclua na resposta SOMENTE os clientes/grupos que realmente se encaixam no critério perguntado
@@ -2620,13 +2709,16 @@ REGRAS OBRIGATÓRIAS:
   confirmou NÃO entra na lista).
 - NUNCA inclua informação que não foi pedida (relatórios, tráfego pago, pedidos de arte, outros
   assuntos do dia, movimentação geral dos grupos) - só o que responde exatamente a pergunta feita.
-- Baseie-se SOMENTE no que está escrito no histórico abaixo - nunca invente confirmação, aprovação
-  ou pendência que não esteja realmente registrada ali.
+- Baseie-se SOMENTE no que está escrito no histórico abaixo (e nas regras já ensinadas, se houver)
+  - nunca invente confirmação, aprovação ou pendência que não esteja realmente registrada ali.
+- Se algum cliente ficar em dúvida real (não há evidência suficiente pra dizer que se encaixa ou
+  não), não finja certeza - pode listar ele separado como pendência de confirmação, deixando claro
+  que não é a mesma coisa que um "sim" confirmado.
 - Se NENHUM cliente se encaixar no critério perguntado, diga isso de forma direta e curta (ex:
   "Nenhum cliente confirmou a gravação ainda.") - nunca invente um exemplo pra preencher a resposta.
 - Formato: liste cada cliente que se encaixa com a informação relevante bem curta, uma linha por
   cliente (ex: "House & Co: quarta às 12h."), sem textão nem explicação de como você chegou nisso.
-
+{contexto_conversa_dm}
 HISTÓRICO POR GRUPO DE CLIENTE:
 {blocos_grupos}
 
@@ -2635,31 +2727,41 @@ Responda SEMPRE E APENAS em JSON válido, sem bloco de código markdown (nada de
 """
 
 
-def responder_pergunta_operacional_geral(pessoa_nome, pergunta):
+def responder_pergunta_operacional_geral(pessoa_nome, pergunta, contexto_conversa_dm=""):
     """Responde uma pergunta operacional que pode envolver VÁRIOS clientes de uma vez (ex:
     "quais clientes confirmaram a gravação?", "quem ainda não respondeu?", "quem aprovou a
     arte?") - analisa o histórico de TODOS os grupos de cliente com conversa registrada, mas
     filtra a resposta estritamente pelo critério perguntado, nunca virando um resumo geral
     (isso já existe separadamente em responder_atividade_geral_hoje, pra quando a pergunta é
-    genuinamente "o que rolou em cada grupo", sem nenhum filtro)."""
+    genuinamente "o que rolou em cada grupo", sem nenhum filtro). Cada mensagem entra com
+    data/hora objetiva e a resposta considera regras já ensinadas por cliente, pra suportar
+    perguntas com recorte temporal e critérios específicos por cliente."""
     grupos_ativos = listar_grupos_cliente_com_historico()
     if not grupos_ativos:
         return "Ainda não tenho nenhum histórico registrado de grupo de cliente pra consultar."
 
     blocos = []
     for info in grupos_ativos.values():
-        linhas = []
-        for m in info["mensagens"]:
-            quem = "equipe" if m.get("eh_equipe") else (m.get("autor") or "cliente")
-            linhas.append(f"  - {quem}: {m.get('conteudo', '')}")
-        blocos.append(f"Grupo \"{info['nome']}\":\n" + "\n".join(linhas))
+        historico_grupo = _montar_historico_com_data(info["mensagens"], indent="  ")
+        regras_grupo = _bloco_regras_para_prompt(cliente=info["nome"])
+        blocos.append(f"Grupo \"{info['nome']}\":\n{historico_grupo}{regras_grupo}")
     blocos_grupos = "\n\n".join(blocos)
+
+    agora = horario_bahia_agora()
+    data_hoje = f"{agora.strftime('%d/%m/%Y')} ({_dia_semana_pt(agora.date())})"
+    bloco_contexto_dm = (
+        f"\nCONTEXTO DA SUA CONVERSA PRIVADA COM {pessoa_nome.upper()} (use pra entender se a "
+        f"pergunta atual é continuação de algo perguntado antes, tipo \"e o outro cliente?\"):\n"
+        f"{contexto_conversa_dm}\n"
+    ) if contexto_conversa_dm else ""
 
     prompt_sistema = (
         SYSTEM_PROMPT_PERGUNTA_OPERACIONAL
         .replace("{pessoa_nome}", pessoa_nome)
         .replace("{pergunta}", pergunta)
+        .replace("{data_hoje}", data_hoje)
         .replace("{blocos_grupos}", blocos_grupos)
+        .replace("{contexto_conversa_dm}", bloco_contexto_dm)
     )
     try:
         resultado = chamar_claude(prompt_sistema, pergunta, max_tokens=2500, timeout=45)
@@ -3101,7 +3203,7 @@ def processar_dm(remote_jid, key, data):
         # criterio especifico (ex: "quais clientes confirmaram a gravacao?") - responde SO o
         # que foi perguntado, nunca vira um resumo geral de tudo (isso e o tipo 6, separado).
         pessoa_nome_operacional = "Torres" if pessoa == "torres" else "Luan"
-        responder(responder_pergunta_operacional_geral(pessoa_nome_operacional, texto))
+        responder(responder_pergunta_operacional_geral(pessoa_nome_operacional, texto, contexto_conversa_dm=contexto_conversa))
     elif resultado.get("eh_pergunta_sobre_grupo") and resultado.get("grupo_perguntado"):
         grupo_jid_pergunta = identificar_grupo_mencionado(resultado["grupo_perguntado"])
         if not grupo_jid_pergunta:
@@ -3113,7 +3215,7 @@ def processar_dm(remote_jid, key, data):
         else:
             grupo_nome_pergunta = GRUPOS[grupo_jid_pergunta]["nome"]
             pessoa_nome = "Torres" if pessoa == "torres" else "Luan"
-            resposta = responder_pergunta_sobre_grupo(pessoa_nome, texto, grupo_jid_pergunta, grupo_nome_pergunta)
+            resposta = responder_pergunta_sobre_grupo(pessoa_nome, texto, grupo_jid_pergunta, grupo_nome_pergunta, contexto_conversa_dm=contexto_conversa)
             responder(resposta)
     elif resultado.get("eh_comando_para_tripa") and resultado.get("mensagem_tripa"):
         mensagem_tripa = resultado["mensagem_tripa"]
