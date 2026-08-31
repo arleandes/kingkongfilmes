@@ -1136,6 +1136,21 @@ IMPORTANTE sobre datas/horários: qualquer campo "*_iso" deve conter APENAS a da
 ISO 8601 com fuso -03:00 (exemplo: 2026-08-29T15:00:00-03:00), sem nenhum texto explicativo junto,
 interpretando horários relativos ao "agora" informado acima.
 
+AMBIGUIDADE DE HORÁRIO (manhã ou noite?): quando a pessoa mencionar um horário sem deixar claro se
+é de manhã ou de noite (ex: "às 9h40", "às 9h"), PARE E PENSE antes de preencher qualquer campo
+"*_iso": se o sentido mais óbvio desse horário (hoje, no período mais próximo de "agora") JÁ TIVER
+PASSADO, é bem provável que a pessoa quis dizer o outro turno do dia (ex: "agora" é 21h09 e ela
+disse "9h40" - ela quase certamente quis dizer 21h40 de hoje à noite, não 9h40 da manhã, que já
+passou faz muito tempo). NUNCA simplesmente aceite um horário que já passou sem questionar - isso é
+sinal de ambiguidade, não uma instrução válida pra agendar algo no passado. Nesses casos: marque
+"eh_pedido_de_lembrete" e "eh_comando_para_tripa" como false (não agende nada ainda), e em
+"resposta_conversa" pergunte de forma natural qual horário a pessoa quis dizer, oferecendo as duas
+opções explícitas (ex: "Você quis dizer 9h40 da manhã (que já passou) ou 21h40 de hoje à noite?").
+Só preencha um campo "*_iso" quando o horário pretendido estiver inequívoco - pela própria mensagem
+(ex: já disse "da manhã"/"da noite"/"desse jeito mesmo"), pelo contexto (ex: prazo de entrega
+normalmente é dentro do horário comercial, 8h-18h), ou porque já é uma resposta esclarecendo uma
+pergunta de ambiguidade anterior sua.
+
 Responda SEMPRE E APENAS em JSON válido, numa única linha por valor, neste formato exato,
 sem usar bloco de código markdown (nada de ```) e sem quebras de linha dentro dos valores. Inclua
 TODAS as chaves sempre, mesmo vazias/false quando não se aplicarem:
