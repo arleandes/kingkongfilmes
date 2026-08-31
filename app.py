@@ -636,7 +636,16 @@ def chamar_claude(system_prompt, conteudo_usuario, imagem_base64=None, pdf_base6
         # com certeza vai vir incompleto/invalido. Loga isso claramente pra facilitar
         # diagnostico, em vez de deixar isso aparecer só como um JSONDecodeError generico.
         print(f"[chamar_claude] AVISO: resposta cortada por max_tokens (stop_reason=max_tokens)", flush=True)
-    texto = resp_json["content"][0]["text"].strip()
+    # O Sonnet 5 (diferente do Haiku) pode devolver blocos de raciocinio (thinking) antes
+    # do bloco de texto de verdade - por isso NAO da pra assumir que content[0] eh o texto.
+    # Procura o primeiro bloco do tipo "text" na lista, em vez de pegar o indice fixo 0.
+    blocos = resp_json.get("content", [])
+    bloco_texto = next((b for b in blocos if b.get("type") == "text"), None)
+    if bloco_texto is None:
+        tipos_encontrados = [b.get("type") for b in blocos]
+        print(f"[chamar_claude] ERRO: nenhum bloco 'text' na resposta (tipos encontrados: {tipos_encontrados})", flush=True)
+        raise RuntimeError(f"Resposta do Claude sem bloco de texto (tipos: {tipos_encontrados})")
+    texto = bloco_texto["text"].strip()
     # As vezes o modelo embrulha o JSON num bloco de codigo markdown - remove isso.
     if texto.startswith("```"):
         texto = re.sub(r"^```(?:json)?\s*", "", texto)
