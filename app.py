@@ -443,6 +443,24 @@ def listar_grupos_com_atividade_hoje():
     return grupos_ativos
 
 
+def listar_grupos_cliente_com_historico(limite_por_grupo=40):
+    """Retorna {grupo_jid: {"nome": ..., "mensagens": [...]}} pra todo grupo de CLIENTE (nunca
+    grupo interno) que tenha pelo menos uma mensagem registrada - sem limitar a "hoje", já que
+    uma pergunta operacional (ex: "quais clientes confirmaram a gravação?") pode precisar olhar
+    alguns dias de conversa, não só o dia atual. Usado pra responder perguntas operacionais que
+    envolvem VÁRIOS clientes de uma vez, filtradas por um critério específico (nunca um resumo
+    geral de tudo, que é o que listar_grupos_com_atividade_hoje/responder_atividade_geral_hoje já
+    cobrem separadamente)."""
+    grupos_com_historico = {}
+    for grupo_jid, info in GRUPOS.items():
+        if info.get("interno"):
+            continue
+        mensagens = buscar_mensagens_recentes_grupo(grupo_jid, limite=limite_por_grupo)
+        if mensagens:
+            grupos_com_historico[grupo_jid] = {"nome": info["nome"], "mensagens": mensagens}
+    return grupos_com_historico
+
+
 def criar_tarefa(cliente_nome, grupo_jid, tipo_peca, descricao, autor="cliente"):
     """Cria uma tarefa nova no banco (pedido original) e registra o primeiro evento no
     historico. Devolve o id da tarefa criada, ou None se o banco nao estiver disponivel
@@ -1389,6 +1407,20 @@ um pedido de lembrete não é um comando pro Tripa, um fato pra guardar não é 
    grupos de uma vez. Marque "eh_pergunta_atividade_geral" como true nesse caso (e deixe
    "grupo_perguntado" vazio, já que não é um grupo específico).
 
+10) PERGUNTA OPERACIONAL SOBRE VÁRIOS CLIENTES DE UMA VEZ, FILTRADA POR UM CRITÉRIO ESPECÍFICO
+   (ex: "quais clientes confirmaram a gravação?", "quem confirmou?", "quais clientes já fecharam
+   gravação?", "quem respondeu sobre a gravação?", "quais horários estão confirmados?", "quem
+   ainda não respondeu?", "quais clientes estão pendentes?", "quem aprovou a arte?", "quais
+   pedidos chegaram hoje?", "quem confirmou essa semana?") - diferente do tipo 3 (que é sobre UM
+   grupo específico nomeado) e do tipo 6 (que é um panorama GERAL sem filtro nenhum, de tudo que
+   rolou em cada grupo): aqui {pessoa_nome} quer saber, olhando VÁRIOS clientes de uma vez, quais
+   deles se encaixam num critério específico (confirmação, aprovação, pendência, resposta, etc.),
+   sem citar um cliente só. Marque "eh_pergunta_operacional_geral" como true nesse caso. Você NÃO
+   monta a resposta filtrada aqui - só identifica que é esse tipo de pergunta, quem realmente
+   filtra e responde é outra etapa que já tem acesso ao histórico completo de cada grupo. Nunca
+   confunda isso com o tipo 6: uma pergunta com critério específico (confirmação, pendência,
+   aprovação) é tipo 10; "o que rolou hoje" sem nenhum filtro é tipo 6.
+
 4) COMANDO PRA REPASSAR ALGO PRO GRUPO TRIPA (ex: "passa pra Tripa fazer isso até amanhã 10h e
    cobra ele às 9h40 perguntando se já fez", "avisa a Tripa que vai ter essa promoção: ...") -
    {pessoa_nome} quer que uma informação/pedido seja encaminhado pro grupo interno da equipe de
@@ -1440,7 +1472,7 @@ um pedido de lembrete não é um comando pro Tripa, um fato pra guardar não é 
    deste prompt) tiverem a resposta pra uma pergunta, use-os pra responder direto. Se for um
    pedido/comando que você ainda não tem como executar automaticamente, confirme que entendeu e que
    vai anotar/repassar, sem inventar que já fez algo que não fez. Nunca deixe esse campo vazio
-   quando nenhum dos tipos 1/2/3/4/6/8/9 acima se aplicar - toda mensagem privada precisa de
+   quando nenhum dos tipos 1/2/3/4/6/8/9/10 acima se aplicar - toda mensagem privada precisa de
    resposta. IMPORTANTE: se {pessoa_nome} estiver claramente selecionando/pedindo de volta algo
    que VOCÊ (Cintia) apresentou nas ÚLTIMAS MENSAGENS acima (ex: "gostei da segunda", "manda só a
    número 2", "essa aí mesmo", "manda de novo"), REUTILIZE o conteúdo exato que você já mandou -
@@ -1468,7 +1500,7 @@ pergunta de ambiguidade anterior sua.
 Responda SEMPRE E APENAS em JSON válido, numa única linha por valor, neste formato exato,
 sem usar bloco de código markdown (nada de ```) e sem quebras de linha dentro dos valores. Inclua
 TODAS as chaves sempre, mesmo vazias/false quando não se aplicarem:
-{"eh_pedido_de_lembrete": true ou false, "destinatario_lembrete": "torres, luan ou tripa - quem deve receber o lembrete", "eh_recorrente": true ou false, "recorrencia_dia_mes": "dia do mes (1-31) se for recorrente mensal, ou string vazia", "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_pergunta_sobre_grupo": true ou false, "grupo_perguntado": "nome do grupo mencionado, ou string vazia", "eh_pergunta_atividade_geral": true ou false, "eh_comando_para_tripa": true ou false, "mensagem_tripa": "texto pronto pra encaminhar pro grupo Tripa, ou string vazia", "tem_cobranca": true ou false, "horario_cobranca_iso": "horario ISO da cobranca, ou string vazia", "pergunta_cobranca": "pergunta curta pra mandar na cobranca, ou string vazia", "eh_comando_briefing_cliente": true ou false, "briefing_cliente_nome": "nome do cliente/grupo mencionado (ou inferido do contexto), ou string vazia", "briefing_assunto": "pista curta do assunto a analisar, ou string vazia", "eh_pergunta_metricool_metricas": true ou false, "metricool_metrica_cliente": "nome do cliente/marca, ou string vazia", "metricool_metrica_rede": "instagram ou facebook", "metricool_metrica_tipo": "seguidores, reels ou posts", "metricool_metrica_dias": 30, "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/3/4/6/8/9 acima for verdadeiro"}
+{"eh_pedido_de_lembrete": true ou false, "destinatario_lembrete": "torres, luan ou tripa - quem deve receber o lembrete", "eh_recorrente": true ou false, "recorrencia_dia_mes": "dia do mes (1-31) se for recorrente mensal, ou string vazia", "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_pergunta_sobre_grupo": true ou false, "grupo_perguntado": "nome do grupo mencionado, ou string vazia", "eh_pergunta_atividade_geral": true ou false, "eh_pergunta_operacional_geral": true ou false, "eh_comando_para_tripa": true ou false, "mensagem_tripa": "texto pronto pra encaminhar pro grupo Tripa, ou string vazia", "tem_cobranca": true ou false, "horario_cobranca_iso": "horario ISO da cobranca, ou string vazia", "pergunta_cobranca": "pergunta curta pra mandar na cobranca, ou string vazia", "eh_comando_briefing_cliente": true ou false, "briefing_cliente_nome": "nome do cliente/grupo mencionado (ou inferido do contexto), ou string vazia", "briefing_assunto": "pista curta do assunto a analisar, ou string vazia", "eh_pergunta_metricool_metricas": true ou false, "metricool_metrica_cliente": "nome do cliente/marca, ou string vazia", "metricool_metrica_rede": "instagram ou facebook", "metricool_metrica_tipo": "seguidores, reels ou posts", "metricool_metrica_dias": 30, "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/3/4/6/8/9/10 acima for verdadeiro"}
 """
 
 
@@ -2319,11 +2351,20 @@ estiver clara nas mensagens disponíveis, diga isso com naturalidade (ex: "não 
 registro/isso não apareceu no que eu vi do grupo") em vez de inventar. Responda de forma natural,
 objetiva e humanizada, como uma colega de equipe contando o que viu.
 
+PERGUNTA ESPECÍFICA = RESPOSTA ESPECÍFICA (nunca vire um resumo geral): {pessoa_nome} e o outro
+sócio (Torres/Luan) têm o mesmo nível de prioridade e autoridade pra esse tipo de consulta -
+responda SOMENTE o que foi perguntado, nunca transforme numa lista de tudo que rolou no grupo. Se a
+pergunta for "o que ficou pendente do Terapia?", fale só sobre o que está pendente, não sobre
+relatório geral da conversa, tráfego pago, ou outros assuntos que não têm relação com o que foi
+perguntado. Só acrescente informação além do que foi pedido quando for ESSENCIAL pra evitar uma
+interpretação errada (ex: avisar que o histórico disponível pode estar incompleto) - nunca só por
+completude ou gentileza.
+
 HISTÓRICO DO GRUPO:
 {historico}
 
 Responda SEMPRE E APENAS em JSON válido, sem bloco de código markdown (nada de ```):
-{"resposta": "sua resposta natural pra {pessoa_nome}"}
+{"resposta": "sua resposta natural, curta e direta pra {pessoa_nome} - só o que foi perguntado"}
 """
 
 
@@ -2560,6 +2601,72 @@ def responder_atividade_geral_hoje(pessoa_nome):
         print(f"[responder_atividade_geral_hoje] erro: {e}", flush=True)
         nomes = ", ".join(info["nome"] for info in grupos_ativos.values())
         return f"Tive um problema pra resumir, mas hoje tiveram atividade nesses grupos: {nomes}."
+
+
+SYSTEM_PROMPT_PERGUNTA_OPERACIONAL = """Você é a Cintia, assistente virtual da Correria. {pessoa_nome}
+fez uma pergunta operacional que pode envolver vários clientes de uma vez: "{pergunta}"
+
+Abaixo está o histórico recente de cada grupo de cliente que tem conversa registrada. {pessoa_nome}
+e o outro sócio (Torres/Luan) têm o mesmo nível de prioridade e autoridade operacional pra esse tipo
+de pergunta.
+
+REGRA MESTRE: ENTENDER A PERGUNTA → ANALISAR O HISTÓRICO DE CADA GRUPO → FILTRAR SÓ O QUE SE
+ENCAIXA NO CRITÉRIO → RESPONDER EXATAMENTE O QUE FOI PEDIDO. Nunca vire uma pergunta específica
+(ex: "quais clientes confirmaram a gravação?") num resumo geral de tudo que está acontecendo.
+
+REGRAS OBRIGATÓRIAS:
+- Inclua na resposta SOMENTE os clientes/grupos que realmente se encaixam no critério perguntado
+  (ex: se a pergunta é sobre confirmação de gravação, um cliente que só recebeu a proposta mas não
+  confirmou NÃO entra na lista).
+- NUNCA inclua informação que não foi pedida (relatórios, tráfego pago, pedidos de arte, outros
+  assuntos do dia, movimentação geral dos grupos) - só o que responde exatamente a pergunta feita.
+- Baseie-se SOMENTE no que está escrito no histórico abaixo - nunca invente confirmação, aprovação
+  ou pendência que não esteja realmente registrada ali.
+- Se NENHUM cliente se encaixar no critério perguntado, diga isso de forma direta e curta (ex:
+  "Nenhum cliente confirmou a gravação ainda.") - nunca invente um exemplo pra preencher a resposta.
+- Formato: liste cada cliente que se encaixa com a informação relevante bem curta, uma linha por
+  cliente (ex: "House & Co: quarta às 12h."), sem textão nem explicação de como você chegou nisso.
+
+HISTÓRICO POR GRUPO DE CLIENTE:
+{blocos_grupos}
+
+Responda SEMPRE E APENAS em JSON válido, sem bloco de código markdown (nada de ```):
+{"resposta": "resposta curta e direta - só o que foi perguntado, no formato mais natural pro caso (lista de clientes, ou uma frase simples se não houver nenhum resultado)"}
+"""
+
+
+def responder_pergunta_operacional_geral(pessoa_nome, pergunta):
+    """Responde uma pergunta operacional que pode envolver VÁRIOS clientes de uma vez (ex:
+    "quais clientes confirmaram a gravação?", "quem ainda não respondeu?", "quem aprovou a
+    arte?") - analisa o histórico de TODOS os grupos de cliente com conversa registrada, mas
+    filtra a resposta estritamente pelo critério perguntado, nunca virando um resumo geral
+    (isso já existe separadamente em responder_atividade_geral_hoje, pra quando a pergunta é
+    genuinamente "o que rolou em cada grupo", sem nenhum filtro)."""
+    grupos_ativos = listar_grupos_cliente_com_historico()
+    if not grupos_ativos:
+        return "Ainda não tenho nenhum histórico registrado de grupo de cliente pra consultar."
+
+    blocos = []
+    for info in grupos_ativos.values():
+        linhas = []
+        for m in info["mensagens"]:
+            quem = "equipe" if m.get("eh_equipe") else (m.get("autor") or "cliente")
+            linhas.append(f"  - {quem}: {m.get('conteudo', '')}")
+        blocos.append(f"Grupo \"{info['nome']}\":\n" + "\n".join(linhas))
+    blocos_grupos = "\n\n".join(blocos)
+
+    prompt_sistema = (
+        SYSTEM_PROMPT_PERGUNTA_OPERACIONAL
+        .replace("{pessoa_nome}", pessoa_nome)
+        .replace("{pergunta}", pergunta)
+        .replace("{blocos_grupos}", blocos_grupos)
+    )
+    try:
+        resultado = chamar_claude(prompt_sistema, pergunta, max_tokens=2500, timeout=45)
+        return resultado.get("resposta") or "Não consegui montar uma resposta a partir do histórico disponível, pode reformular a pergunta?"
+    except Exception as e:
+        print(f"[responder_pergunta_operacional_geral] erro: {e}", flush=True)
+        return "Tive um problema pra analisar isso agora, pode tentar de novo daqui a pouco?"
 
 
 # --------------------------------------------------------------------------
@@ -2989,6 +3096,12 @@ def processar_dm(remote_jid, key, data):
     elif resultado.get("eh_pergunta_atividade_geral"):
         pessoa_nome_geral = "Torres" if pessoa == "torres" else "Luan"
         responder(responder_atividade_geral_hoje(pessoa_nome_geral))
+    elif resultado.get("eh_pergunta_operacional_geral"):
+        # Pergunta operacional que pode envolver varios clientes de uma vez, filtrada por um
+        # criterio especifico (ex: "quais clientes confirmaram a gravacao?") - responde SO o
+        # que foi perguntado, nunca vira um resumo geral de tudo (isso e o tipo 6, separado).
+        pessoa_nome_operacional = "Torres" if pessoa == "torres" else "Luan"
+        responder(responder_pergunta_operacional_geral(pessoa_nome_operacional, texto))
     elif resultado.get("eh_pergunta_sobre_grupo") and resultado.get("grupo_perguntado"):
         grupo_jid_pergunta = identificar_grupo_mencionado(resultado["grupo_perguntado"])
         if not grupo_jid_pergunta:
