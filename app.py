@@ -624,6 +624,52 @@ def baixar_midia_evolution(message_key):
     return data.get("base64") or data.get("media", {}).get("base64")
 
 
+_nomes_grupo_desconhecido_cache = {}
+
+
+def buscar_nome_grupo_evolution(grupo_jid):
+    """Busca o nome (subject) de um grupo do WhatsApp que ainda NAO esta cadastrado no
+    dicionario GRUPOS, direto na Evolution API - com cache em memoria pra nao bater na
+    API a cada mensagem do mesmo grupo. Se nao conseguir descobrir o nome por qualquer
+    motivo (API fora do ar, endpoint diferente, etc), usa o proprio JID como nome - NUNCA
+    deixa de registrar a mensagem so porque nao achou o nome bonito do grupo."""
+    if grupo_jid in _nomes_grupo_desconhecido_cache:
+        return _nomes_grupo_desconhecido_cache[grupo_jid]
+    nome = grupo_jid
+    try:
+        resp = requests.get(
+            f"{EVOLUTION_BASE_URL}/group/findGroupInfos/{EVOLUTION_INSTANCE}",
+            headers={"apikey": EVOLUTION_APIKEY},
+            params={"groupJid": grupo_jid},
+            timeout=10,
+        )
+        if resp.status_code < 400:
+            info = resp.json()
+            nome = info.get("subject") or grupo_jid
+        else:
+            print(f"[buscar_nome_grupo_evolution] API respondeu {resp.status_code} pro grupo {grupo_jid}, usando JID como nome", flush=True)
+    except Exception as e:
+        print(f"[buscar_nome_grupo_evolution] nao conseguiu buscar nome do grupo {grupo_jid}, usando JID como nome: {e}", flush=True)
+    _nomes_grupo_desconhecido_cache[grupo_jid] = nome
+    return nome
+
+
+def processar_mensagem_grupo_desconhecido(remote_jid, key, data):
+    """Grupo que ainda NAO esta cadastrado no dicionario GRUPOS - nunca recebe
+    auto-resposta (nao temos regras de atendimento configuradas pra ele), mas mesmo assim
+    a mensagem e registrada no historico, pra nenhum grupo ficar de fora do "sistema de
+    defesa" (Torres pediu explicitamente: TODOS os grupos, sem excecao, incluindo os que
+    ainda nao foram cadastrados manualmente aqui)."""
+    conteudo_texto, _imagem_base64, _pdf_base64, _nome_arquivo_doc = extrair_conteudo_mensagem_grupo(key, data)
+    if not conteudo_texto:
+        return {"skipped": "grupo não cadastrado, sem conteúdo tratável pra registrar"}
+    _participant, eh_equipe = _detectar_participante_grupo(key, data)
+    sender_name = data.get("pushName", "cliente")
+    nome_grupo = buscar_nome_grupo_evolution(remote_jid)
+    registrar_mensagem_grupo(remote_jid, nome_grupo, sender_name, conteudo_texto, eh_equipe)
+    return {"grupo_nao_cadastrado_registrado": nome_grupo}
+
+
 def transcrever_audio(caminho_arquivo):
     with open(caminho_arquivo, "rb") as f:
         resp = requests.post(
@@ -944,14 +990,13 @@ def extrair_conteudo_mensagem_grupo(key, data):
     return conteudo_texto, imagem_base64, pdf_base64, nome_arquivo_doc
 
 
-def processar_mensagem_grupo(remote_jid, grupo, key, data):
-    # Quem mandou a mensagem DENTRO do grupo (diferente do remote_jid, que e o
-    # ID do grupo). Se for a propria equipe (Torres ou Luan) falando no grupo,
-    # o robo nunca deve responder nem entrar na conversa.
-    # Confere tanto "participant" quanto variantes alternativas que o Whatsapp/Evolution
-    # as vezes manda (ex: quando o remetente usa um identificador "lid" em vez do numero
-    # de telefone direto) - assim a checagem de "e a propria equipe falando" nao falha so
-    # porque o formato do identificador mudou.
+def _detectar_participante_grupo(key, data):
+    """Descobre quem mandou uma mensagem DENTRO de um grupo (diferente do remote_jid, que
+    e o ID do grupo) e se e a propria equipe (Torres, Luan ou o outro agente de IA)
+    falando. Confere tanto "participant" quanto variantes alternativas que o
+    Whatsapp/Evolution as vezes manda (ex: quando o remetente usa um identificador "lid"
+    em vez do numero de telefone direto) - assim a checagem nao falha so porque o formato
+    do identificador mudou. Compartilhado entre grupos cadastrados e nao cadastrados."""
     candidatos_participant = [
         key.get("participant") or "",
         key.get("participantAlt") or "",
@@ -964,6 +1009,13 @@ def processar_mensagem_grupo(remote_jid, grupo, key, data):
         for c in candidatos_participant if c
         for numero in NUMEROS_SEM_AUTO_RESPOSTA_EM_GRUPO
     )
+    return participant, eh_equipe
+
+
+def processar_mensagem_grupo(remote_jid, grupo, key, data):
+    # Se for a propria equipe (Torres ou Luan) falando no grupo, o robo nunca deve
+    # responder nem entrar na conversa (mas a mensagem ainda e registrada no historico).
+    participant, eh_equipe = _detectar_participante_grupo(key, data)
 
     sender_name = data.get("pushName", "cliente")
     conteudo_texto, imagem_base64, pdf_base64, nome_arquivo_doc = extrair_conteudo_mensagem_grupo(key, data)
@@ -975,7 +1027,7 @@ def processar_mensagem_grupo(remote_jid, grupo, key, data):
         registrar_mensagem_grupo(remote_jid, grupo["nome"], sender_name, conteudo_texto, eh_equipe)
 
     if eh_equipe:
-        print(f"[processar_mensagem_grupo] mensagem da propria equipe/outro agente ({candidatos_participant}), ignorando", flush=True)
+        print(f"[processar_mensagem_grupo] mensagem da propria equipe/outro agente (participant={participant}), ignorando", flush=True)
         # Se Torres, Luan ou o outro agente ja respondeu no grupo enquanto o bot ainda
         # estava com uma resposta pendente (dentro da janela de debounce) pra esse mesmo
         # grupo, cancela essa resposta pendente - a equipe ja assumiu a conversa, o bot
@@ -2081,11 +2133,20 @@ def webhook():
             grupo = GRUPOS[remote_jid]
             print(f"[webhook] grupo reconhecido: {grupo['nome']} (interno={grupo['interno']})", flush=True)
             if grupo["interno"]:
+                # Grupo interno (ex: "Correria - Gestão") nunca recebe auto-resposta, mas o
+                # historico continua sendo registrado igual a qualquer outro grupo - Torres
+                # pediu explicitamente que TODOS os grupos e todos os participantes (ele e o
+                # Luan incluidos) fiquem guardados, sem excecao pros grupos internos.
+                conteudo_log, _im, _pdf, _doc = extrair_conteudo_mensagem_grupo(key, data)
+                if conteudo_log:
+                    _participant_interno, eh_equipe_interno = _detectar_participante_grupo(key, data)
+                    sender_name_interno = data.get("pushName", "equipe")
+                    registrar_mensagem_grupo(remote_jid, grupo["nome"], sender_name_interno, conteudo_log, eh_equipe_interno)
                 return jsonify({"ok": True, "skipped": "grupo interno, sem auto-resposta"})
             resultado = processar_mensagem_grupo(remote_jid, grupo, key, data)
         elif remote_jid.endswith("@g.us"):
-            print(f"[webhook] grupo NÃO reconhecido (não está no dicionário GRUPOS): {remote_jid}", flush=True)
-            return jsonify({"ok": True, "skipped": "grupo não cadastrado"})
+            print(f"[webhook] grupo NÃO reconhecido (não está no dicionário GRUPOS): {remote_jid} - registrando mesmo assim", flush=True)
+            resultado = processar_mensagem_grupo_desconhecido(remote_jid, key, data)
         elif remote_jid.endswith("@s.whatsapp.net") or remote_jid.endswith("@lid"):
             print(f"[webhook] tratando como DM: {remote_jid}", flush=True)
             resultado = processar_dm(remote_jid, key, data)
