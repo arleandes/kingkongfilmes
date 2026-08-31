@@ -192,9 +192,13 @@ def init_db():
                     id SERIAL PRIMARY KEY,
                     autor TEXT,
                     texto TEXT NOT NULL,
+                    cliente TEXT,
                     criado_em TIMESTAMPTZ NOT NULL DEFAULT now()
                 )
             """)
+            # migracao pra bancos que ja tinham essa tabela antes da coluna "cliente" existir
+            # (regras especificas de um cliente, em vez de regras gerais pra todo atendimento).
+            cur.execute("ALTER TABLE regras_atendimento ADD COLUMN IF NOT EXISTS cliente TEXT")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS fatos_memoria (
                     id SERIAL PRIMARY KEY,
@@ -227,32 +231,47 @@ _regras_memoria = []
 _regras_lock = threading.Lock()
 
 
-def salvar_regra(autor, texto):
+def salvar_regra(autor, texto, cliente=None):
+    """Salva uma regra de atendimento. "cliente" vazio/None = regra GERAL, aplicada em
+    todo atendimento; preenchido = regra ESPECÍFICA daquele cliente (guardada com o nome
+    canônico do grupo, pra bater certinho na hora de listar)."""
     if DATABASE_URL:
         try:
             with db_cursor(commit=True) as cur:
                 cur.execute(
-                    "INSERT INTO regras_atendimento (autor, texto) VALUES (%s, %s)",
-                    (autor, texto),
+                    "INSERT INTO regras_atendimento (autor, texto, cliente) VALUES (%s, %s, %s)",
+                    (autor, texto, cliente),
                 )
             return
         except Exception as e:
             print(f"[salvar_regra] banco de dados falhou, usando fallback em memoria: {e}", flush=True)
     with _regras_lock:
-        _regras_memoria.append({"autor": autor, "texto": texto})
+        _regras_memoria.append({"autor": autor, "texto": texto, "cliente": cliente})
 
 
-def listar_regras():
+def listar_regras(cliente=None):
+    """Devolve as regras GERAIS (valem pra todo atendimento) seguidas das regras
+    ESPECÍFICAS do cliente informado, se houver - assim uma orientação dada só pro
+    cliente X (ex: "nesse cliente, quando perguntarem isso, pode dizer que...") nunca
+    vaza pra outro cliente."""
     if DATABASE_URL:
         try:
             with db_cursor() as cur:
-                cur.execute("SELECT texto FROM regras_atendimento ORDER BY criado_em ASC")
-                return [r["texto"] for r in cur.fetchall()]
+                cur.execute("SELECT texto, cliente FROM regras_atendimento ORDER BY criado_em ASC")
+                linhas = cur.fetchall()
         except Exception as e:
             print(f"[listar_regras] erro: {e}", flush=True)
             return []
-    with _regras_lock:
-        return [r["texto"] for r in _regras_memoria]
+    else:
+        with _regras_lock:
+            linhas = list(_regras_memoria)
+    gerais = [r["texto"] for r in linhas if not r.get("cliente")]
+    cliente_norm = normalizar_texto(cliente) if cliente else ""
+    especificas = [
+        r["texto"] for r in linhas
+        if cliente_norm and r.get("cliente") and normalizar_texto(r["cliente"]) == cliente_norm
+    ]
+    return gerais + especificas
 
 
 # Fatos soltos que Torres/Luan contam no privado (preferencias, informacoes de clientes,
@@ -884,6 +903,14 @@ DÚVIDA EM CASO URGENTE: além da checagem acima, se a mensagem também parecer 
 pra hoje/já, evento acontecendo agora, algo com risco de dar errado), marque adicionalmente
 "duvida_urgente" como true (isso faz a equipe ser avisada com destaque/prioridade).
 
+NUNCA EXPONHA A COMUNICAÇÃO INTERNA PRO CLIENTE: mesmo quando você não tem certeza e vai avisar
+Torres/Luan por trás (via "duvida_geral"), a "resposta_cliente" NUNCA deve mencionar esse processo
+interno - nunca diga coisas como "vou perguntar pro Torres", "não sei", "o Luan ainda não me
+respondeu" ou "a equipe não me informou isso". Pro cliente, a resposta deve soar como alguém da
+própria equipe que já está cuidando disso - use algo neutro como "vou confirmar essa informação e
+já retorno" ou simplesmente confirme o recebimento, sem revelar que existe uma checagem acontecendo
+por dentro.
+
 PRAZO DE ENTREGA (pedidos de arte e gravação): o prazo padrão informado a todo cliente é de até
 48 horas - pode mencionar que às vezes a equipe entrega antes, mas o prazo garantido/oficial que
 você comunica é sempre até 48h; nunca prometa um prazo mais curto que esse como garantia. Se o
@@ -1146,7 +1173,7 @@ def _finalizar_processamento_grupo(chave):
     ) if historico_grupo else ""
 
     dentro_horario = dentro_do_horario_comercial()
-    regras_extras = listar_regras()
+    regras_extras = listar_regras(cliente=grupo["nome"])
     bloco_regras = ""
     if regras_extras:
         bloco_regras = (
@@ -1313,7 +1340,10 @@ um pedido de lembrete não é um comando pro Tripa, um fato pra guardar não é 
    pedido/comando que você ainda não tem como executar automaticamente, confirme que entendeu e que
    vai anotar/repassar, sem inventar que já fez algo que não fez. Nunca deixe esse campo vazio
    quando nenhum dos tipos 1/2/3/4/6/8 acima se aplicar - toda mensagem privada precisa de
-   resposta.
+   resposta. IMPORTANTE: se {pessoa_nome} estiver claramente selecionando/pedindo de volta algo
+   que VOCÊ (Cintia) apresentou nas ÚLTIMAS MENSAGENS acima (ex: "gostei da segunda", "manda só a
+   número 2", "essa aí mesmo", "manda de novo"), REUTILIZE o conteúdo exato que você já mandou -
+   não regenere nem invente uma versão nova, copie literalmente a opção/texto que já foi mostrado.
 
 IMPORTANTE sobre datas/horários: qualquer campo "*_iso" deve conter APENAS a data/hora em formato
 ISO 8601 com fuso -03:00 (exemplo: 2026-08-29T15:00:00-03:00), sem nenhum texto explicativo junto,
@@ -1794,9 +1824,28 @@ def processar_revisao_grupo_designer(remote_jid, key, data):
     return {"resultado": resultado, "cliente_identificado": cliente_nome, "comparacao": resultado_comparacao}
 
 
+SYSTEM_PROMPT_CORRECAO_CONSERVADORA = """Você corrige um texto em português do Brasil que a pessoa
+escreveu com dificuldade. IMPORTANTE - aqui você NÃO reescreve nem melhora o texto, só corrige o
+que está objetivamente errado:
+
+- Corrija ortografia, acentuação, pontuação, concordância verbal/nominal e erros de digitação.
+- NUNCA troque palavras por sinônimos, nunca deixe o texto mais formal, nunca mude o tom, nunca
+  resuma, nunca acrescente nem remova informação, nunca reorganize o raciocínio ou a ordem das
+  ideias. Mantenha as mesmas palavras sempre que possível.
+- O resultado deve parecer escrito pela MESMA pessoa, do mesmo jeito, só sem erro - alguém que
+  conhece quem escreveu não pode notar que "não parece mais ela/ele".
+- Preserve tratamentos informais, cumprimentos ("Amiga", "Bom dia" etc.) e a pontuação emocional
+  (like "!", "?") do jeito que a pessoa usou, corrigindo só o que está de fato incorreto.
+
+Responda SEMPRE E APENAS em JSON válido, sem texto fora do JSON e sem bloco de código markdown
+(nada de ```), neste formato exato:
+{"texto_corrigido": "o texto corrigido, preservando ao máximo as palavras e o estilo original"}
+"""
+
 SYSTEM_PROMPT_CORRECAO_TEXTO = """Você ajuda a revisar e reescrever, em português do Brasil, um texto
 que a pessoa escreveu com dificuldade (pode ter erro de ortografia, gramática, concordância, ou
-frases desorganizadas/informais demais). A pessoa pediu o tom "{tom}" pro resultado.
+frases desorganizadas/informais demais). A pessoa pediu explicitamente pra reescrever no tom
+"{tom}" (isso é diferente de uma simples correção - ela quer uma versão diferente, não só sem erro).
 
 - Corrija toda a ortografia, gramática e concordância.
 - Reescreva no tom pedido: "formal" é mais sério e profissional, sem gírias e sem emojis;
@@ -1812,41 +1861,72 @@ Responda SEMPRE E APENAS em JSON válido, sem texto fora do JSON e sem bloco de 
 {"opcao_1": "primeira versão reescrita e corrigida", "opcao_2": "segunda versão reescrita e corrigida, diferente da primeira"}
 """
 
-_REGEX_PEDIDO_CORRECAO = re.compile(r"^\s*corri[gj]\w*\s+(?:o\s+)?texto\b.*?:", re.IGNORECASE | re.DOTALL)
+# Corrigir/corrige/revisa sozinho (sem pedir reescrita) = so conserta erro, preservando as
+# palavras - reescrita completa (outro tom, mais formal, etc) só quando pedida explicitamente.
+_REGEX_PEDIDO_CORRECAO = re.compile(r"^\s*(?:corri[gj]\w*|revis\w*)\b.*?:", re.IGNORECASE | re.DOTALL)
+_PALAVRAS_PEDEM_REESCRITA = (
+    "formal", "cordial", "profissional", "comercial", "melhora", "melhore", "melhorar",
+    "reescreve", "reescreva", "reescrever", "outra versao", "outra opcao", "resuma", "resumir",
+)
 
 
-def extrair_tom_e_texto_correcao(texto_completo):
-    """Se a mensagem começar com o padrão 'corrija o texto com o tom formal/cordial: <texto>',
-    devolve (tom, texto_a_corrigir). Se não bater com o padrão, devolve (None, None)."""
+def extrair_modo_e_texto_correcao(texto_completo):
+    """Se a mensagem começar com 'corrija'/'corrige'/'revise' seguido de ':', devolve
+    (modo, texto_a_corrigir). "modo" e "conservador" (so ortografia/gramatica/pontuacao,
+    preservando as palavras) quando a pessoa so pediu correcao mesmo, sem mencionar tom
+    ou reescrita - esse e o padrao, igual um "corrija" simples deve funcionar. So vira
+    "formal"/"cordial" (reescrita completa com 2 opcoes) quando ela pede isso explicitamente
+    (ex: "corrija com tom formal", "corrija e deixa mais profissional", "reescreve isso")."""
     m = _REGEX_PEDIDO_CORRECAO.match(texto_completo)
     if not m:
         return None, None
-    prefixo = m.group(0).lower()
-    tom = "formal" if "formal" in prefixo else "cordial"
+    prefixo = normalizar_texto(m.group(0))
     texto_a_corrigir = texto_completo[m.end():].strip()
-    return tom, texto_a_corrigir
+    if "formal" in prefixo:
+        return "formal", texto_a_corrigir
+    if "cordial" in prefixo:
+        return "cordial", texto_a_corrigir
+    if any(palavra in prefixo for palavra in _PALAVRAS_PEDEM_REESCRITA):
+        return "cordial", texto_a_corrigir
+    return "conservador", texto_a_corrigir
 
 
-def corrigir_texto_dm(numero, tom, texto_a_corrigir):
+def corrigir_texto_dm(numero, modo, texto_a_corrigir):
     if not texto_a_corrigir:
         enviar_texto(
             numero,
-            "Manda o texto depois dos dois pontos, tipo: \"Corrija o texto com o tom formal: "
-            "<seu texto aqui>\"",
+            "Manda o texto depois dos dois pontos, tipo: \"Corrija: <seu texto aqui>\" (só "
+            "corrige o erro) ou \"Corrija com tom formal: <seu texto aqui>\" (se quiser uma "
+            "versão reescrita)",
         )
         return {"skipped": "pedido de correcao sem texto"}
 
-    prompt_sistema = SYSTEM_PROMPT_CORRECAO_TEXTO.replace("{tom}", tom)
+    pessoa = "torres" if numero_bate(numero, TORRES_NUMBER) else "luan"
+    grupo_jid_dm = f"dm_{pessoa}"
+    grupo_nome_dm = "Privado - Torres" if pessoa == "torres" else "Privado - Luan"
+
+    prompt_sistema = (
+        SYSTEM_PROMPT_CORRECAO_CONSERVADORA if modo == "conservador"
+        else SYSTEM_PROMPT_CORRECAO_TEXTO.replace("{tom}", modo)
+    )
     try:
         resultado = chamar_claude(prompt_sistema, texto_a_corrigir)
     except Exception as e:
         enviar_texto(numero, "Tive um problema pra revisar esse texto agora, pode tentar de novo?")
         return {"erro_claude": str(e)}
 
-    opcao_1 = resultado.get("opcao_1", "")
-    opcao_2 = resultado.get("opcao_2", "")
-    resposta = f"Aqui vão 2 opções no tom {tom}:\n\n1️⃣ {opcao_1}\n\n2️⃣ {opcao_2}"
+    if modo == "conservador":
+        resposta = resultado.get("texto_corrigido", "")
+    else:
+        opcao_1 = resultado.get("opcao_1", "")
+        opcao_2 = resultado.get("opcao_2", "")
+        resposta = f"Aqui vão 2 opções no tom {modo}:\n\n1️⃣ {opcao_1}\n\n2️⃣ {opcao_2}"
+
     enviar_texto(numero, resposta)
+    # Registra a resposta no historico do DM tambem, pra se a pessoa disser depois "manda
+    # só a segunda"/"gostei dessa" o bot conseguir recuperar o que foi mostrado, em vez de
+    # inventar outra coisa.
+    registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", resposta, False)
     return {"resultado": resultado}
 
 
@@ -2120,6 +2200,9 @@ def metricool_responder_metricas(marca, rede, tipo, dias):
     return f"{prefixo}{texto}"
 
 
+_REGEX_REGRA_CLIENTE = re.compile(r"^\s*regra\s+(?:para|pro|pra)\s+(.+?)\s*:\s*(.+)$", re.IGNORECASE | re.DOTALL)
+
+
 def processar_dm(remote_jid, key, data):
     if numero_bate(remote_jid, TORRES_NUMBER):
         pessoa, numero = "torres", TORRES_NUMBER
@@ -2188,6 +2271,27 @@ def processar_dm(remote_jid, key, data):
             return {"skipped": "DM de tipo não tratado nesta versão, mas registrado no histórico"}
         registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, pessoa, texto, True)
 
+    # "regra pro/pra/para <cliente>: <instrucao>" - mesma ideia da regra geral, mas
+    # vinculada a UM cliente especifico (ex: "regra pro Zurca: quando perguntarem sobre
+    # gravacao, pode dizer que e marcada direto comigo") - nunca vaza pra outro cliente.
+    m_regra_cliente = _REGEX_REGRA_CLIENTE.match(texto)
+    if m_regra_cliente:
+        nome_cliente_regra = m_regra_cliente.group(1).strip()
+        texto_regra_cliente = m_regra_cliente.group(2).strip()
+        grupo_jid_regra = identificar_grupo_mencionado(nome_cliente_regra)
+        grupo_regra = GRUPOS.get(grupo_jid_regra) if grupo_jid_regra else None
+        if grupo_regra and not grupo_regra.get("interno") and texto_regra_cliente:
+            nome_canonico = grupo_regra["nome"]
+            salvar_regra(pessoa, texto_regra_cliente, cliente=nome_canonico)
+            responder(f'Anotado! ✅ Regra específica pro cliente {nome_canonico}: "{texto_regra_cliente}"')
+            return {"regra_cliente_salva": texto_regra_cliente, "cliente": nome_canonico}
+        elif not texto_regra_cliente:
+            responder("Entendi que é uma regra específica de cliente, mas não veio nenhuma instrução depois dos dois pontos. Pode mandar de novo?")
+            return {"skipped": "regra de cliente vazia"}
+        else:
+            responder(f'Entendi que é uma regra pro cliente "{nome_cliente_regra}", mas não achei esse cliente cadastrado. Pode confirmar o nome certinho?')
+            return {"skipped": "cliente nao encontrado pra regra especifica"}
+
     # Palavra-chave "regra:" tem prioridade maxima sobre qualquer outra logica - e como
     # Torres/Luan ensinam uma instrucao permanente de atendimento, que passa a valer pra
     # toda resposta automatica de cliente dali pra frente (guardada no banco).
@@ -2203,9 +2307,9 @@ def processar_dm(remote_jid, key, data):
 
     # Pedido de correção de texto ("corrija o texto com o tom formal/cordial: ...") tem
     # prioridade sobre a lógica de lembrete - não é um lembrete, é outra ferramenta.
-    tom, texto_a_corrigir = extrair_tom_e_texto_correcao(texto)
-    if tom:
-        return corrigir_texto_dm(numero, tom, texto_a_corrigir)
+    modo_correcao, texto_a_corrigir = extrair_modo_e_texto_correcao(texto)
+    if modo_correcao:
+        return corrigir_texto_dm(numero, modo_correcao, texto_a_corrigir)
 
     # Se tem um comando "pro Tripa" pendente de confirmacao pra essa pessoa, confere se
     # essa mensagem e um sim/nao curto antes de tratar como mensagem nova.
