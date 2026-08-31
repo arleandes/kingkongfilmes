@@ -1605,7 +1605,7 @@ def parece_confirmacao(texto: str):
     t = normalizar_texto(texto).strip()
     afirmativos = {"sim", "pode", "posso", "pode mandar", "confirma", "confirmado", "manda",
                    "isso mesmo", "isso", "ok", "beleza", "pode enviar", "manda sim", "claro",
-                   "com certeza", "pode sim", "manda ai"}
+                   "com certeza", "pode sim", "manda ai", "perfeito", "vai"}
     negativos = {"nao", "cancela", "cancelar", "espera", "pera", "para", "deixa quieto"}
     if t in afirmativos:
         return True
@@ -2264,6 +2264,43 @@ def montar_briefing_cliente(pessoa_nome, grupo_jid, grupo_nome, assunto):
         return {"duvida_ambigua": True, "pergunta_duvida": "Tive um problema técnico tentando montar esse briefing, pode pedir de novo daqui a pouco?"}
 
 
+SYSTEM_PROMPT_AJUSTE_BRIEFING = """Você é a Cintia, assistente virtual da Correria. Você acabou de
+mostrar um briefing pronto (abaixo) esperando confirmação antes de mandar pro grupo Tripa, e a
+pessoa mandou uma nova mensagem em vez de um "sim"/"não" direto.
+
+Decida: essa mensagem é um PEDIDO DE AJUSTE pontual nesse briefing específico (ex: "troca X por
+Y", "tira a linha do horário", "muda o texto principal pra Z", "adiciona que não pode usar preço
+individual"), ou é outra coisa (mensagem nova sem relação com ajustar esse briefing)?
+
+SE FOR UM AJUSTE: aplique SOMENTE a alteração pedida no texto abaixo. Mantenha TUDO o resto
+exatamente igual - mesma formatação (*CLIENTE:*, *PEDIDO N | título*, itens com •), mesma ordem,
+mesmas palavras que não foram mencionadas na alteração. NUNCA reescreva, resuma, complete ou
+reinterprete nada além do que foi pedido - a versão ajustada deve ser idêntica à original exceto
+pela mudança específica.
+
+SE NÃO FOR UM AJUSTE a esse briefing: marque "eh_ajuste" como false e não altere nada.
+
+BRIEFING ATUAL:
+{briefing_atual}
+
+Responda SEMPRE E APENAS em JSON válido, sem bloco de código markdown (nada de ```):
+{"eh_ajuste": true ou false, "briefing_atualizado": "o texto COMPLETO do briefing já com o ajuste aplicado, no mesmo formato do original, ou string vazia se eh_ajuste for false"}
+"""
+
+
+def tentar_ajustar_briefing_pendente(mensagem_atual, instrucao_texto):
+    """Quando ha um briefing de cliente pendente de confirmacao e a pessoa manda algo que nao e
+    um sim/nao direto, verifica se e um pedido de AJUSTE pontual (ex: "troca X por Y") - nesse
+    caso aplica so a mudanca pedida (nunca remonta/reinterpreta o briefing do zero) e devolve o
+    texto atualizado pra passar por uma nova confirmacao antes de ir pro Tripa."""
+    prompt_sistema = SYSTEM_PROMPT_AJUSTE_BRIEFING.replace("{briefing_atual}", mensagem_atual)
+    try:
+        return chamar_claude(prompt_sistema, instrucao_texto, max_tokens=2000, timeout=40)
+    except Exception as e:
+        print(f"[tentar_ajustar_briefing_pendente] erro ({type(e).__name__}): {e}", flush=True)
+        return {"eh_ajuste": False, "briefing_atualizado": ""}
+
+
 SYSTEM_PROMPT_ATIVIDADE_GERAL = """Você é a Cintia, assistente virtual da Correria. {pessoa_nome}
 perguntou quais grupos (de cliente ou o grupo interno Tripa) tiveram atividade hoje, pra ter um
 panorama geral sem precisar abrir grupo por grupo. Abaixo está, pra cada grupo que teve pelo menos
@@ -2628,9 +2665,24 @@ def processar_dm(remote_jid, key, data):
             _comandos_pendentes.pop(pessoa, None)
             responder("Beleza, não mandei nada. Se quiser, me manda de novo do jeito certo.")
             return {"comando_tripa_cancelado": True}
-        # confirma is None: nao pareceu sim/nem nao, segue o fluxo normal (pode ser uma
-        # mensagem nova, ou uma correcao ao comando pendente - nesse caso o comando antigo
-        # so expira depois do TTL, ou e substituido se essa mensagem virar um novo comando).
+        elif pendente.get("eh_briefing_cliente"):
+            # Nao foi um sim/nao direto - antes de tratar como mensagem nova, confere se e um
+            # pedido de AJUSTE pontual nesse briefing especifico (ex: "troca X por Y"). Se for,
+            # aplica SO a mudanca pedida (nunca remonta do zero) e pede confirmacao de novo -
+            # nunca reescreve/reinterpreta o resto do briefing ja aprovado como pronto.
+            ajuste = tentar_ajustar_briefing_pendente(pendente["mensagem_tripa"], texto)
+            if ajuste.get("eh_ajuste") and ajuste.get("briefing_atualizado"):
+                novo_texto_briefing = ajuste["briefing_atualizado"]
+                pendente["mensagem_tripa"] = novo_texto_briefing
+                pendente["criado_em"] = time.time()
+                responder(f"{novo_texto_briefing}\n\nPosso enviar assim para a Tripa?")
+                return {"briefing_ajustado": True}
+            # Nao pareceu um ajuste a esse briefing - segue o fluxo normal (mensagem nova; o
+            # pendente antigo so expira pelo TTL ou e substituido se virar um novo comando).
+        # confirma is None (e nao era ajuste de briefing pendente): nao pareceu sim/nem nao,
+        # segue o fluxo normal (pode ser uma mensagem nova, ou uma correcao ao comando pendente -
+        # nesse caso o comando antigo so expira depois do TTL, ou e substituido se essa mensagem
+        # virar um novo comando).
 
     # Se tem uma promessa detectada aguardando confirmacao (Torres OU Luan podem responder -
     # nao e por pessoa como o comando pro Tripa, porque os dois recebem o aviso), confere a
@@ -2831,15 +2883,21 @@ def processar_dm(remote_jid, key, data):
                         secao += f"\n{linhas_itens}"
                     secoes.append(secao)
                 mensagem_tripa_briefing = f"*CLIENTE:* {grupo_nome_briefing}\n\n" + "\n\n".join(secoes)
-                # "Analisa e passa pra Tripa" ja e a autorizacao pra encaminhar - so pergunta antes
-                # se sobrar duvida real (tratada acima via duvida_ambigua), nunca depois do briefing
-                # pronto. Manda direto, sem pedir "confirma que posso mandar?" de novo.
-                enviar_texto(TRIPA_DESIGNER_JID, mensagem_tripa_briefing)
-                resumo_curto = briefing.get("resumo_curto") or f"Briefing do {grupo_nome_briefing} pronto."
-                responder(
-                    f"Analisei a conversa do {grupo_nome_briefing}! {resumo_curto}\n\n"
-                    f"Mandei isso pra Tripa:\n\n{mensagem_tripa_briefing}"
-                )
+                # Mesmo com "analisa e passa pra Tripa" dito de antemao, o briefing pronto SEMPRE
+                # precisa ser mostrado pra Torres/Luan e confirmado antes de ir pro Tripa (nunca
+                # manda direto) - guarda como comando pendente igual ao "passa pra Tripa: ..."
+                # manual, marcado como briefing_cliente pra permitir pedido de AJUSTE pontual
+                # (troca so o que foi pedido, sem remontar do zero) antes da nova confirmacao.
+                _comandos_pendentes[pessoa] = {
+                    "mensagem_tripa": mensagem_tripa_briefing,
+                    "tem_cobranca": False,
+                    "horario_cobranca": None,
+                    "pergunta_cobranca": "",
+                    "criado_em": time.time(),
+                    "eh_briefing_cliente": True,
+                    "grupo_nome_briefing": grupo_nome_briefing,
+                }
+                responder(f"{mensagem_tripa_briefing}\n\nPosso enviar assim para a Tripa?")
     elif resultado.get("eh_pergunta_metricool_metricas"):
         nome_cliente_metrica = resultado.get("metricool_metrica_cliente") or ""
         marca_metrica = metricool_identificar_marca(nome_cliente_metrica)
