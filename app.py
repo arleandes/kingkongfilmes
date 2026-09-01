@@ -1314,7 +1314,10 @@ def _finalizar_processamento_grupo(chave):
     )
 
     try:
-        resultado = chamar_claude(SYSTEM_PROMPT_ATENDIMENTO, prompt_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64)
+        # Esse prompt cresceu bastante ao longo das rodadas (varias secoes de regras) - usa um
+        # max_tokens maior que o padrao pra reduzir a chance de precisar da tentativa extra
+        # automatica (que dobra o custo/tempo dessa chamada quando acontece).
+        resultado = chamar_claude(SYSTEM_PROMPT_ATENDIMENTO, prompt_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64, max_tokens=3000)
     except Exception as e:
         # Antes disso ficava em silencio total (so um print no log) - o cliente nao recebia
         # nenhuma resposta e a equipe nao ficava sabendo que uma mensagem falhou, parecendo
@@ -1832,7 +1835,9 @@ def revisar_peca(imagem_base64, pdf_base64, caption):
     mandar pro Tripa uma "correção" contraditória tipo "PARMEGIANA está errado, o correto é
     PARMEGIANA"."""
     prompt_usuario = "Revise essa peça em busca de erros de escrita." + (f" Legenda enviada junto: {caption}" if caption else "")
-    resultado = chamar_claude(SYSTEM_PROMPT_REVISAO, prompt_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64)
+    # Prompt de ortografia cresceu bastante (3 estados, regra mestre, etc.) - max_tokens maior
+    # que o padrao reduz a chance de precisar da tentativa extra automatica.
+    resultado = chamar_claude(SYSTEM_PROMPT_REVISAO, prompt_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64, max_tokens=3000)
 
     erros_brutos = resultado.get("erros") or []
     erros_validos = []
@@ -2312,7 +2317,9 @@ def comparar_arte_com_pedido(pedido_texto, imagem_base64, pdf_base64, historico_
     # prompt sem arriscar ficar desatualizado quando o ano virar.
     ano_atual = str(horario_bahia_agora().year)
     prompt_sistema = SYSTEM_PROMPT_COMPARACAO_PEDIDO.replace("{ano_atual}", ano_atual)
-    resultado = chamar_claude(prompt_sistema, prompt_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64)
+    # Prompt de conferencia de conteudo tambem cresceu bastante (calendario + padrao curto) -
+    # max_tokens maior que o padrao reduz a chance de precisar da tentativa extra automatica.
+    resultado = chamar_claude(prompt_sistema, prompt_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64, max_tokens=3000)
 
     if resultado.get("duvida_ambigua"):
         bate = False
@@ -2692,7 +2699,9 @@ def responder_pergunta_sobre_grupo(pessoa_nome, pergunta, grupo_jid, grupo_nome,
         .replace("{regras_cliente}", _bloco_regras_para_prompt(cliente=grupo_nome))
     )
     try:
-        resultado = chamar_claude(prompt_sistema, pergunta)
+        # Prompt ganhou blocos de historico com timestamp + regras do cliente - max_tokens maior
+        # que o padrao reduz a chance de precisar da tentativa extra automatica.
+        resultado = chamar_claude(prompt_sistema, pergunta, max_tokens=2500)
         return resultado.get("resposta") or "Não consegui montar uma resposta a partir do histórico do grupo, pode reformular a pergunta?"
     except Exception as e:
         print(f"[responder_pergunta_sobre_grupo] erro: {e}", flush=True)
@@ -2898,7 +2907,10 @@ def responder_atividade_geral_hoje(pessoa_nome):
         .replace("{blocos_grupos}", blocos_grupos)
     )
     try:
-        resultado = chamar_claude(prompt_sistema, "Quais grupos tiveram atividade hoje?")
+        # Pode juntar ate 15 mensagens de CADA grupo de cliente ativo (as vezes varios de uma
+        # vez) - max_tokens maior que o padrao reduz a chance de precisar da tentativa extra
+        # automatica.
+        resultado = chamar_claude(prompt_sistema, "Quais grupos tiveram atividade hoje?", max_tokens=3000)
         resumos = resultado.get("resumos") or []
         if not resumos:
             nomes = ", ".join(info["nome"] for info in grupos_ativos.values())
@@ -3387,7 +3399,10 @@ def processar_dm(remote_jid, key, data):
         .replace("{lista_grupos}", lista_grupos)
     )
     try:
-        resultado = chamar_claude(prompt_sistema, texto)
+        # Classificador de TODA mensagem do privado - cresceu bastante (10 tipos, nota de
+        # continuacao, etc.) e roda em toda mensagem, entao vale max_tokens maior que o padrao
+        # pra reduzir a chance de precisar da tentativa extra automatica.
+        resultado = chamar_claude(prompt_sistema, texto, max_tokens=2500)
     except Exception as e:
         responder("Tive um problema pra processar sua mensagem agora, pode mandar de novo?")
         return {"erro_claude": str(e), "lembrete_anterior_resolvido": tinha_pendente}
