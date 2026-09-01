@@ -751,7 +751,7 @@ def transcrever_audio(caminho_arquivo):
     return resp.json().get("text", "")
 
 
-def chamar_claude(system_prompt, conteudo_usuario, imagem_base64=None, pdf_base64=None, max_tokens=1500, timeout=30):
+def chamar_claude(system_prompt, conteudo_usuario, imagem_base64=None, pdf_base64=None, max_tokens=1500, timeout=30, _tentativa=1):
     messages_content = []
     if imagem_base64:
         messages_content.append({
@@ -801,7 +801,23 @@ def chamar_claude(system_prompt, conteudo_usuario, imagem_base64=None, pdf_base6
     bloco_texto = next((b for b in blocos if b.get("type") == "text"), None)
     if bloco_texto is None:
         tipos_encontrados = [b.get("type") for b in blocos]
-        print(f"[chamar_claude] ERRO: nenhum bloco 'text' na resposta (tipos encontrados: {tipos_encontrados})", flush=True)
+        print(f"[chamar_claude] ERRO: nenhum bloco 'text' na resposta (tipos encontrados: {tipos_encontrados}, max_tokens={max_tokens})", flush=True)
+        # Bug real de producao (visto nos logs): quando estoura max_tokens ainda dentro do
+        # bloco de "thinking" (raciocinio), a resposta nunca chega a ter um bloco de texto -
+        # sem essa rede de seguranca isso virava um RuntimeError silencioso, que em varios
+        # pontos do codigo nao mandava NENHUMA mensagem de volta (cliente/equipe ficavam sem
+        # resposta nenhuma, parecendo que o bot simplesmente ignorou). Como os prompts foram
+        # crescendo (mais regras/contexto a cada rodada), o orcamento de tokens que bastava
+        # antes deixou de bastar pra algumas chamadas mais pesadas. Em vez de arriscar deixar
+        # isso acontecer de novo a cada prompt novo, tenta UMA vez a mais com um orcamento bem
+        # maior antes de desistir de verdade.
+        if stop_reason == "max_tokens" and _tentativa == 1:
+            novo_max_tokens = max(max_tokens * 3, max_tokens + 3000)
+            print(f"[chamar_claude] tentando de novo com max_tokens={novo_max_tokens} (era {max_tokens})", flush=True)
+            return chamar_claude(
+                system_prompt, conteudo_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64,
+                max_tokens=novo_max_tokens, timeout=timeout, _tentativa=2,
+            )
         raise RuntimeError(f"Resposta do Claude sem bloco de texto (tipos: {tipos_encontrados})")
     texto = bloco_texto["text"].strip()
     # As vezes o modelo embrulha o JSON num bloco de codigo markdown - remove isso.
@@ -1300,7 +1316,21 @@ def _finalizar_processamento_grupo(chave):
     try:
         resultado = chamar_claude(SYSTEM_PROMPT_ATENDIMENTO, prompt_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64)
     except Exception as e:
+        # Antes disso ficava em silencio total (so um print no log) - o cliente nao recebia
+        # nenhuma resposta e a equipe nao ficava sabendo que uma mensagem falhou, parecendo
+        # que o bot simplesmente ignorou. Agora sempre avisa os dois lados.
         print(f"[_finalizar_processamento_grupo] erro claude: {e}", flush=True)
+        resposta_fallback = "Recebi sua mensagem! Tive um probleminha técnico aqui agora, pode mandar de novo em instantes? 🙏"
+        enviar_texto(remote_jid, resposta_fallback)
+        registrar_mensagem_grupo(remote_jid, grupo["nome"], "Cintia", resposta_fallback, True)
+        aviso_erro = (
+            f"🚨 Atenção (erro técnico ao processar mensagem do cliente)\n"
+            f"*{grupo['nome']}* · {sender_name}\n\n"
+            f"{conteudo_texto}\n\n"
+            f"Mandei um aviso de fallback pro cliente pedindo pra mandar de novo. Vale conferir manualmente."
+        )
+        for numero in TEAM_NUMBERS:
+            enviar_texto(numero, aviso_erro)
         return
 
     # "Inteligência contextual nos grupos de clientes": nem toda mensagem exige resposta - um
@@ -2386,7 +2416,11 @@ def processar_revisao_grupo_designer(remote_jid, key, data):
     try:
         tem_erro, texto_resp, resultado = revisar_peca(imagem_base64, pdf_base64, caption)
     except Exception as e:
+        # Antes disso ficava em silencio total no Tripa (so log interno) quando a chamada
+        # falhava - o designer nao tinha como saber que a peca nao foi revisada. Agora avisa
+        # no proprio grupo, no mesmo padrao usado no privado (revisar_arte_dm).
         print(f"[processar_revisao_grupo_designer] erro claude: {e}", flush=True)
+        enviar_texto(remote_jid, "Tive um problema pra revisar essa peça agora, pode mandar de novo em instantes?")
         return {"erro_claude": str(e)}
 
     pontos_ortografia = _formatar_pontos_ortografia(resultado)
