@@ -17,6 +17,17 @@
 # deste servico): ANTHROPIC_API_KEY, OPENAI_API_KEY, EVOLUTION_BASE_URL,
 # EVOLUTION_APIKEY, EVOLUTION_INSTANCE, TORRES_NUMBER, LUAN_NUMBER
 #
+# Migracao pra Z-API (setembro/2026, Evolution API estava com quedas/bloqueios
+# recorrentes do WhatsApp): WHATSAPP_PROVIDER="zapi" liga o envio de mensagem pela
+# Z-API em vez da Evolution API (default continua "evolution", sem mudar nada se
+# essa variavel nao for configurada). Quando for "zapi", precisa tambem de
+# ZAPI_INSTANCE_ID, ZAPI_INSTANCE_TOKEN e, se o Client-Token de seguranca da conta
+# estiver ativado no painel da Z-API, ZAPI_CLIENT_TOKEN. O recebimento de mensagem
+# nao depende dessa variavel - a Z-API manda pra rota /webhook-zapi e a Evolution
+# API continua mandando pra /webhook, as duas rotas podem coexistir durante a
+# transicao (so uma das duas vai receber trafego de verdade, dependendo de qual
+# webhook estiver configurado do lado de fora).
+#
 # Observacao: este servico guarda lembretes pendentes em memoria (nao em
 # banco de dados) - se reiniciar com um lembrete pendente, ele se perde.
 # Rode este servico com UMA unica instancia (nao escale horizontalmente).
@@ -53,6 +64,14 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 EVOLUTION_BASE_URL = os.environ.get("EVOLUTION_BASE_URL", "").rstrip("/")
 EVOLUTION_APIKEY = os.environ.get("EVOLUTION_APIKEY", "")
 EVOLUTION_INSTANCE = os.environ.get("EVOLUTION_INSTANCE", "")
+
+# Z-API (provedor novo, ver comentario de migracao no topo do arquivo)
+WHATSAPP_PROVIDER = os.environ.get("WHATSAPP_PROVIDER", "evolution").strip().lower()
+ZAPI_BASE_URL = os.environ.get("ZAPI_BASE_URL", "https://api.z-api.io").rstrip("/")
+ZAPI_INSTANCE_ID = os.environ.get("ZAPI_INSTANCE_ID", "")
+ZAPI_INSTANCE_TOKEN = os.environ.get("ZAPI_INSTANCE_TOKEN", "")
+ZAPI_CLIENT_TOKEN = os.environ.get("ZAPI_CLIENT_TOKEN", "")
+
 TORRES_NUMBER = os.environ.get("TORRES_NUMBER", "5571999394216")
 LUAN_NUMBER = os.environ.get("LUAN_NUMBER", "5571992200583")
 TEAM_NUMBERS = [TORRES_NUMBER, LUAN_NUMBER]
@@ -644,7 +663,36 @@ def dentro_do_horario_comercial() -> bool:
     return 8 <= agora.hour < 18
 
 
+def _jid_para_zapi_phone(numero_ou_jid: str) -> str:
+    """Converte um numero/JID no formato que usamos internamente (compativel com a
+    Evolution API) pro formato que a Z-API espera no campo "phone": grupo usa sufixo
+    "-group" em vez de "@g.us"; numero direto (DM) usa so os digitos, sem sufixo."""
+    if numero_ou_jid.endswith("@g.us"):
+        return numero_ou_jid[: -len("@g.us")] + "-group"
+    if numero_ou_jid.endswith("@s.whatsapp.net") or numero_ou_jid.endswith("@lid"):
+        return so_digitos(numero_ou_jid)
+    return so_digitos(numero_ou_jid) or numero_ou_jid
+
+
+def _zapi_url(caminho: str) -> str:
+    return f"{ZAPI_BASE_URL}/instances/{ZAPI_INSTANCE_ID}/token/{ZAPI_INSTANCE_TOKEN}/{caminho}"
+
+
+def _zapi_headers() -> dict:
+    headers = {"Content-Type": "application/json"}
+    if ZAPI_CLIENT_TOKEN:
+        headers["Client-Token"] = ZAPI_CLIENT_TOKEN
+    return headers
+
+
 def enviar_texto(numero_ou_jid: str, texto: str):
+    if WHATSAPP_PROVIDER == "zapi":
+        _enviar_texto_zapi(numero_ou_jid, texto)
+    else:
+        _enviar_texto_evolution(numero_ou_jid, texto)
+
+
+def _enviar_texto_evolution(numero_ou_jid: str, texto: str):
     try:
         resp = requests.post(
             f"{EVOLUTION_BASE_URL}/message/sendText/{EVOLUTION_INSTANCE}",
@@ -658,9 +706,30 @@ def enviar_texto(numero_ou_jid: str, texto: str):
         print(f"[enviar_texto] falhou: {e}", flush=True)
 
 
+def _enviar_texto_zapi(numero_ou_jid: str, texto: str):
+    try:
+        resp = requests.post(
+            _zapi_url("send-text"),
+            headers=_zapi_headers(),
+            json={"phone": _jid_para_zapi_phone(numero_ou_jid), "message": texto},
+            timeout=20,
+        )
+        if resp.status_code >= 400:
+            print(f"[enviar_texto_zapi] ERRO {resp.status_code}: {resp.text[:500]}", flush=True)
+    except Exception as e:
+        print(f"[enviar_texto_zapi] falhou: {e}", flush=True)
+
+
 def enviar_midia(numero_ou_jid: str, media_base64: str, mediatype: str, caption: str = "", nome_arquivo: str = "arquivo"):
-    """Encaminha uma imagem ou documento (base64) pra um numero/grupo via Evolution API.
+    """Encaminha uma imagem ou documento (base64) pra um numero/grupo.
     mediatype: "image" ou "document"."""
+    if WHATSAPP_PROVIDER == "zapi":
+        _enviar_midia_zapi(numero_ou_jid, media_base64, mediatype, caption=caption, nome_arquivo=nome_arquivo)
+    else:
+        _enviar_midia_evolution(numero_ou_jid, media_base64, mediatype, caption=caption, nome_arquivo=nome_arquivo)
+
+
+def _enviar_midia_evolution(numero_ou_jid: str, media_base64: str, mediatype: str, caption: str = "", nome_arquivo: str = "arquivo"):
     try:
         resp = requests.post(
             f"{EVOLUTION_BASE_URL}/message/sendMedia/{EVOLUTION_INSTANCE}",
@@ -678,6 +747,51 @@ def enviar_midia(numero_ou_jid: str, media_base64: str, mediatype: str, caption:
             print(f"[enviar_midia] ERRO {resp.status_code}: {resp.text[:500]}", flush=True)
     except Exception as e:
         print(f"[enviar_midia] falhou: {e}", flush=True)
+
+
+def _enviar_midia_zapi(numero_ou_jid: str, media_base64: str, mediatype: str, caption: str = "", nome_arquivo: str = "arquivo"):
+    phone = _jid_para_zapi_phone(numero_ou_jid)
+    try:
+        if mediatype == "image":
+            endpoint = "send-image"
+            body = {"phone": phone, "image": f"data:image/jpeg;base64,{media_base64}", "caption": caption}
+        else:
+            extensao = nome_arquivo.rsplit(".", 1)[-1].lower() if "." in nome_arquivo else "pdf"
+            endpoint = f"send-document/{extensao}"
+            body = {
+                "phone": phone,
+                "document": f"data:application/{extensao};base64,{media_base64}",
+                "fileName": nome_arquivo,
+                "caption": caption,
+            }
+        resp = requests.post(_zapi_url(endpoint), headers=_zapi_headers(), json=body, timeout=40)
+        if resp.status_code >= 400:
+            print(f"[enviar_midia_zapi] ERRO {resp.status_code}: {resp.text[:500]}", flush=True)
+    except Exception as e:
+        print(f"[enviar_midia_zapi] falhou: {e}", flush=True)
+
+
+def baixar_midia(message_key):
+    """Dispatcher: mensagens vindas da Z-API carregam a propria URL de download dentro
+    da key normalizada (campo interno "_zapi_media_url", ver _normalizar_evento_zapi) -
+    nesse caso baixa direto dessa URL. Caso contrario (Evolution API), usa o endpoint
+    proprio da Evolution que busca a midia pela key original da mensagem."""
+    url_zapi = message_key.get("_zapi_media_url") if isinstance(message_key, dict) else None
+    if url_zapi:
+        return baixar_midia_zapi_url(url_zapi)
+    return baixar_midia_evolution(message_key)
+
+
+def baixar_midia_zapi_url(url):
+    if not url:
+        return None
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        return base64.b64encode(resp.content).decode("utf-8")
+    except Exception as e:
+        print(f"[baixar_midia_zapi_url] falhou: {e}", flush=True)
+        return None
 
 
 def baixar_midia_evolution(message_key):
@@ -1118,10 +1232,10 @@ def extrair_conteudo_mensagem_grupo(key, data):
         conteudo_texto = message.get("conversation", "")
     elif "image" in message_type.lower():
         caption = message.get("imageMessage", {}).get("caption", "")
-        imagem_base64 = baixar_midia_evolution(key)
+        imagem_base64 = baixar_midia(key)
         conteudo_texto = caption or "(cliente mandou uma imagem sem legenda)"
     elif "audio" in message_type.lower() or "ptt" in message_type.lower():
-        b64 = baixar_midia_evolution(key)
+        b64 = baixar_midia(key)
         if b64:
             with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as f:
                 f.write(base64.b64decode(b64))
@@ -1145,7 +1259,7 @@ def extrair_conteudo_mensagem_grupo(key, data):
         caption = doc_msg.get("caption", "")
         nome_arquivo_doc = doc_msg.get("fileName", "arquivo.pdf")
         mimetype = doc_msg.get("mimetype", "")
-        b64 = baixar_midia_evolution(key)
+        b64 = baixar_midia(key)
         if b64 and ("pdf" in mimetype.lower() or nome_arquivo_doc.lower().endswith(".pdf")):
             pdf_base64 = b64
             conteudo_texto = caption or f"(cliente mandou um PDF/informativo: {nome_arquivo_doc})"
@@ -1804,7 +1918,7 @@ def extrair_midia_para_revisao(key, data, message_type):
 
     if "image" in message_type.lower():
         caption = message.get("imageMessage", {}).get("caption", "")
-        imagem_base64 = baixar_midia_evolution(key)
+        imagem_base64 = baixar_midia(key)
         if not imagem_base64:
             aviso = "Recebi a imagem mas não consegui baixar pra revisar, pode reenviar?"
     elif "document" in message_type.lower():
@@ -1812,7 +1926,7 @@ def extrair_midia_para_revisao(key, data, message_type):
         caption = doc_msg.get("caption", "")
         nome_arquivo = doc_msg.get("fileName", "arquivo.pdf")
         mimetype = doc_msg.get("mimetype", "")
-        b64 = baixar_midia_evolution(key)
+        b64 = baixar_midia(key)
         if b64 and ("pdf" in mimetype.lower() or nome_arquivo.lower().endswith(".pdf")):
             pdf_base64 = b64
         elif b64:
@@ -3231,7 +3345,7 @@ def processar_dm(remote_jid, key, data):
     # dali pra frente (pode ser um pedido de lembrete, uma regra, uma pergunta, etc) - antes
     # isso caia direto no "nao tratado" e nem era registrado no historico.
     if "audio" in tipo_lower or "ptt" in tipo_lower:
-        b64_audio = baixar_midia_evolution(key)
+        b64_audio = baixar_midia(key)
         if b64_audio:
             with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as f:
                 f.write(base64.b64decode(b64_audio))
@@ -3598,18 +3712,89 @@ def processar_dm(remote_jid, key, data):
 # Rota principal do webhook
 # --------------------------------------------------------------------------
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    body = request.get_json(silent=True) or {}
-    print(f"[webhook] payload bruto: {json.dumps(body)[:3000]}", flush=True)
-    data = body.get("data", body)
+def _normalizar_evento_zapi(body):
+    """Converte o payload de webhook da Z-API pro MESMO formato interno que ja usamos
+    pra Evolution API (um dict com key/pushName/messageType/message) - assim nenhuma
+    regra de negocio (classificacao, prompts, atendimento, testes ja existentes) precisa
+    mudar, so essa camada de entrada. Devolve None se o evento nao for uma mensagem
+    recebida de verdade pra processar (ex: confirmacao de status/entrega, evento de
+    conexao, eco da propria mensagem que a Cintia mandou).
 
+    Formato de grupo da Z-API usa sufixo "-group" em vez de "@g.us" no campo "phone" -
+    convertido aqui pra "@g.us" assim o dicionario GRUPOS (que usa esse formato) continua
+    funcionando sem nenhuma alteracao."""
+    tipo_evento = body.get("type")
+    if tipo_evento and tipo_evento != "ReceivedCallback":
+        return None
+    if body.get("fromMe"):
+        return None
+    if body.get("isStatusReply") or body.get("isNewsletter"):
+        return None
+
+    phone = body.get("phone", "") or ""
+    eh_grupo = bool(body.get("isGroup")) or phone.endswith("-group")
+    if eh_grupo:
+        remote_jid = phone[: -len("-group")] + "@g.us" if phone.endswith("-group") else f"{phone}@g.us"
+        participant_phone = body.get("participantPhone", "")
+        participant = f"{participant_phone}@s.whatsapp.net" if participant_phone else ""
+    else:
+        remote_jid = f"{phone}@s.whatsapp.net" if phone else ""
+        participant = ""
+
+    key = {
+        "remoteJid": remote_jid,
+        "id": body.get("messageId", ""),
+        "fromMe": bool(body.get("fromMe", False)),
+        "participant": participant,
+    }
+
+    message_type = ""
+    message = {}
+    if "text" in body:
+        message_type = "conversation"
+        message["conversation"] = (body.get("text") or {}).get("message", "")
+    elif "image" in body:
+        message_type = "imageMessage"
+        message["imageMessage"] = {"caption": (body.get("image") or {}).get("caption", "")}
+        key["_zapi_media_url"] = (body.get("image") or {}).get("imageUrl", "")
+    elif "audio" in body:
+        message_type = "audioMessage"
+        message["audioMessage"] = {}
+        key["_zapi_media_url"] = (body.get("audio") or {}).get("audioUrl", "")
+    elif "video" in body:
+        message_type = "videoMessage"
+        message["videoMessage"] = {"caption": (body.get("video") or {}).get("caption", "")}
+        key["_zapi_media_url"] = (body.get("video") or {}).get("videoUrl", "")
+    elif "document" in body:
+        doc = body.get("document") or {}
+        message_type = "documentMessage"
+        message["documentMessage"] = {
+            "caption": doc.get("caption", ""),
+            "fileName": doc.get("fileName", "arquivo.pdf"),
+            "mimetype": doc.get("mimeType", ""),
+        }
+        key["_zapi_media_url"] = doc.get("documentUrl", "")
+    else:
+        return None  # tipo de mensagem que a Z-API manda e a gente ainda nao trata (figurinha, reacao, enquete, etc)
+
+    return {
+        "key": key,
+        "pushName": body.get("senderName") or body.get("chatName") or "cliente",
+        "messageType": message_type,
+        "message": message,
+    }
+
+
+def _processar_evento_webhook(data, origem="evolution"):
+    """Logica compartilhada entre as rotas /webhook (Evolution API) e /webhook-zapi
+    (Z-API) - depois que cada uma normaliza o payload bruto do provedor pro formato
+    interno comum, o roteamento pra grupo/DM/Tripa e identico nos dois casos."""
     key = data.get("key", {})
     remote_jid = key.get("remoteJid", "")
     msg_id = key.get("id", "")
     from_me = key.get("fromMe", False)
 
-    print(f"[webhook] remote_jid={remote_jid} msg_id={msg_id} from_me={from_me} messageType={data.get('messageType')}", flush=True)
+    print(f"[webhook:{origem}] remote_jid={remote_jid} msg_id={msg_id} from_me={from_me} messageType={data.get('messageType')}", flush=True)
 
     if not remote_jid or from_me:
         return jsonify({"ok": True, "skipped": "sem remoteJid ou mensagem própria"})
@@ -3619,11 +3804,11 @@ def webhook():
 
     try:
         if remote_jid == TRIPA_DESIGNER_JID:
-            print("[webhook] grupo Tripa Designer - checando se tem peça pra revisar", flush=True)
+            print(f"[webhook:{origem}] grupo Tripa Designer - checando se tem peça pra revisar", flush=True)
             resultado = processar_revisao_grupo_designer(remote_jid, key, data)
         elif remote_jid in GRUPOS:
             grupo = GRUPOS[remote_jid]
-            print(f"[webhook] grupo reconhecido: {grupo['nome']} (interno={grupo['interno']})", flush=True)
+            print(f"[webhook:{origem}] grupo reconhecido: {grupo['nome']} (interno={grupo['interno']})", flush=True)
             if grupo["interno"]:
                 # Grupo interno (ex: "Correria - Gestão") nunca recebe auto-resposta, mas o
                 # historico continua sendo registrado igual a qualquer outro grupo - Torres
@@ -3637,21 +3822,39 @@ def webhook():
                 return jsonify({"ok": True, "skipped": "grupo interno, sem auto-resposta"})
             resultado = processar_mensagem_grupo(remote_jid, grupo, key, data)
         elif remote_jid.endswith("@g.us"):
-            print(f"[webhook] grupo NÃO reconhecido (não está no dicionário GRUPOS): {remote_jid} - registrando mesmo assim", flush=True)
+            print(f"[webhook:{origem}] grupo NÃO reconhecido (não está no dicionário GRUPOS): {remote_jid} - registrando mesmo assim", flush=True)
             resultado = processar_mensagem_grupo_desconhecido(remote_jid, key, data)
         elif remote_jid.endswith("@s.whatsapp.net") or remote_jid.endswith("@lid"):
-            print(f"[webhook] tratando como DM: {remote_jid}", flush=True)
+            print(f"[webhook:{origem}] tratando como DM: {remote_jid}", flush=True)
             resultado = processar_dm(remote_jid, key, data)
         else:
-            print(f"[webhook] origem não tratada: {remote_jid}", flush=True)
+            print(f"[webhook:{origem}] origem não tratada: {remote_jid}", flush=True)
             return jsonify({"ok": True, "skipped": "origem não tratada"})
     except Exception as e:
         import traceback
         traceback.print_exc()
         return jsonify({"ok": False, "erro": str(e)}), 200
 
-    print(f"[webhook] resultado final: {resultado}", flush=True)
+    print(f"[webhook:{origem}] resultado final: {resultado}", flush=True)
     return jsonify({"ok": True, "resultado": resultado})
+
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    body = request.get_json(silent=True) or {}
+    print(f"[webhook] payload bruto: {json.dumps(body)[:3000]}", flush=True)
+    data = body.get("data", body)
+    return _processar_evento_webhook(data, origem="evolution")
+
+
+@app.route("/webhook-zapi", methods=["POST"])
+def webhook_zapi():
+    body = request.get_json(silent=True) or {}
+    print(f"[webhook-zapi] payload bruto: {json.dumps(body)[:3000]}", flush=True)
+    data = _normalizar_evento_zapi(body)
+    if data is None:
+        return jsonify({"ok": True, "skipped": "evento zapi não é mensagem recebida tratável (status/conexão/eco/tipo não suportado)"})
+    return _processar_evento_webhook(data, origem="zapi")
 
 
 @app.route("/", methods=["GET"])
