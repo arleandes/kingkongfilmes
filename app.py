@@ -429,12 +429,20 @@ def _mensagem_de_hoje(mensagem_criado_em, inicio_dia):
 
 
 def listar_grupos_com_atividade_hoje():
-    """Retorna {grupo_jid: {"nome": ..., "mensagens": [...]}} pra todo grupo que teve pelo
-    menos uma mensagem registrada hoje (horario de Bahia) - grupos de cliente e o grupo Tripa,
-    mas NUNCA os DMs privados de Torres/Luan (esses nao contam como "grupo"). Usado pra
-    responder perguntas do tipo "quais grupos tiveram atividade hoje"."""
+    """Retorna (grupos_ativos, grupos_nao_identificados) - grupos_ativos e
+    {grupo_jid: {"nome": ..., "mensagens": [...]}} pra todo grupo que teve pelo menos uma
+    mensagem registrada hoje (horario de Bahia) - grupos de cliente e o grupo Tripa, mas NUNCA
+    os DMs privados de Torres/Luan (esses nao contam como "grupo"). Usado pra responder
+    perguntas do tipo "quais grupos tiveram atividade hoje"/"alguma novidade?".
+
+    Grupo cujo nome não pôde ser resolvido (ver _nome_parece_id_tecnico) é EXCLUÍDO da lista e
+    só contado em grupos_nao_identificados - nunca deve ir pro prompt do Claude nem aparecer
+    numa resposta, porque o "nome" nesse caso é um identificador técnico cru (bug real já visto
+    em produção, round 18: um ID tipo "557192200583-1634639987@g.us" vazou numa resposta de
+    "alguma novidade?" porque o grupo não estava cadastrado e a busca do nome real falhou)."""
     inicio_dia = horario_bahia_agora().replace(hour=0, minute=0, second=0, microsecond=0)
     grupos_ativos = {}
+    jids_nao_identificados = set()
     if DATABASE_URL:
         try:
             with db_cursor() as cur:
@@ -444,11 +452,16 @@ def listar_grupos_com_atividade_hoje():
                     (inicio_dia,),
                 )
                 for row in cur.fetchall():
+                    if _nome_parece_id_tecnico(row["grupo_nome"]):
+                        # Conta por GRUPO distinto, não por mensagem - senão um grupo com
+                        # várias mensagens hoje infla o número mostrado pro Torres/Luan.
+                        jids_nao_identificados.add(row["grupo_jid"])
+                        continue
                     info = grupos_ativos.setdefault(row["grupo_jid"], {"nome": row["grupo_nome"], "mensagens": []})
                     info["mensagens"].append({
                         "autor": row["autor"], "conteudo": row["conteudo"], "eh_equipe": row["eh_equipe"],
                     })
-            return grupos_ativos
+            return grupos_ativos, len(jids_nao_identificados)
         except Exception as e:
             print(f"[listar_grupos_com_atividade_hoje] erro no banco, usando fallback em memoria: {e}", flush=True)
     with _mensagens_grupo_lock:
@@ -458,8 +471,11 @@ def listar_grupos_com_atividade_hoje():
             mensagens_hoje = [m for m in mensagens if _mensagem_de_hoje(m.get("criado_em", ""), inicio_dia)]
             if mensagens_hoje:
                 nome = GRUPOS.get(grupo_jid, {}).get("nome", grupo_jid)
+                if _nome_parece_id_tecnico(nome):
+                    jids_nao_identificados.add(grupo_jid)
+                    continue
                 grupos_ativos[grupo_jid] = {"nome": nome, "mensagens": mensagens_hoje}
-    return grupos_ativos
+    return grupos_ativos, len(jids_nao_identificados)
 
 
 def listar_grupos_cliente_com_historico(limite_por_grupo=40):
@@ -637,6 +653,25 @@ def already_processed(msg_id: str) -> bool:
 
 def so_digitos(s: str) -> str:
     return re.sub(r"\D", "", s or "")
+
+
+def _nome_parece_id_tecnico(nome: str) -> bool:
+    """Detecta se um "nome de grupo" na verdade é um identificador técnico cru (JID do
+    WhatsApp, formato antigo "numero-timestamp" de grupo, etc) em vez de um nome de verdade -
+    acontece quando o nome do grupo não pôde ser resolvido no momento do registro (ex:
+    Evolution API/Z-API fora do ar) e o código usa o próprio identificador como fallback, só
+    pra nunca perder o registro da mensagem (ver buscar_nome_grupo). Um valor assim NUNCA deve
+    ser mostrado pra Torres/Luan numa resposta - bug real já visto em produção (round 18)."""
+    if not nome:
+        return True
+    nome_limpo = nome.strip()
+    if nome_limpo.endswith("@g.us") or nome_limpo.endswith("@s.whatsapp.net") or nome_limpo.endswith("-group"):
+        return True
+    if re.fullmatch(r"[0-9]+-[0-9]+", nome_limpo):  # formato antigo de grupo: numero-timestamp
+        return True
+    if nome_limpo.isdigit():
+        return True
+    return False
 
 
 def numero_bate(remote_jid: str, numero_completo: str) -> bool:
@@ -836,6 +871,40 @@ def buscar_nome_grupo_evolution(grupo_jid):
     return nome
 
 
+def buscar_nome_grupo_zapi(grupo_jid):
+    """Equivalente a buscar_nome_grupo_evolution, mas consultando a API do Z-API. Mesma
+    politica de cache e mesmo fallback (nunca deixar de registrar a mensagem so porque nao
+    achou o nome bonito do grupo) - a diferenca de nome feio/tecnico e filtrada depois, no
+    codigo que monta a resposta pro cliente (_nome_parece_id_tecnico), nunca aqui."""
+    if grupo_jid in _nomes_grupo_desconhecido_cache:
+        return _nomes_grupo_desconhecido_cache[grupo_jid]
+    nome = grupo_jid
+    try:
+        phone = _jid_para_zapi_phone(grupo_jid)
+        resp = requests.get(
+            _zapi_url(f"groups/{phone}"),
+            headers=_zapi_headers(),
+            timeout=10,
+        )
+        if resp.status_code < 400:
+            info = resp.json()
+            nome = info.get("subject") or grupo_jid
+        else:
+            print(f"[buscar_nome_grupo_zapi] API respondeu {resp.status_code} pro grupo {grupo_jid}, usando JID como nome", flush=True)
+    except Exception as e:
+        print(f"[buscar_nome_grupo_zapi] nao conseguiu buscar nome do grupo {grupo_jid}, usando JID como nome: {e}", flush=True)
+    _nomes_grupo_desconhecido_cache[grupo_jid] = nome
+    return nome
+
+
+def buscar_nome_grupo(grupo_jid):
+    """Dispatcher: busca o nome de um grupo desconhecido no provedor de WhatsApp ativo
+    (Evolution ou Z-API), conforme WHATSAPP_PROVIDER."""
+    if WHATSAPP_PROVIDER == "zapi":
+        return buscar_nome_grupo_zapi(grupo_jid)
+    return buscar_nome_grupo_evolution(grupo_jid)
+
+
 def processar_mensagem_grupo_desconhecido(remote_jid, key, data):
     """Grupo que ainda NAO esta cadastrado no dicionario GRUPOS - nunca recebe
     auto-resposta (nao temos regras de atendimento configuradas pra ele), mas mesmo assim
@@ -847,7 +916,7 @@ def processar_mensagem_grupo_desconhecido(remote_jid, key, data):
         return {"skipped": "grupo não cadastrado, sem conteúdo tratável pra registrar"}
     _participant, eh_equipe = _detectar_participante_grupo(key, data)
     sender_name = data.get("pushName", "cliente")
-    nome_grupo = buscar_nome_grupo_evolution(remote_jid)
+    nome_grupo = buscar_nome_grupo(remote_jid)
     registrar_mensagem_grupo(remote_jid, nome_grupo, sender_name, conteudo_texto, eh_equipe)
     return {"grupo_nao_cadastrado_registrado": nome_grupo}
 
@@ -1587,9 +1656,12 @@ um pedido de lembrete não é um comando pro Tripa, um fato pra guardar não é 
    {lista_grupos}
 
 6) PERGUNTA SOBRE ATIVIDADE GERAL, EM TODOS OS GRUPOS (ex: "algum grupo teve atividade hoje?",
-   "quais grupos tiveram movimento hoje?", "teve alguma coisa acontecendo hoje?") - diferente do
-   tipo 3, aqui {pessoa_nome} NÃO cita um grupo específico - quer um panorama geral de TODOS os
-   grupos de uma vez. Marque "eh_pergunta_atividade_geral" como true nesse caso (e deixe
+   "quais grupos tiveram movimento hoje?", "teve alguma coisa acontecendo hoje?", "alguma
+   novidade?", "tem alguma novidade nos grupos?", "rolou algo importante hoje?", "algum cliente
+   respondeu?", "quem deu retorno hoje?") - diferente do tipo 3, aqui {pessoa_nome} NÃO cita um
+   grupo específico - quer um panorama (geral ou só do que for relevante) de TODOS os grupos de
+   uma vez, usando palavras como "grupos"/"clientes"/"algum"/"alguém"/"quem"/"quais" no plural ou
+   de forma genérica. Marque "eh_pergunta_atividade_geral" como true nesse caso (e deixe
    "grupo_perguntado" vazio, já que não é um grupo específico).
 
 10) PERGUNTA OPERACIONAL SOBRE VÁRIOS CLIENTES DE UMA VEZ, FILTRADA POR UM CRITÉRIO ESPECÍFICO
@@ -2984,27 +3056,51 @@ def tentar_ajustar_briefing_pendente(mensagem_atual, instrucao_texto):
 
 
 SYSTEM_PROMPT_ATIVIDADE_GERAL = """Você é a Cintia, assistente virtual da Correria. {pessoa_nome}
-perguntou quais grupos (de cliente ou o grupo interno Tripa) tiveram atividade hoje, pra ter um
-panorama geral sem precisar abrir grupo por grupo. Abaixo está, pra cada grupo que teve pelo menos
-uma mensagem hoje, um trecho do que foi registrado.
+fez essa pergunta sobre os grupos hoje: "{pergunta}"
 
-Pra CADA grupo listado, escreva um resumo BEM curto (uma frase só) do que rolou lá, com base
-SOMENTE nas mensagens mostradas - sem inventar nada que não esteja ali. Se o grupo só teve
-mensagem da própria equipe (sem nada de cliente), pode dizer isso também.
+Abaixo está, pra CADA grupo (de cliente ou o grupo interno Tripa) que teve pelo menos uma
+mensagem hoje, um trecho do que foi registrado. Essa lista JÁ inclui TODOS os grupos com
+atividade hoje - você não precisa (nem deve) supor que existam outros além desses.
+
+PASSO 1 - Decida o tipo de resposta pela pergunta:
+- Se a pergunta for sobre "novidade"/"algo importante"/"pendência" (não sobre atividade genérica),
+  procure em cada grupo um FATO CONCRETO relevante: cliente fez pedido novo, confirmou algo,
+  alterou informação, respondeu uma pendência, gravação foi confirmada, arte foi aprovada, cliente
+  pediu correção, surgiu tarefa nova, horário mudou, ou qualquer conversa operacional relevante.
+  "Bom dia"/emoji/figurinha/conversa social sozinha NÃO é novidade - ignore grupos que só tiveram
+  isso (não invente um resumo genérico tipo "teve conversa" só pra preencher).
+- Se a pergunta for sobre atividade/movimento em geral (sem pedir só o que é "importante"), aí sim
+  pode listar todo grupo que teve qualquer mensagem, inclusive social, com um resumo de uma frase.
+
+PASSO 2 - Pra cada grupo que você vai incluir na resposta, escreva um resumo CURTO e ESPECÍFICO
+(o fato em si, não uma descrição vaga) baseado SOMENTE nas mensagens mostradas - nunca invente
+nada que não esteja ali. Exemplo do nível de especificidade esperado: "gravação confirmada para
+quarta às 12h" (bom) em vez de "teve conversa sobre horário" (vago demais).
+
+PASSO 3 - Antes de responder, confirme mentalmente: já considerei TODOS os grupos listados
+abaixo (não só o primeiro)? Só incluí grupo com fato relevante de verdade (se a pergunta foi
+sobre novidade)? Usei exatamente o nome de grupo mostrado abaixo, nunca um ID/código técnico?
 
 ATIVIDADE DE HOJE POR GRUPO:
 {blocos_grupos}
 
 Responda SEMPRE E APENAS em JSON válido, sem bloco de código markdown (nada de ```), neste
-formato exato:
-{"resumos": [{"grupo": "nome do grupo", "resumo": "resumo de uma frase do que rolou nesse grupo"}]}
+formato exato - "resumos" pode ficar vazio se, olhando TODOS os grupos, nenhum teve novidade
+relevante de verdade (nesse caso não invente um resumo genérico):
+{"resumos": [{"grupo": "nome do grupo (exatamente como aparece acima)", "resumo": "fato específico e curto do que rolou nesse grupo"}], "houve_so_atividade_social_sem_novidade": true ou false}
 """
 
 
-def responder_atividade_geral_hoje(pessoa_nome):
-    grupos_ativos = listar_grupos_com_atividade_hoje()
+def responder_atividade_geral_hoje(pessoa_nome, pergunta="Alguma novidade nos grupos hoje?"):
+    grupos_ativos, grupos_nao_identificados = listar_grupos_com_atividade_hoje()
+    nota_nao_identificados = (
+        f"\n\n(Encontrei atividade também em {grupos_nao_identificados} grupo(s) que o cadastro "
+        "ainda não identificou pelo nome - preciso corrigir esse vínculo antes de te informar com "
+        "segurança sobre eles.)" if grupos_nao_identificados else ""
+    )
     if not grupos_ativos:
-        return "Hoje ainda não teve nenhuma atividade registrada em nenhum grupo (nem de cliente, nem no Tripa)."
+        base = "Hoje ainda não teve nenhuma atividade registrada em nenhum grupo (nem de cliente, nem no Tripa)."
+        return base + nota_nao_identificados
 
     blocos = []
     for info in grupos_ativos.values():
@@ -3018,23 +3114,30 @@ def responder_atividade_geral_hoje(pessoa_nome):
     prompt_sistema = (
         SYSTEM_PROMPT_ATIVIDADE_GERAL
         .replace("{pessoa_nome}", pessoa_nome)
+        .replace("{pergunta}", pergunta)
         .replace("{blocos_grupos}", blocos_grupos)
     )
     try:
         # Pode juntar ate 15 mensagens de CADA grupo de cliente ativo (as vezes varios de uma
         # vez) - max_tokens maior que o padrao reduz a chance de precisar da tentativa extra
         # automatica.
-        resultado = chamar_claude(prompt_sistema, "Quais grupos tiveram atividade hoje?", max_tokens=4000)
+        resultado = chamar_claude(prompt_sistema, pergunta, max_tokens=4000)
         resumos = resultado.get("resumos") or []
         if not resumos:
+            if resultado.get("houve_so_atividade_social_sem_novidade"):
+                return "Hoje teve movimentação nos grupos, mas nada relevante ou pendente até agora." + nota_nao_identificados
             nomes = ", ".join(info["nome"] for info in grupos_ativos.values())
-            return f"Hoje tiveram atividade: {nomes}."
+            return f"Hoje tiveram atividade: {nomes}." + nota_nao_identificados
         linhas_resposta = [f"• *{r.get('grupo', '')}*: {r.get('resumo', '')}" for r in resumos]
-        return "Hoje tiveram atividade nesses grupos:\n\n" + "\n".join(linhas_resposta)
+        return (
+            f"Hoje tivemos novidade em {len(linhas_resposta)} grupo(s):\n\n"
+            + "\n".join(linhas_resposta)
+            + nota_nao_identificados
+        )
     except Exception as e:
         print(f"[responder_atividade_geral_hoje] erro: {e}", flush=True)
         nomes = ", ".join(info["nome"] for info in grupos_ativos.values())
-        return f"Tive um problema pra resumir, mas hoje tiveram atividade nesses grupos: {nomes}."
+        return f"Tive um problema pra resumir, mas hoje tiveram atividade nesses grupos: {nomes}." + nota_nao_identificados
 
 
 SYSTEM_PROMPT_PERGUNTA_OPERACIONAL = """Você é a Cintia, assistente virtual da Correria. {pessoa_nome}
@@ -3557,7 +3660,7 @@ def processar_dm(remote_jid, key, data):
         responder(f"Anotado! ✅ Vou lembrar: \"{resultado['fato_texto']}\"")
     elif resultado.get("eh_pergunta_atividade_geral"):
         pessoa_nome_geral = "Torres" if pessoa == "torres" else "Luan"
-        responder(responder_atividade_geral_hoje(pessoa_nome_geral))
+        responder(responder_atividade_geral_hoje(pessoa_nome_geral, texto))
     elif resultado.get("eh_pergunta_operacional_geral"):
         # Pergunta operacional que pode envolver varios clientes de uma vez, filtrada por um
         # criterio especifico (ex: "quais clientes confirmaram a gravacao?") - responde SO o
