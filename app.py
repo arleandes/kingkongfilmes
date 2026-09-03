@@ -1801,6 +1801,23 @@ um pedido de lembrete não é um comando pro Tripa, um fato pra guardar não é 
    IMPORTANTE: você NUNCA envia isso direto - só organiza o conteúdo, quem decide se confirma o
    envio é sempre {pessoa_nome} (vai ver um preview antes).
 
+11) DICA DE COMO RESPONDER UM CLIENTE - ENSINANDO UMA RESPOSTA (ex: "o cliente do Terapia Luciano
+   falou: Falta frango a passarinho no dobrado da semana toda / aí eu respondi: Isso vai ser
+   permanente?...", "dica de como responder o Terapia: <texto da resposta>") - {pessoa_nome} ou
+   Luan está contando o que um cliente perguntou/falou e como ELE (a pessoa) respondeu ou quer
+   responder, pra você revisar o português (só corrigir erro de escrita/concordância, sem mudar
+   as palavras nem o tom - a resposta continua sendo a dele, só sem erro), mostrar pronta pra
+   aprovação, e guardar esse atendimento como aprendizado daquele cliente pro futuro. DIFERENTE do
+   tipo 4 (que é conteúdo pra Tripa, o grupo de design) e do tipo 9 (que pede pra você MESMA
+   analisar e montar algo do zero) - aqui a resposta já vem pronta, escrita pela pessoa, seu papel
+   é só revisar e organizar o envio pro grupo do CLIENTE. Marque "eh_dica_resposta_cliente" como
+   true e preencha: "dica_cliente_nome" com o nome do cliente mencionado (o mais parecido possível
+   com um cliente cadastrado); "dica_pergunta_cliente" com o que o cliente perguntou/falou, se foi
+   mencionado (ou string vazia se não veio); "dica_resposta_sugerida" com o texto exato que
+   {pessoa_nome}/Luan escreveu como resposta (só a resposta em si, sem o "eu respondi:" ou
+   similar). Você NÃO corrige nem envia aqui - só identifica a intenção e extrai os textos, quem
+   revisa o português e organiza o envio (com aprovação antes de mandar pro cliente) é outra etapa.
+
 9) COMANDO PRA ANALISAR A CONVERSA DE UM CLIENTE E MONTAR UM BRIEFING PRA TRIPA (ex: "Cintia,
    analise o pedido do Terapia e passa pra Tripa", "veja o que ficou decidido com o Zurca sobre a
    promoção e manda pro designer", "pega tudo que foi resolvido no grupo do Terapia sobre o
@@ -1883,7 +1900,7 @@ pergunta de ambiguidade anterior sua.
 Responda SEMPRE E APENAS em JSON válido, numa única linha por valor, neste formato exato,
 sem usar bloco de código markdown (nada de ```) e sem quebras de linha dentro dos valores. Inclua
 TODAS as chaves sempre, mesmo vazias/false quando não se aplicarem:
-{"eh_pedido_de_lembrete": true ou false, "destinatario_lembrete": "torres, luan ou tripa - quem deve receber o lembrete", "eh_recorrente": true ou false, "recorrencia_dia_mes": "dia do mes (1-31) se for recorrente mensal, ou string vazia", "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_pedido_mudanca_sistema": true ou false, "eh_pergunta_sobre_grupo": true ou false, "grupo_perguntado": "nome do grupo mencionado, ou string vazia", "eh_pergunta_atividade_geral": true ou false, "eh_pergunta_operacional_geral": true ou false, "eh_comando_para_tripa": true ou false, "mensagem_tripa": "texto pronto pra encaminhar pro grupo Tripa, ou string vazia", "tem_cobranca": true ou false, "horario_cobranca_iso": "horario ISO da cobranca, ou string vazia", "pergunta_cobranca": "pergunta curta pra mandar na cobranca, ou string vazia", "eh_comando_briefing_cliente": true ou false, "briefing_cliente_nome": "nome do cliente/grupo mencionado (ou inferido do contexto), ou string vazia", "briefing_assunto": "pista curta do assunto a analisar, ou string vazia", "eh_pergunta_metricool_metricas": true ou false, "metricool_metrica_cliente": "nome do cliente/marca, ou string vazia", "metricool_metrica_rede": "instagram ou facebook", "metricool_metrica_tipo": "seguidores, reels ou posts", "metricool_metrica_dias": 30, "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/3/4/6/8/9/10 acima for verdadeiro"}
+{"eh_pedido_de_lembrete": true ou false, "destinatario_lembrete": "torres, luan ou tripa - quem deve receber o lembrete", "eh_recorrente": true ou false, "recorrencia_dia_mes": "dia do mes (1-31) se for recorrente mensal, ou string vazia", "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_pedido_mudanca_sistema": true ou false, "eh_pergunta_sobre_grupo": true ou false, "grupo_perguntado": "nome do grupo mencionado, ou string vazia", "eh_pergunta_atividade_geral": true ou false, "eh_pergunta_operacional_geral": true ou false, "eh_comando_para_tripa": true ou false, "mensagem_tripa": "texto pronto pra encaminhar pro grupo Tripa, ou string vazia", "tem_cobranca": true ou false, "horario_cobranca_iso": "horario ISO da cobranca, ou string vazia", "pergunta_cobranca": "pergunta curta pra mandar na cobranca, ou string vazia", "eh_comando_briefing_cliente": true ou false, "briefing_cliente_nome": "nome do cliente/grupo mencionado (ou inferido do contexto), ou string vazia", "briefing_assunto": "pista curta do assunto a analisar, ou string vazia", "eh_pergunta_metricool_metricas": true ou false, "metricool_metrica_cliente": "nome do cliente/marca, ou string vazia", "metricool_metrica_rede": "instagram ou facebook", "metricool_metrica_tipo": "seguidores, reels ou posts", "metricool_metrica_dias": 30, "eh_dica_resposta_cliente": true ou false, "dica_cliente_nome": "nome do cliente mencionado, ou string vazia", "dica_pergunta_cliente": "o que o cliente perguntou/falou, ou string vazia", "dica_resposta_sugerida": "o texto da resposta escrito pela pessoa, ou string vazia", "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/3/4/6/8/9/10 acima for verdadeiro"}
 """
 
 
@@ -4203,7 +4220,28 @@ def processar_dm(remote_jid, key, data):
     pendente = _comandos_pendentes.get(pessoa)
     if pendente and (time.time() - pendente["criado_em"]) <= _COMANDO_PENDENTE_TTL:
         confirma = parece_confirmacao(texto)
-        if confirma is True:
+        if confirma is True and pendente.get("eh_resposta_cliente"):
+            # Fecha o loop da "dica de resposta pro cliente" (pedido do Torres): so envia pro
+            # grupo do CLIENTE de verdade depois de aprovacao explicita - grupo de cliente e mais
+            # sensivel que o Tripa (e o proprio publico pagante), nunca envia sem confirmar.
+            jid_destino_resposta = pendente["jid_destino"]
+            texto_resposta_final = pendente["mensagem_tripa"]
+            nome_cliente_resposta = pendente.get("cliente_nome_resposta", "cliente")
+            enviar_texto(jid_destino_resposta, texto_resposta_final)
+            # Guarda no historico do proprio grupo (fica pesquisavel depois, igual qualquer
+            # mensagem da equipe) e como fato estruturado permanente daquele cliente (round 21) -
+            # assim uma pergunta futura tipo "o Terapia ja perguntou sobre isso?" acha essa
+            # resposta, sem precisar que o classificador por-mensagem tenha rodado em cima dela.
+            registrar_mensagem_grupo(jid_destino_resposta, nome_cliente_resposta, "Cintia (equipe)", texto_resposta_final, True)
+            assunto_fato_resposta = pendente.get("pergunta_cliente_resposta") or "Atendimento"
+            registrar_fato_cliente(
+                nome_cliente_resposta, assunto_fato_resposta, texto_resposta_final,
+                grupo_jid=jid_destino_resposta, solicitado_por=pessoa,
+            )
+            _comandos_pendentes.pop(pessoa, None)
+            responder(f"Show, mandei pro {nome_cliente_resposta}! ✅ Já guardei esse atendimento pra lembrar depois.")
+            return {"resposta_cliente_confirmada": True, "cliente": nome_cliente_resposta}
+        elif confirma is True:
             enviar_texto(TRIPA_DESIGNER_JID, pendente["mensagem_tripa"])
             aviso_cobranca = ""
             if pendente.get("tem_cobranca") and pendente.get("horario_cobranca"):
@@ -4492,6 +4530,49 @@ def processar_dm(remote_jid, key, data):
             )
         else:
             responder(metricool_responder_metricas(marca_metrica, rede_metrica, tipo_metrica, dias_metrica))
+    elif resultado.get("eh_dica_resposta_cliente") and resultado.get("dica_resposta_sugerida"):
+        nome_mencionado_dica = resultado.get("dica_cliente_nome") or ""
+        candidatos_dica = identificar_grupos_candidatos(nome_mencionado_dica)
+        if not candidatos_dica:
+            responder(
+                f"Entendi que é uma dica de resposta pro cliente \"{nome_mencionado_dica}\", mas "
+                "não achei esse cliente cadastrado. Pode confirmar o nome certinho?"
+            )
+        elif len(candidatos_dica) > 1:
+            nomes_candidatos_dica = ", ".join(GRUPOS[jid]["nome"] for jid in candidatos_dica)
+            responder(
+                f"Encontrei mais de um cliente relacionado a \"{nome_mencionado_dica}\": "
+                f"{nomes_candidatos_dica}. Pra qual deles é essa resposta?"
+            )
+        else:
+            grupo_jid_dica = candidatos_dica[0]
+            grupo_nome_dica = GRUPOS[grupo_jid_dica]["nome"]
+            pergunta_cliente_dica = resultado.get("dica_pergunta_cliente") or ""
+            resposta_bruta_dica = resultado["dica_resposta_sugerida"]
+            try:
+                resultado_correcao = chamar_claude(SYSTEM_PROMPT_CORRECAO_CONSERVADORA, resposta_bruta_dica)
+                resposta_corrigida_dica = resultado_correcao.get("texto_corrigido") or resposta_bruta_dica
+            except Exception as e:
+                print(f"[dica_resposta_cliente] erro ao corrigir texto, usando o original: {e}", flush=True)
+                resposta_corrigida_dica = resposta_bruta_dica
+            # Igual ao "passa pra Tripa": nunca envia direto pro cliente, sempre mostra a previa e
+            # so manda depois de "sim" - grupo de cliente e mais sensivel ainda que o Tripa, pedido
+            # explicito do Torres pra fechar o loop sozinha so com aprovacao antes.
+            _comandos_pendentes[pessoa] = {
+                "mensagem_tripa": resposta_corrigida_dica,
+                "tem_cobranca": False,
+                "horario_cobranca": None,
+                "pergunta_cobranca": "",
+                "criado_em": time.time(),
+                "eh_resposta_cliente": True,
+                "jid_destino": grupo_jid_dica,
+                "cliente_nome_resposta": grupo_nome_dica,
+                "pergunta_cliente_resposta": pergunta_cliente_dica,
+            }
+            responder(
+                f"Ficou assim pra mandar pro {grupo_nome_dica}:\n\n\"{resposta_corrigida_dica}\"\n\n"
+                "Confirma que posso mandar? (responde \"sim\" ou \"não\")"
+            )
     elif tinha_pendente:
         responder("Combinado, marquei como resolvido! ✅")
     else:
