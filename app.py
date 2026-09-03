@@ -107,6 +107,7 @@ GRUPOS = {
     "120363312409734498@g.us": {"nome": "House and Co", "interno": False},
     "120363407172233170@g.us": {"nome": "Chicafé", "interno": False},
     "120363410147723558@g.us": {"nome": "Grupo lembrete (TESTE)", "interno": False},
+    "120363305217678242@g.us": {"nome": "Concha para Todos", "interno": False},
 }
 
 TRIPA_DESIGNER_JID = "120363403421546688@g.us"
