@@ -1828,6 +1828,22 @@ um pedido de lembrete não é um comando pro Tripa, um fato pra guardar não é 
    número 2", "essa aí mesmo", "manda de novo"), REUTILIZE o conteúdo exato que você já mandou -
    não regenere nem invente uma versão nova, copie literalmente a opção/texto que já foi mostrado.
 
+   CAPACIDADE REAL DE ENXERGAR MÍDIA (nunca negue isso, já confundiu o Torres antes): quando
+   {pessoa_nome} perguntar se você viu/consegue ver algo enviado num grupo (ex: "você viu a arte
+   que mandei pro Tripa?", "você consegue ver a imagem que mandei?"), a resposta correta é
+   confirmar que SIM - você tem capacidade real de analisar (com IA de visão, lendo o texto
+   escrito na peça de verdade, não só a legenda) toda imagem e todo PDF postados tanto aqui no
+   privado quanto no grupo Tripa (Criações/Gravações), e todo áudio é sempre transcrito e lido por
+   você também, nos dois lugares. Isso acontece automaticamente, mesmo sem ninguém perguntar -
+   você já vê, revisa e guarda a informação de cada peça assim que ela chega. A ÚNICA limitação
+   real é vídeo: você não analisa o conteúdo em movimento, só a legenda que vier junto - essa é a
+   única vez que faz sentido dizer que não consegue "ver" algo. NUNCA diga que uma imagem, PDF ou
+   áudio "chega só como anexo, sem conteúdo" ou que você "não consegue abrir" esses tipos de
+   arquivo - isso é falso. Uma coisa é você ANALISAR (sempre acontece); outra é você COMENTAR
+   sozinha no grupo Tripa sobre o resultado (só faz isso quando alguém pede explicitamente, ali ou
+   aqui no privado) - se {pessoa_nome} perguntar aqui no privado, sempre responda com o que você
+   realmente viu/concluiu, mesmo que você não tenha comentado nada no grupo sobre aquela peça.
+
 IMPORTANTE sobre datas/horários: qualquer campo "*_iso" deve conter APENAS a data/hora em formato
 ISO 8601 com fuso -03:00 (exemplo: 2026-08-29T15:00:00-03:00), sem nenhum texto explicativo junto,
 interpretando horários relativos ao "agora" informado acima.
@@ -2043,6 +2059,15 @@ Antes de sinalizar qualquer erro, tenha certeza real de que ele existe.
   "erros" uma lista vazia - não force uma correção só para justificar a revisão. Um falso
   positivo (apontar erro que não existe) é pior que não encontrar nada, porque gera retrabalho e
   desconfiança à toa - na dúvida, seja conservador.
+- CRASE EM NOME DE PRATO/EXPRESSÃO ADVERBIAL "À + ESTILO": expressões como "à milanesa", "à
+  parmegiana", "à moda da casa", "à passarinho" (ex: "frango à passarinho" é um prato consagrado
+  em cardápios brasileiros) usam a crase CORRETAMENTE no padrão "à + jeito/estilo de preparo" -
+  não remova nem "corrija" esse acento grave achando que está errado, a não ser que você tenha
+  certeza real e consiga explicar exatamente por que a crase está mal empregada ali. Já aconteceu
+  de um revisor apontar erroneamente "FRANGO À PASSARINHO" como se devesse perder o acento - isso
+  é o tipo exato de falso positivo que essa regra existe pra evitar. Na dúvida sobre crase
+  específica de nome de prato/expressão de estilo, classifique como INCERTO, nunca aponte como
+  erro confirmado.
 
 ORDEM OBRIGATÓRIA: ler exatamente o que está escrito → ignorar caixa alta/baixa como critério →
 verificar se é nome próprio/marca/termo comercial → comparar com a forma correta → verificar se
@@ -3035,21 +3060,52 @@ def _registrar_log_tripa(remote_jid, data, conteudo):
     )
 
 
+def _transcrever_audio_tripa(key):
+    """Baixa e transcreve um audio postado no grupo Tripa, devolvendo o texto transcrito (ou
+    None se nao deu pra baixar/transcrever). Antes disso, audio no Tripa so virava um
+    "[áudio enviado]" vazio no historico - o Torres pediu explicitamente que ela "veja... audios
+    ... e lembre de tudo", igual ja acontecia nos grupos de cliente (extrair_conteudo_mensagem_grupo
+    ja transcrevia audio ha varias rodadas; aqui no Tripa estava faltando)."""
+    b64 = baixar_midia(key)
+    if not b64:
+        return None
+    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as f:
+        f.write(base64.b64decode(b64))
+        caminho = f.name
+    try:
+        return transcrever_audio(caminho)
+    finally:
+        os.unlink(caminho)
+
+
 def processar_revisao_grupo_designer(remote_jid, key, data):
-    """No grupo Tripa Designer: se alguem postar uma foto/PDF de peca, revisa a ortografia
-    e SEMPRE avisa no grupo o resultado (bateu ou nao bateu). Se a legenda citar o nome de
-    um cliente (ex: "terapia") e tiver um pedido de arte pendente daquele cliente, TAMBEM
-    compara a arte com o pedido original e avisa o resultado dessa comparação também."""
+    """No grupo Tripa Designer: se alguem postar uma foto/PDF de peca com o cliente
+    identificavel (legenda "Arte <cliente>" ou pelo contexto recente), SEMPRE revisa a
+    ortografia e - se houver pedido pendente - compara com o pedido, mas fica em SILÊNCIO no
+    grupo sobre o resultado (nem "tudo certo" nem erro) a nao ser que a legenda em si já seja um
+    pedido explicito de conferencia (ex: "confere isso"/"está certo?" como legenda). A analise e
+    guardada de qualquer forma (historico real + cache da ultima arte), pra poder responder
+    corretamente depois: quando alguem perguntar no privado (Torres/Luan) OU perguntar aqui no
+    proprio grupo Tripa (texto solto tipo "confere isso"/"tá certo?"), ela reconfere e responde
+    de verdade - nunca comenta sozinha sobre a arte de um cliente pra nao gerar ruido/confusao
+    (pedido explicito do Torres, round 22, depois de ela ter se contradito no grupo dizendo "tá
+    errado" e depois "tá tudo certo" sem ninguem ter perguntado de novo)."""
     message_type = data.get("messageType", "")
     tipo_lower = message_type.lower()
     eh_midia_revisavel = "image" in tipo_lower or "document" in tipo_lower
 
     if not eh_midia_revisavel:
-        # Texto/video/audio no Tripa: nao passam pela revisao automatica de imagem/PDF, mas
-        # um texto solto pedindo conferencia (ex: "esta certo?"/"confere isso", sem reenviar
-        # a peça) reconfere a ULTIMA arte enviada aqui - mesmo comportamento que ja existe no
-        # privado de Torres/Luan e agora no grupo Gestao (pedido explicito do Torres).
-        conteudo_log_tripa = _extrair_texto_log_tripa(data, message_type)
+        # Texto/video/audio no Tripa: nao passam pela revisao automatica de imagem/PDF. Audio e
+        # sempre transcrito (round 22) pra virar historico de verdade, nao um placeholder vazio -
+        # o texto transcrito tambem pode ser um pedido de conferencia falado em vez de escrito.
+        if "audio" in tipo_lower or "ptt" in tipo_lower:
+            transcricao = _transcrever_audio_tripa(key)
+            conteudo_log_tripa = f"[áudio] {transcricao}" if transcricao else "[áudio enviado - não consegui transcrever]"
+        else:
+            # Um texto solto pedindo conferencia (ex: "esta certo?"/"confere isso", sem reenviar
+            # a peça) reconfere a ULTIMA arte enviada aqui - mesmo comportamento que ja existe no
+            # privado de Torres/Luan e no grupo Gestao (pedido explicito do Torres).
+            conteudo_log_tripa = _extrair_texto_log_tripa(data, message_type)
         if conteudo_log_tripa:
             _registrar_log_tripa(remote_jid, data, conteudo_log_tripa)
             if _parece_pedido_de_conferencia(conteudo_log_tripa):
@@ -3079,12 +3135,23 @@ def processar_revisao_grupo_designer(remote_jid, key, data):
         print(f"[processar_revisao_grupo_designer] {aviso}", flush=True)
         return {"skipped": aviso}
 
+    # A legenda da PRÓPRIA imagem já pode ser um pedido explícito (ex: legenda "confere isso" ou
+    # "está certo?" junto com a peça) - só nesse caso ela fala no grupo automaticamente; sem isso,
+    # ela analisa e guarda tudo em silêncio, e só fala se alguém perguntar depois (aqui ou no
+    # privado). Isso é o que resolve a contradição que o Torres viu: antes ela sempre anunciava um
+    # veredito sozinha (às vezes errando, como no caso do "Frango à Passarinho"), o que criava a
+    # impressão de estar se contradizendo quando o veredito mudava entre uma chamada e outra.
+    pedido_explicito = _parece_pedido_de_conferencia(caption)
+
+    def _falar_no_grupo(texto):
+        if pedido_explicito:
+            enviar_texto(remote_jid, texto)
+
     try:
         tem_erro, texto_resp, resultado = revisar_peca(imagem_base64, pdf_base64, caption)
     except Exception as e:
-        # Antes disso ficava em silencio total no Tripa (so log interno) quando a chamada
-        # falhava - o designer nao tinha como saber que a peca nao foi revisada. Agora avisa
-        # no proprio grupo, no mesmo padrao usado no privado (revisar_arte_dm).
+        # Erro técnico de verdade (não é um veredito sobre a peça) - isso sim avisa sempre no
+        # grupo, mesmo em silêncio, porque senão o designer pensaria que foi revisada e passou.
         print(f"[processar_revisao_grupo_designer] erro claude: {e}", flush=True)
         enviar_texto(remote_jid, "Tive um problema pra revisar essa peça agora, pode mandar de novo em instantes?")
         prefixo_legenda = f" (legenda: {caption})" if caption else ""
@@ -3113,11 +3180,11 @@ def processar_revisao_grupo_designer(remote_jid, key, data):
             )
             if resultado_comparacao.get("duvida_ambigua"):
                 # Nunca escolhe uma informacao em duvida por conta propria - so pergunta pra
-                # Torres/Luan em privado, sem postar nenhum veredito (certo/errado) no Tripa
-                # enquanto a duvida nao for resolvida por um humano. A ortografia (que ja foi
-                # conferida com certeza) pode falar normalmente no Tripa nesse meio tempo.
+                # Torres/Luan em privado (isso SEMPRE acontece, é uma escalação, não um comentário
+                # solto sobre a arte). A ortografia (já conferida com certeza) só fala no grupo se
+                # havia pedido explícito, igual ao resto.
                 veredito_final = _montar_veredito_curto(pontos_ortografia)
-                enviar_texto(remote_jid, veredito_final)
+                _falar_no_grupo(veredito_final)
                 veredito_final += " (comparação com o pedido ficou em dúvida, perguntei pra equipe em privado)"
                 pergunta = resultado_comparacao.get("pergunta_duvida") or (
                     f"Estou conferindo uma arte do cliente {cliente_nome} e encontrei uma "
@@ -3130,12 +3197,13 @@ def processar_revisao_grupo_designer(remote_jid, key, data):
                 # Padrão curto de resposta: ortografia + conteúdo viram UMA mensagem objetiva
                 # só, em vez de dois avisos separados repetindo "tudo certo".
                 veredito_final = _montar_veredito_curto(pontos_ortografia, resultado_comparacao)
-                enviar_texto(remote_jid, veredito_final)
+                _falar_no_grupo(veredito_final)
                 # Quando o pedido veio do banco (tem tarefa_id), atualiza o status da
                 # tarefa de acordo com o resultado da conferencia: concluida se bateu
                 # tudo certo, ou aguardando correcao se faltou/tem algo errado - assim a
                 # mesma tarefa continua aberta pra receber a proxima rodada corrigida. O
                 # historico da tarefa guarda o texto completo da conferencia (nao o curto).
+                # Isso acontece sempre (é atualização de status interno, não comentário no grupo).
                 if pedido.get("tarefa_id"):
                     novo_status = STATUS_CONCLUIDO if bate else STATUS_AGUARDANDO_CORRECAO
                     adicionar_evento_tarefa(
@@ -3146,19 +3214,20 @@ def processar_revisao_grupo_designer(remote_jid, key, data):
             # Legenda citou um cliente mas nao ha pedido pendente pra comparar - so a
             # ortografia mesmo (ja aconteceu antes, comportamento preservado).
             veredito_final = _montar_veredito_curto(pontos_ortografia)
-            enviar_texto(remote_jid, veredito_final)
+            _falar_no_grupo(veredito_final)
     else:
         veredito_final = _montar_veredito_curto(pontos_ortografia)
-        enviar_texto(remote_jid, veredito_final)
+        _falar_no_grupo(veredito_final)
 
     # Registra no historico o resultado REAL da revisao (nunca mais um placeholder vazio tipo
     # "[imagem enviada]") - assim uma pergunta futura tipo "o que rolou no Tripa hoje"/"você viu
     # os erros" tem conteudo de verdade pra responder, em vez de só enxergar as mensagens de
-    # texto que passaram por perto da imagem.
+    # texto que passaram por perto da imagem. Isso acontece MESMO quando ela ficou em silêncio no
+    # grupo - analisar e guardar sempre, comentar só quando pedido.
     prefixo_legenda = f" (legenda: {caption})" if caption else ""
     _registrar_log_tripa(remote_jid, data, f"[arte revisada{prefixo_legenda}] {veredito_final}")
 
-    return {"resultado": resultado, "cliente_identificado": cliente_nome, "comparacao": resultado_comparacao}
+    return {"resultado": resultado, "cliente_identificado": cliente_nome, "comparacao": resultado_comparacao, "falou_no_grupo": pedido_explicito}
 
 
 def processar_mensagem_grupo_gestao(remote_jid, key, data):
