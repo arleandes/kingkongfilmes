@@ -110,6 +110,7 @@ GRUPOS = {
 }
 
 TRIPA_DESIGNER_JID = "120363403421546688@g.us"
+GESTAO_JID = "120363422131389631@g.us"
 
 # --------------------------------------------------------------------------
 # Banco de dados (memoria de tarefas persistente)
@@ -2103,25 +2104,152 @@ def _montar_veredito_curto(pontos_ortografia, resultado_comparacao=None):
     return "⚠️ Ajustar:\n" + "\n".join(f"- {p}" for p in pontos)
 
 
+def _identificar_cliente_por_historico_recente(chave_historico, limite=6):
+    """Olha as ultimas mensagens de uma conversa (DM, Tripa ou Gestao) procurando a mencao de
+    EXATAMENTE UM cliente conhecido - usado como fallback quando a legenda de uma imagem (ou
+    a propria pergunta de conferencia) nao cita o cliente diretamente. Nunca escolhe sozinho
+    quando ha mais de um candidato (ambiguidade real) - devolve None nesse caso."""
+    historico = buscar_mensagens_recentes_grupo(chave_historico, limite=limite)
+    texto_recente = "\n".join(m["conteudo"] for m in historico)
+    candidatos = identificar_grupos_candidatos(texto_recente)
+    if len(candidatos) == 1:
+        return GRUPOS[candidatos[0]]["nome"]
+    return None
+
+
 def _identificar_cliente_para_conferencia_dm(caption, grupo_jid_dm):
     """Tenta identificar de qual cliente se trata uma arte enviada no PRIVADO de Torres/Luan,
     pra poder rodar a conferencia de conteudo completa (nao so a revisao de ortografia) - o
     mesmo "gatilho arte + cliente" que ja funciona no grupo Tripa. Primeiro tenta pela legenda
     da propria imagem (ex: "Arte Terapia"); se a legenda nao citar nenhum cliente, olha as
     ultimas mensagens dessa conversa privada (ex: Torres perguntou "confere essa arte do
-    Terapia" antes de mandar a foto, ou "analisa essa peça" logo depois de falar do cliente).
-    Nunca escolhe um cliente sozinho quando ha ambiguidade real (mais de um candidato) - nesse
-    caso devolve None e so a revisao de ortografia acontece, sem risco de comparar com o pedido
-    de outro cliente por engano."""
+    Terapia" antes de mandar a foto, ou "analisa essa peça" logo depois de falar do cliente)."""
     cliente_nome = extrair_cliente_da_legenda(caption)
     if cliente_nome:
         return cliente_nome
-    historico_dm = buscar_mensagens_recentes_grupo(grupo_jid_dm, limite=6)
-    texto_recente = "\n".join(m["conteudo"] for m in historico_dm)
-    candidatos = identificar_grupos_candidatos(texto_recente)
-    if len(candidatos) == 1:
-        return GRUPOS[candidatos[0]]["nome"]
-    return None
+    return _identificar_cliente_por_historico_recente(grupo_jid_dm)
+
+
+# --------------------------------------------------------------------------
+# Reconferencia de arte a partir de um pedido em TEXTO solto ("esta certo?",
+# "confere isso" etc), sem precisar reenviar a peca - regra pedida pelo Torres
+# valendo nos 3 lugares onde conferencia de arte pode acontecer: privado de
+# Torres/Luan, grupo Tripa e grupo Correria - Gestao.
+# --------------------------------------------------------------------------
+
+_ultima_arte_por_conversa = {}  # chave (grupo_jid_dm, TRIPA_DESIGNER_JID ou GESTAO_JID) -> info
+_ultima_arte_lock = threading.Lock()
+_ULTIMA_ARTE_TTL = 4 * 60 * 60  # 4h - depois disso, um "esta certo?" solto nao tenta mais
+                                 # reconferir uma arte antiga sozinho (evita reconferir algo
+                                 # que ja nem faz mais sentido no contexto atual da conversa)
+
+_FRASES_PEDIDO_CONFERENCIA = [
+    "esta escrito certo", "esta tudo certo", "confere isso", "confere essa arte",
+    "confere essa", "tem algum erro", "essas informacoes estao corretas",
+    "informacoes estao corretas", "veja se esta certo", "confere com o cliente",
+    "confere pra mim", "confirma se esta certo", "da uma conferida nisso",
+]
+
+
+def _parece_pedido_de_conferencia(texto):
+    """Detecta (por codigo, sem gastar uma chamada de IA so pra isso) se uma mensagem de
+    texto solta esta pedindo pra conferir uma arte/informacao ja enviada - frases como "esta
+    certo?"/"confere isso"/"tem algum erro?" (lista exata pedida pelo Torres). So dispara a
+    reconferencia de verdade se alem disso houver uma arte recente guardada pra essa
+    conversa (ver _buscar_ultima_arte) - isso evita falso positivo numa frase comum do dia a
+    dia que por acaso bate com uma dessas expressoes."""
+    if not texto:
+        return False
+    texto_norm = normalizar_texto(texto)
+    return any(frase in texto_norm for frase in _FRASES_PEDIDO_CONFERENCIA)
+
+
+def _guardar_ultima_arte(chave_conversa, key, message_type, caption, cliente_nome):
+    with _ultima_arte_lock:
+        _ultima_arte_por_conversa[chave_conversa] = {
+            "key": key, "message_type": message_type, "caption": caption or "",
+            "cliente_nome": cliente_nome, "timestamp": time.time(),
+        }
+
+
+def _buscar_ultima_arte(chave_conversa):
+    with _ultima_arte_lock:
+        info = _ultima_arte_por_conversa.get(chave_conversa)
+    if not info or (time.time() - info["timestamp"] > _ULTIMA_ARTE_TTL):
+        return None
+    return info
+
+
+def _conferir_ultima_arte_da_conversa(chave_arte, chave_historico, enviar_resposta_fn, log_prefixo):
+    """Reexecuta a conferencia (ortografia + comparacao com o pedido do cliente) sobre a
+    ULTIMA arte/PDF enviado numa conversa, quando alguem pergunta depois, em texto solto,
+    algo como "esta certo?"/"confere isso" - sem precisar reenviar a peca de novo. Baixa a
+    midia de novo a partir da key guardada (funciona com Evolution ou Z-API, o dispatcher
+    baixar_midia cuida disso). Devolve um dict com o resultado, ou None se nao havia nenhuma
+    arte recente guardada (ou nao foi possivel baixar de novo) - quem chamou decide como
+    reagir nesse caso (avisar, ou so deixar cair pro fluxo normal da mensagem)."""
+    info = _buscar_ultima_arte(chave_arte)
+    if not info:
+        return None
+
+    tipo_lower = info["message_type"].lower()
+    imagem_base64, pdf_base64 = None, None
+    if "image" in tipo_lower:
+        imagem_base64 = baixar_midia(info["key"])
+    elif "document" in tipo_lower:
+        pdf_base64 = baixar_midia(info["key"])
+    if not imagem_base64 and not pdf_base64:
+        print(f"[{log_prefixo}] pedido de reconferência, mas não consegui baixar a arte de novo", flush=True)
+        return None
+
+    caption = info.get("caption") or ""
+    try:
+        _, _, resultado_orto = revisar_peca(imagem_base64, pdf_base64, caption)
+    except Exception as e:
+        print(f"[{log_prefixo}] erro ao reconferir ortografia: {e}", flush=True)
+        return None
+    pontos_ortografia = _formatar_pontos_ortografia(resultado_orto)
+
+    cliente_nome = (
+        info.get("cliente_nome")
+        or extrair_cliente_da_legenda(caption)
+        or _identificar_cliente_por_historico_recente(chave_historico)
+    )
+    resultado_comparacao = None
+    veredito_final = None
+    if cliente_nome:
+        conferencia = _rodar_conferencia_de_conteudo(cliente_nome, imagem_base64, pdf_base64, log_prefixo)
+        if conferencia:
+            pedido, bate, texto_comparacao, resultado_comparacao = (
+                conferencia["pedido"], conferencia["bate"], conferencia["texto_comparacao"], conferencia["resultado"]
+            )
+            if resultado_comparacao.get("duvida_ambigua"):
+                veredito_final = _montar_veredito_curto(pontos_ortografia)
+                enviar_resposta_fn(veredito_final)
+                pergunta = resultado_comparacao.get("pergunta_duvida") or (
+                    f"Estou reconferindo uma arte do cliente {cliente_nome} e encontrei uma "
+                    "informação que não consegui confirmar com segurança no histórico. Pode "
+                    "dar uma olhada?"
+                )
+                for numero in TEAM_NUMBERS:
+                    enviar_texto(numero, f"❓ Dúvida na conferência de conteúdo ({cliente_nome}):\n\n{pergunta}")
+            else:
+                veredito_final = _montar_veredito_curto(pontos_ortografia, resultado_comparacao)
+                enviar_resposta_fn(veredito_final)
+                if pedido.get("tarefa_id"):
+                    novo_status = STATUS_CONCLUIDO if bate else STATUS_AGUARDANDO_CORRECAO
+                    adicionar_evento_tarefa(
+                        pedido["tarefa_id"], "entrega", texto_comparacao,
+                        autor="designer", novo_status=novo_status,
+                    )
+        else:
+            veredito_final = _montar_veredito_curto(pontos_ortografia)
+            enviar_resposta_fn(veredito_final)
+    else:
+        veredito_final = _montar_veredito_curto(pontos_ortografia)
+        enviar_resposta_fn(veredito_final)
+
+    return {"cliente_identificado": cliente_nome, "comparacao": resultado_comparacao, "veredito": veredito_final}
 
 
 def revisar_arte_dm(numero, key, data, message_type, grupo_jid_dm=None):
@@ -2148,6 +2276,10 @@ def revisar_arte_dm(numero, key, data, message_type, grupo_jid_dm=None):
     cliente_nome = None
     if grupo_jid_dm:
         cliente_nome = _identificar_cliente_para_conferencia_dm(caption, grupo_jid_dm)
+        # Guarda essa arte como "a ultima enviada nessa conversa", pra caso Torres/Luan
+        # perguntem depois, em texto solto, "esta certo?"/"confere isso" sem reenviar a peça
+        # - ver _conferir_ultima_arte_da_conversa, chamada la em processar_dm.
+        _guardar_ultima_arte(grupo_jid_dm, key, message_type, caption, cliente_nome)
         if cliente_nome:
             conferencia = _rodar_conferencia_de_conteudo(cliente_nome, imagem_base64, pdf_base64, "revisar_arte_dm")
             if conferencia:
@@ -2599,11 +2731,25 @@ def processar_revisao_grupo_designer(remote_jid, key, data):
     eh_midia_revisavel = "image" in tipo_lower or "document" in tipo_lower
 
     if not eh_midia_revisavel:
-        # Texto/video/audio no Tripa: nao passam por revisao de conteudo, registra do jeito
-        # de sempre (o proprio texto, ou um placeholder simples pra video/audio).
+        # Texto/video/audio no Tripa: nao passam pela revisao automatica de imagem/PDF, mas
+        # um texto solto pedindo conferencia (ex: "esta certo?"/"confere isso", sem reenviar
+        # a peça) reconfere a ULTIMA arte enviada aqui - mesmo comportamento que ja existe no
+        # privado de Torres/Luan e agora no grupo Gestao (pedido explicito do Torres).
         conteudo_log_tripa = _extrair_texto_log_tripa(data, message_type)
         if conteudo_log_tripa:
             _registrar_log_tripa(remote_jid, data, conteudo_log_tripa)
+            if _parece_pedido_de_conferencia(conteudo_log_tripa):
+                resultado_reconf = _conferir_ultima_arte_da_conversa(
+                    remote_jid, remote_jid, lambda t: enviar_texto(remote_jid, t), "processar_revisao_grupo_designer",
+                )
+                if resultado_reconf is None:
+                    enviar_texto(remote_jid, "Não encontrei nenhuma arte enviada recentemente aqui pra conferir. Pode reenviar a peça?")
+                else:
+                    _registrar_log_tripa(remote_jid, data, f"[reconferência solicitada] {resultado_reconf['veredito']}")
+                return {"reconferencia_tripa": resultado_reconf}
+        # Sem isso, uma mensagem de texto que caia aqui (que nao e imagem/documento) nunca
+        # deveria seguir pro trecho de baixo, que so trata midia revisavel de verdade.
+        return {"logged": bool(conteudo_log_tripa)}
 
     imagem_base64, pdf_base64, caption, aviso = extrair_midia_para_revisao(key, data, message_type)
     if aviso:
@@ -2634,8 +2780,17 @@ def processar_revisao_grupo_designer(remote_jid, key, data):
     pontos_ortografia = _formatar_pontos_ortografia(resultado)
 
     resultado_comparacao = None
-    cliente_nome = extrair_cliente_da_legenda(caption)
+    # Fallback pro contexto recente do proprio grupo Tripa quando a legenda nao cita o
+    # cliente diretamente (ex: legenda "está certo?" em vez de "Arte Terapia") - mesma ideia
+    # que ja existia so no privado (_identificar_cliente_para_conferencia_dm); sem isso, uma
+    # arte sem legenda com nome de cliente nunca passava pela comparação de conteúdo, só pela
+    # ortografia - o Torres pediu explicitamente pra não presumir que está tudo certo só
+    # porque a legenda não citou o cliente.
+    cliente_nome = extrair_cliente_da_legenda(caption) or _identificar_cliente_por_historico_recente(remote_jid)
     veredito_final = None
+    # Guarda essa arte como "a ultima enviada nesse grupo", pra caso alguem pergunte depois,
+    # em texto solto, "esta certo?"/"confere isso" sem reenviar a peça (ver bloco acima).
+    _guardar_ultima_arte(remote_jid, key, message_type, caption, cliente_nome)
     if cliente_nome:
         conferencia = _rodar_conferencia_de_conteudo(cliente_nome, imagem_base64, pdf_base64, "processar_revisao_grupo_designer")
         if conferencia:
@@ -2690,6 +2845,46 @@ def processar_revisao_grupo_designer(remote_jid, key, data):
     _registrar_log_tripa(remote_jid, data, f"[arte revisada{prefixo_legenda}] {veredito_final}")
 
     return {"resultado": resultado, "cliente_identificado": cliente_nome, "comparacao": resultado_comparacao}
+
+
+def processar_mensagem_grupo_gestao(remote_jid, key, data):
+    """Grupo interno Correria - Gestão: continua SEM auto-resposta pra mensagens normais
+    (mesma regra de qualquer grupo interno - só guarda histórico), MAS reconhece um pedido
+    explícito de conferência de arte/informação (frases tipo "está certo?"/"confere isso") e
+    reconfere a ÚLTIMA arte enviada nesse grupo contra o pedido do cliente identificado -
+    mesmo comportamento que já existe no Tripa e no privado de Torres/Luan (pedido explícito
+    do Torres pros 3 lugares reconhecerem esse tipo de pergunta). O gatilho automático "Arte +
+    nome do cliente" continua exclusivo do Tripa/privado - aqui só dispara com o pedido
+    explícito em texto."""
+    message_type = data.get("messageType", "")
+    tipo_lower = message_type.lower()
+    conteudo_log, _im, _pdf, _doc = extrair_conteudo_mensagem_grupo(key, data)
+    grupo_nome = GRUPOS.get(remote_jid, {}).get("nome", "Gestão")
+    sender_name = data.get("pushName", "equipe")
+    _participant, eh_equipe = _detectar_participante_grupo(key, data)
+
+    if "image" in tipo_lower or "document" in tipo_lower:
+        message = data.get("message", {})
+        if "image" in tipo_lower:
+            caption = message.get("imageMessage", {}).get("caption", "")
+        else:
+            caption = message.get("documentMessage", {}).get("caption", "")
+        _guardar_ultima_arte(remote_jid, key, message_type, caption, extrair_cliente_da_legenda(caption))
+
+    if conteudo_log:
+        registrar_mensagem_grupo(remote_jid, grupo_nome, sender_name, conteudo_log, eh_equipe)
+
+    if conteudo_log and _parece_pedido_de_conferencia(conteudo_log):
+        resultado = _conferir_ultima_arte_da_conversa(
+            remote_jid, remote_jid, lambda t: enviar_texto(remote_jid, t), "processar_mensagem_grupo_gestao",
+        )
+        if resultado is None:
+            enviar_texto(remote_jid, "Não encontrei nenhuma arte enviada recentemente aqui pra conferir. Pode reenviar a peça?")
+        else:
+            registrar_mensagem_grupo(remote_jid, grupo_nome, "Cintia", f"[reconferência solicitada] {resultado['veredito']}", False)
+        return {"conferencia_gestao": resultado}
+
+    return {"logged": bool(conteudo_log)}
 
 
 SYSTEM_PROMPT_CORRECAO_CONSERVADORA = """Você corrige um texto em português do Brasil que a pessoa
@@ -3548,6 +3743,18 @@ def processar_dm(remote_jid, key, data):
     if modo_correcao:
         return corrigir_texto_dm(numero, modo_correcao, texto_a_corrigir)
 
+    # Pedido de conferência de arte/informação em TEXTO solto ("está certo?", "confere
+    # isso", etc) - reconfere a ÚLTIMA arte enviada nesse privado (imagem/PDF), sem precisar
+    # reenviar a peça. Mesmo gatilho que existe no grupo Tripa e no Gestão (pedido explícito
+    # do Torres). Só dispara de verdade se existir uma arte recente guardada - senão cai pro
+    # fluxo normal (pode ser só uma frase comum do dia a dia sem relação com conferência).
+    if _parece_pedido_de_conferencia(texto):
+        resultado_reconf = _conferir_ultima_arte_da_conversa(
+            grupo_jid_dm, grupo_jid_dm, responder, "processar_dm",
+        )
+        if resultado_reconf is not None:
+            return {"reconferencia_dm": resultado_reconf}
+
     # Se tem um comando "pro Tripa" pendente de confirmacao pra essa pessoa, confere se
     # essa mensagem e um sim/nao curto antes de tratar como mensagem nova.
     pendente = _comandos_pendentes.get(pessoa)
@@ -3937,6 +4144,9 @@ def _processar_evento_webhook(data, origem="evolution"):
         if remote_jid == TRIPA_DESIGNER_JID:
             print(f"[webhook:{origem}] grupo Tripa Designer - checando se tem peça pra revisar", flush=True)
             resultado = processar_revisao_grupo_designer(remote_jid, key, data)
+        elif remote_jid == GESTAO_JID:
+            print(f"[webhook:{origem}] grupo Correria - Gestão - checando se é pedido de conferência", flush=True)
+            resultado = processar_mensagem_grupo_gestao(remote_jid, key, data)
         elif remote_jid in GRUPOS:
             grupo = GRUPOS[remote_jid]
             print(f"[webhook:{origem}] grupo reconhecido: {grupo['nome']} (interno={grupo['interno']})", flush=True)
