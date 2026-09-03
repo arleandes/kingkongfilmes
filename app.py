@@ -2582,27 +2582,40 @@ def _rodar_conferencia_de_conteudo(cliente_nome, imagem_base64, pdf_base64, log_
     return {"pedido": pedido, "bate": bate, "texto_comparacao": texto_comparacao, "resultado": resultado_comparacao}
 
 
+def _registrar_log_tripa(remote_jid, data, conteudo):
+    registrar_mensagem_grupo(
+        remote_jid, GRUPOS.get(remote_jid, {}).get("nome", "Tripa"),
+        data.get("pushName", "equipe"), conteudo, True,
+    )
+
+
 def processar_revisao_grupo_designer(remote_jid, key, data):
     """No grupo Tripa Designer: se alguem postar uma foto/PDF de peca, revisa a ortografia
     e SEMPRE avisa no grupo o resultado (bateu ou nao bateu). Se a legenda citar o nome de
     um cliente (ex: "terapia") e tiver um pedido de arte pendente daquele cliente, TAMBEM
     compara a arte com o pedido original e avisa o resultado dessa comparação também."""
     message_type = data.get("messageType", "")
+    tipo_lower = message_type.lower()
+    eh_midia_revisavel = "image" in tipo_lower or "document" in tipo_lower
 
-    # Registra TUDO que acontece no grupo Tripa (texto, imagem, arquivo, video, audio) no
-    # historico, mesmo mensagens que nao viram revisao de peca - assim da pra perguntar
-    # depois no privado "o que rolou no Tripa" e a Cintia sabe responder.
-    conteudo_log_tripa = _extrair_texto_log_tripa(data, message_type)
-    if conteudo_log_tripa:
-        registrar_mensagem_grupo(
-            remote_jid, GRUPOS.get(remote_jid, {}).get("nome", "Tripa"),
-            data.get("pushName", "equipe"), conteudo_log_tripa, True,
-        )
+    if not eh_midia_revisavel:
+        # Texto/video/audio no Tripa: nao passam por revisao de conteudo, registra do jeito
+        # de sempre (o proprio texto, ou um placeholder simples pra video/audio).
+        conteudo_log_tripa = _extrair_texto_log_tripa(data, message_type)
+        if conteudo_log_tripa:
+            _registrar_log_tripa(remote_jid, data, conteudo_log_tripa)
 
     imagem_base64, pdf_base64, caption, aviso = extrair_midia_para_revisao(key, data, message_type)
     if aviso:
-        # No grupo nao mandamos os avisos de "nao consegui baixar" pra nao gerar ruido -
-        # so logamos e seguimos.
+        # No grupo nao mandamos os avisos de "nao consegui baixar" pra nao gerar ruido - so
+        # logamos e seguimos. Mas o historico precisa registrar que uma midia chegou (com a
+        # legenda, se tiver) - bug real relatado pelo Torres: antes disso, imagem/arte que
+        # falhava ao baixar (ou qualquer imagem, na verdade - ver comentario abaixo) ficava
+        # sem NENHUM conteudo no historico, so um "[imagem enviada]" vazio - perguntada depois
+        # sobre "o que rolou no Tripa hoje", a Cintia so conseguia citar mensagens de TEXTO
+        # (ela mesma descreveu certinho esse sintoma quando o Torres perguntou).
+        prefixo_legenda = f" (legenda: {caption})" if caption else ""
+        _registrar_log_tripa(remote_jid, data, f"[imagem/arquivo enviado{prefixo_legenda} - não consegui baixar pra revisar]")
         print(f"[processar_revisao_grupo_designer] {aviso}", flush=True)
         return {"skipped": aviso}
 
@@ -2614,12 +2627,15 @@ def processar_revisao_grupo_designer(remote_jid, key, data):
         # no proprio grupo, no mesmo padrao usado no privado (revisar_arte_dm).
         print(f"[processar_revisao_grupo_designer] erro claude: {e}", flush=True)
         enviar_texto(remote_jid, "Tive um problema pra revisar essa peça agora, pode mandar de novo em instantes?")
+        prefixo_legenda = f" (legenda: {caption})" if caption else ""
+        _registrar_log_tripa(remote_jid, data, f"[imagem/arte enviada{prefixo_legenda} - erro ao revisar, não sei o que tinha nela]")
         return {"erro_claude": str(e)}
 
     pontos_ortografia = _formatar_pontos_ortografia(resultado)
 
     resultado_comparacao = None
     cliente_nome = extrair_cliente_da_legenda(caption)
+    veredito_final = None
     if cliente_nome:
         conferencia = _rodar_conferencia_de_conteudo(cliente_nome, imagem_base64, pdf_base64, "processar_revisao_grupo_designer")
         if conferencia:
@@ -2631,7 +2647,9 @@ def processar_revisao_grupo_designer(remote_jid, key, data):
                 # Torres/Luan em privado, sem postar nenhum veredito (certo/errado) no Tripa
                 # enquanto a duvida nao for resolvida por um humano. A ortografia (que ja foi
                 # conferida com certeza) pode falar normalmente no Tripa nesse meio tempo.
-                enviar_texto(remote_jid, _montar_veredito_curto(pontos_ortografia))
+                veredito_final = _montar_veredito_curto(pontos_ortografia)
+                enviar_texto(remote_jid, veredito_final)
+                veredito_final += " (comparação com o pedido ficou em dúvida, perguntei pra equipe em privado)"
                 pergunta = resultado_comparacao.get("pergunta_duvida") or (
                     f"Estou conferindo uma arte do cliente {cliente_nome} e encontrei uma "
                     "informação que não consegui confirmar com segurança no histórico. Pode "
@@ -2642,7 +2660,8 @@ def processar_revisao_grupo_designer(remote_jid, key, data):
             else:
                 # Padrão curto de resposta: ortografia + conteúdo viram UMA mensagem objetiva
                 # só, em vez de dois avisos separados repetindo "tudo certo".
-                enviar_texto(remote_jid, _montar_veredito_curto(pontos_ortografia, resultado_comparacao))
+                veredito_final = _montar_veredito_curto(pontos_ortografia, resultado_comparacao)
+                enviar_texto(remote_jid, veredito_final)
                 # Quando o pedido veio do banco (tem tarefa_id), atualiza o status da
                 # tarefa de acordo com o resultado da conferencia: concluida se bateu
                 # tudo certo, ou aguardando correcao se faltou/tem algo errado - assim a
@@ -2657,9 +2676,18 @@ def processar_revisao_grupo_designer(remote_jid, key, data):
         else:
             # Legenda citou um cliente mas nao ha pedido pendente pra comparar - so a
             # ortografia mesmo (ja aconteceu antes, comportamento preservado).
-            enviar_texto(remote_jid, _montar_veredito_curto(pontos_ortografia))
+            veredito_final = _montar_veredito_curto(pontos_ortografia)
+            enviar_texto(remote_jid, veredito_final)
     else:
-        enviar_texto(remote_jid, _montar_veredito_curto(pontos_ortografia))
+        veredito_final = _montar_veredito_curto(pontos_ortografia)
+        enviar_texto(remote_jid, veredito_final)
+
+    # Registra no historico o resultado REAL da revisao (nunca mais um placeholder vazio tipo
+    # "[imagem enviada]") - assim uma pergunta futura tipo "o que rolou no Tripa hoje"/"você viu
+    # os erros" tem conteudo de verdade pra responder, em vez de só enxergar as mensagens de
+    # texto que passaram por perto da imagem.
+    prefixo_legenda = f" (legenda: {caption})" if caption else ""
+    _registrar_log_tripa(remote_jid, data, f"[arte revisada{prefixo_legenda}] {veredito_final}")
 
     return {"resultado": resultado, "cliente_identificado": cliente_nome, "comparacao": resultado_comparacao}
 
