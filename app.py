@@ -239,7 +239,44 @@ def init_db():
                 )
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_mensagens_grupo_jid_criado ON mensagens_grupo (grupo_jid, criado_em)")
-        print(f"[init_db] banco de dados pronto (schema '{DB_SCHEMA}', tabelas tarefas/tarefas_eventos/regras_atendimento/fatos_memoria/mensagens_grupo)", flush=True)
+            # Memoria permanente ESTRUTURADA por cliente+assunto (round 21): diferente de
+            # mensagens_grupo (log bruto de tudo), aqui cada linha e "a informacao valida hoje"
+            # sobre um assunto de um cliente (ex: cliente=Terapia Beach, assunto=Promocao
+            # segunda - prato executivo, valor="R$ 39,90, nao vale pra salmao/moqueca"). Quando
+            # o valor muda, a versao anterior vai pra fatos_cliente_historico em vez de
+            # desaparecer - assim uma pergunta tipo "qual era o valor antes?" ainda pode ser
+            # respondida daqui a meses/anos, sem depender so da janela recente de mensagens.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS fatos_cliente (
+                    id SERIAL PRIMARY KEY,
+                    cliente_nome TEXT NOT NULL,
+                    assunto TEXT NOT NULL,
+                    valor_atual TEXT NOT NULL,
+                    status TEXT,
+                    origem_grupo_jid TEXT,
+                    solicitado_por TEXT,
+                    criado_em TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    atualizado_em TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+            cur.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_fatos_cliente_unico ON fatos_cliente "
+                "(lower(cliente_nome), lower(assunto))"
+            )
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS fatos_cliente_historico (
+                    id SERIAL PRIMARY KEY,
+                    fato_id INTEGER NOT NULL REFERENCES fatos_cliente(id) ON DELETE CASCADE,
+                    valor_anterior TEXT NOT NULL,
+                    status_anterior TEXT,
+                    alterado_por TEXT,
+                    alterado_em TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_fatos_cliente_historico_fato ON fatos_cliente_historico (fato_id)"
+            )
+        print(f"[init_db] banco de dados pronto (schema '{DB_SCHEMA}', tabelas tarefas/tarefas_eventos/regras_atendimento/fatos_memoria/mensagens_grupo/fatos_cliente/fatos_cliente_historico)", flush=True)
     except Exception as e:
         print(f"[init_db] erro ao inicializar banco de dados: {e}", flush=True)
 
@@ -380,11 +417,14 @@ def buscar_mensagens_recentes_grupo(grupo_jid, limite=30):
 def identificar_grupo_mencionado(texto):
     """Procura, no texto de uma mensagem de DM, o nome de algum grupo de cliente
     conhecido (comparacao sem acento/case, por substring) - pra Torres/Luan poderem
-    perguntar sobre um grupo pelo nome sem precisar citar o JID. O grupo Tripa (interno)
-    tambem pode ser perguntado assim, ja que o historico dele tambem fica registrado."""
+    perguntar sobre um grupo pelo nome sem precisar citar o JID. Os grupos internos Tripa
+    e Gestao tambem podem ser perguntados assim (round 21), ja que o historico dos dois
+    fica registrado permanentemente igual aos grupos de cliente."""
     texto_norm = normalizar_texto(texto)
     if "tripa" in texto_norm:
         return TRIPA_DESIGNER_JID
+    if "gestao" in texto_norm:
+        return GESTAO_JID
     melhor = None
     for jid, info in GRUPOS.items():
         if info.get("interno"):
@@ -1250,6 +1290,34 @@ cliente cobre depois. Quando não houver nenhum compromisso concreto (ex: só um
 genérica de recebimento, sem prazo/ação específica prometida), "eh_promessa" é false e
 "texto_promessa" fica vazio.
 
+MEMÓRIA PERMANENTE DO CLIENTE (fatos que precisam sobreviver meses/anos, não só a conversa de
+hoje): você não deve só LER as conversas - deve identificar o que é uma informação DURÁVEL sobre
+esse cliente (não uma mensagem qualquer) e guardar isso de forma organizada, pra alguém poder
+perguntar sobre isso daqui a meses ou anos e você conseguir responder. É durável, por exemplo:
+valor/preço, promoção e suas condições/exceções, data e horário de evento, artista/atração,
+endereço, contato/responsável, texto obrigatório numa arte, aprovação ou reprovação de algo,
+cancelamento, e qualquer decisão ou mudança de estratégia do cliente ou da equipe sobre esse
+cliente. NÃO é durável uma mensagem de rotina sem informação nova (cumprimento, agradecimento,
+"ok", pergunta cujo conteúdo você já vai responder sem gerar decisão nova).
+Quando encontrar algo durável, preencha "fatos_para_memoria" com um ou mais itens, cada um com:
+- "assunto": um rótulo curto e estável pra essa informação (ex: "Promoção segunda - prato
+  executivo", "Endereço do evento de aniversário", "Horário do show de sexta"). Se esse mesmo
+  assunto já aparecer na lista "FATOS JÁ REGISTRADOS" abaixo (quando vier preenchida), REUTILIZE
+  o texto EXATO de lá em vez de inventar uma variação - é assim que uma alteração vira uma nova
+  VERSÃO do mesmo fato, em vez de virar uma linha solta desconectada da anterior.
+- "valor": a informação completa e autocontida, com todo o contexto necessário pra fazer sentido
+  sozinha depois (não guarde só "R$ 39,90" - guarde "Prato executivo, R$ 39,90, vale segundas,
+  quartas e quintas, não vale pra salmão nem moqueca"). Sempre que a mensagem alterar/corrigir uma
+  informação anterior (ex: "muda o horário do Roberto Neves pra 15h30"), o "valor" deve ser a
+  informação NOVA e completa - o valor antigo é preservado automaticamente pelo sistema, você não
+  precisa (nem deve) escrever "antes era X, agora é Y" dentro do valor.
+- "status": livre e curto (ex: "aprovado", "alterado", "pendente", "cancelado", "informativo"),
+  ou string vazia se não fizer sentido pro caso.
+Se nada durável for identificado nessa mensagem, "fatos_para_memoria" é uma lista vazia [] - isso
+é o caso mais comum, não force um fato pra toda mensagem. Nunca invente um fato que não foi
+realmente dito - assim como em qualquer outra parte da sua resposta, só registre o que está
+claramente na mensagem/histórico.
+
 RESUMO INTERNO HUMANIZADO: o campo "resumo_interno" é a mensagem que Torres e Luan vão ler pra
 saber rapidamente o que aconteceu naquele atendimento, então precisa ser natural e fácil de
 entender de primeira - escreva como se estivesse contando pra um colega o que rolou, em 1-2 frases
@@ -1273,6 +1341,7 @@ Responda SEMPRE E APENAS em JSON válido, neste formato exato, sem nenhum texto 
   "eh_promessa": true ou false,
   "texto_promessa": "resumo curto do compromisso assumido com o cliente (com prazo/acao), ou string vazia",
   "descricao_midia": "descrição curta do que a imagem/PDF anexado mostra, ou string vazia se não veio arquivo",
+  "fatos_para_memoria": [{"assunto": "rótulo curto e estável do fato", "valor": "informação completa e autocontida", "status": "aprovado/alterado/pendente/cancelado/informativo, ou vazio"}],
   "resumo_interno": "1-2 frases naturais e humanizadas contando pra equipe o que o cliente queria e o que foi respondido"
 }
 """
@@ -1488,8 +1557,10 @@ def _finalizar_processamento_grupo(chave):
             "qualquer outra instrução se houver conflito):\n"
             + "\n".join(f"- {r}" for r in regras_extras) + "\n\n"
         )
+    bloco_fatos_conhecidos = _bloco_assuntos_conhecidos_cliente(grupo["nome"])
     prompt_usuario = (
         f"{bloco_regras}"
+        f"{bloco_fatos_conhecidos}"
         f"{bloco_historico}"
         f"Nome do cliente: {sender_name}\n"
         f"Grupo: {grupo['nome']}\n"
@@ -1544,6 +1615,22 @@ def _finalizar_processamento_grupo(chave):
             f"[conteúdo d{'a' if tipo_arquivo == 'imagem' else 'o'} {tipo_arquivo} enviad{'a' if tipo_arquivo == 'imagem' else 'o'}]: {descricao_midia}",
             False,
         )
+
+    # Memória permanente do cliente (round 21): grava/atualiza cada fato durável identificado
+    # nessa mensagem (CLIENTE -> ASSUNTO -> VALOR ATUAL), preservando a versão anterior em vez de
+    # sobrescrever - ver registrar_fato_cliente. Isso roda em TODA mensagem de grupo de cliente,
+    # não só nas que geram resposta/pedido de arte, porque uma informação durável pode aparecer
+    # numa mensagem que nem precisava de resposta (ex: cliente só confirmando algo pro Torres).
+    for fato in (resultado.get("fatos_para_memoria") or []):
+        if not isinstance(fato, dict):
+            continue
+        assunto = (fato.get("assunto") or "").strip()
+        valor = (fato.get("valor") or "").strip()
+        if assunto and valor:
+            registrar_fato_cliente(
+                grupo["nome"], assunto, valor, status=fato.get("status"),
+                grupo_jid=remote_jid, solicitado_por=sender_name,
+            )
 
     # Pedido de arte: organiza e encaminha pro grupo Tripa Designer, junto com
     # todas as fotos/PDFs que o cliente mandou nessa leva de mensagens (se tiver).
@@ -2377,6 +2464,233 @@ def extrair_cliente_da_legenda(caption):
     return None
 
 
+# --------------------------------------------------------------------------
+# Memoria permanente estruturada por cliente (round 21) - "REGRA ESPECIAL DE MEMÓRIA
+# PERMANENTE" pedida pelo Torres: a Cintia nao deve so ler os grupos, deve LER -> INTERPRETAR
+# -> ORGANIZAR -> RELACIONAR -> ARMAZENAR -> RECUPERAR, guardando cada fato relevante como
+# CLIENTE -> ASSUNTO -> VALOR ATUAL, preservando toda alteracao anterior em vez de sobrescrever
+# (fatos_cliente_historico), pra poder responder perguntas tipo "o Terapia ja pediu pra tirar o
+# salmao dessa promocao?" mesmo que a conversa original tenha sido meses ou anos atras. Mesmo
+# padrao hibrido banco+memoria das outras tabelas - so que o fallback em memoria NAO sobrevive a
+# reinicio do servico, entao a garantia de "memoria de longo prazo" so vale de verdade com
+# DATABASE_URL configurada.
+_fatos_cliente_memoria = {}  # cliente_norm -> {assunto_norm: {dados do fato + "historico": [...]}}
+_fatos_cliente_lock = threading.Lock()
+
+
+def registrar_fato_cliente(cliente_nome, assunto, valor, status=None, grupo_jid=None, solicitado_por=None):
+    """Registra/atualiza um fato permanente de um cliente. Se ja existir um fato com o MESMO
+    assunto (comparacao sem acento/case) pra esse cliente e o valor mudou, a versao anterior e
+    preservada em fatos_cliente_historico (nunca e apagada) antes de sobrescrever. Se o valor for
+    igual ao que ja estava salvo, nao faz nada (evita historico poluido por reconfirmacoes)."""
+    valor = (valor or "").strip()
+    status = (status or "").strip()
+    if not cliente_nome or not assunto or not valor:
+        return
+    if DATABASE_URL:
+        try:
+            with db_cursor(commit=True) as cur:
+                cur.execute(
+                    "SELECT id, valor_atual, status FROM fatos_cliente "
+                    "WHERE lower(cliente_nome) = lower(%s) AND lower(assunto) = lower(%s)",
+                    (cliente_nome, assunto),
+                )
+                existente = cur.fetchone()
+                if existente:
+                    if (existente["valor_atual"] or "").strip() != valor:
+                        cur.execute(
+                            "INSERT INTO fatos_cliente_historico "
+                            "(fato_id, valor_anterior, status_anterior, alterado_por) VALUES (%s, %s, %s, %s)",
+                            (existente["id"], existente["valor_atual"], existente.get("status"), solicitado_por),
+                        )
+                        cur.execute(
+                            "UPDATE fatos_cliente SET valor_atual=%s, status=%s, origem_grupo_jid=%s, "
+                            "solicitado_por=%s, atualizado_em=now() WHERE id=%s",
+                            (valor, status, grupo_jid, solicitado_por, existente["id"]),
+                        )
+                else:
+                    cur.execute(
+                        "INSERT INTO fatos_cliente (cliente_nome, assunto, valor_atual, status, "
+                        "origem_grupo_jid, solicitado_por) VALUES (%s, %s, %s, %s, %s, %s)",
+                        (cliente_nome, assunto, valor, status, grupo_jid, solicitado_por),
+                    )
+            return
+        except Exception as e:
+            print(f"[registrar_fato_cliente] banco de dados falhou, usando fallback em memoria: {e}", flush=True)
+    chave_cliente = normalizar_texto(cliente_nome)
+    chave_assunto = normalizar_texto(assunto)
+    agora = horario_bahia_agora().isoformat()
+    with _fatos_cliente_lock:
+        fatos_do_cliente = _fatos_cliente_memoria.setdefault(chave_cliente, {})
+        existente = fatos_do_cliente.get(chave_assunto)
+        if existente:
+            if (existente["valor_atual"] or "").strip() != valor:
+                existente.setdefault("historico", []).append({
+                    "valor_anterior": existente["valor_atual"], "status_anterior": existente.get("status"),
+                    "alterado_por": solicitado_por, "alterado_em": existente.get("atualizado_em"),
+                })
+                existente["valor_atual"] = valor
+                existente["status"] = status
+                existente["atualizado_em"] = agora
+        else:
+            fatos_do_cliente[chave_assunto] = {
+                "cliente_nome": cliente_nome, "assunto": assunto, "valor_atual": valor,
+                "status": status, "atualizado_em": agora, "historico": [],
+            }
+
+
+def listar_fatos_cliente(cliente_nome):
+    """Devolve todos os fatos permanentes conhecidos daquele cliente (mais recentemente
+    atualizado primeiro), cada um com sua lista de versoes anteriores (mais antiga primeiro)."""
+    if not cliente_nome:
+        return []
+    if DATABASE_URL:
+        try:
+            with db_cursor() as cur:
+                cur.execute(
+                    "SELECT id, assunto, valor_atual, status, atualizado_em FROM fatos_cliente "
+                    "WHERE lower(cliente_nome) = lower(%s) ORDER BY atualizado_em DESC",
+                    (cliente_nome,),
+                )
+                fatos = cur.fetchall()
+                for fato in fatos:
+                    cur.execute(
+                        "SELECT valor_anterior, status_anterior, alterado_por, alterado_em "
+                        "FROM fatos_cliente_historico WHERE fato_id = %s ORDER BY alterado_em ASC",
+                        (fato["id"],),
+                    )
+                    fato["historico"] = cur.fetchall()
+                return fatos
+        except Exception as e:
+            print(f"[listar_fatos_cliente] erro: {e}", flush=True)
+            return []
+    with _fatos_cliente_lock:
+        fatos = list(_fatos_cliente_memoria.get(normalizar_texto(cliente_nome), {}).values())
+    return sorted(fatos, key=lambda f: f.get("atualizado_em") or "", reverse=True)
+
+
+def _bloco_assuntos_conhecidos_cliente(cliente_nome):
+    """Bloco curto (só rótulo + valor atual) pra injetar no prompt de atendimento, ANTES de
+    processar uma nova mensagem - a ideia é o modelo REUTILIZAR o mesmo texto de "assunto" já
+    usado antes pra mesma coisa (em vez de inventar um rótulo levemente diferente a cada vez),
+    senão o mesmo fato viraria várias linhas soltas sem se relacionar como versões uma da outra."""
+    fatos = listar_fatos_cliente(cliente_nome)
+    if not fatos:
+        return ""
+    linhas = "\n".join(f"- {f['assunto']}: {f['valor_atual']}" for f in fatos)
+    return (
+        "\n\nFATOS JÁ REGISTRADOS NA MEMÓRIA PERMANENTE DESSE CLIENTE (se a mensagem atual for "
+        "sobre uma dessas mesmas coisas, reutilize o MESMO texto de assunto abaixo em "
+        "\"fatos_para_memoria\", em vez de inventar um rótulo novo pra mesma informação - isso "
+        "mantém o histórico organizado como uma única linha que evolui, não várias soltas):\n"
+        + linhas + "\n"
+    )
+
+
+def _bloco_fatos_cliente_completo(cliente_nome):
+    """Bloco completo (valor atual + status + data + TODAS as versões anteriores preservadas)
+    pra injetar na hora de RESPONDER uma pergunta sobre o cliente - é a "memória permanente" de
+    verdade, que sobrevive além da janela recente de mensagens do grupo."""
+    fatos = listar_fatos_cliente(cliente_nome)
+    if not fatos:
+        return ""
+    blocos = []
+    for f in fatos:
+        linha = f"- {f['assunto']}: {f['valor_atual']}"
+        if f.get("status"):
+            linha += f" (status: {f['status']})"
+        quando = _formatar_timestamp_mensagem(f.get("atualizado_em"))
+        if quando:
+            linha += f" [válido desde {quando}]"
+        historico = f.get("historico") or []
+        if historico:
+            linha += "\n  Versões anteriores desse mesmo assunto (mais antiga primeiro):"
+            for h in historico:
+                quando_h = _formatar_timestamp_mensagem(h.get("alterado_em"))
+                quem_h = h.get("alterado_por")
+                linha += f"\n    • {h.get('valor_anterior')}"
+                if quando_h:
+                    linha += f" (válido até {quando_h})"
+                if quem_h:
+                    linha += f" - alteração pedida por {quem_h}"
+        blocos.append(linha)
+    return (
+        "MEMÓRIA PERMANENTE DESSE CLIENTE (fatos estruturados guardados ao longo do tempo, "
+        "independente da janela recente de mensagens abaixo - a primeira linha de cada assunto é "
+        "a informação VÁLIDA HOJE; as \"versões anteriores\" só existem pra responder perguntas "
+        "explicitamente sobre o passado, nunca as apresente como se ainda valessem):\n"
+        + "\n".join(blocos) + "\n\n"
+    )
+
+
+_STOPWORDS_BUSCA_HISTORICO = {
+    "a", "o", "as", "os", "de", "do", "da", "dos", "das", "e", "ou", "que", "um", "uma", "uns",
+    "umas", "em", "no", "na", "nos", "nas", "pra", "para", "por", "com", "sem", "se", "ja", "nao",
+    "sim", "eh", "foi", "ser", "tem", "teve", "tinha", "vai", "vou", "vamos", "isso", "isto",
+    "aquilo", "esse", "essa", "esses", "essas", "este", "esta", "estes", "estas", "aquele",
+    "aquela", "aqueles", "aquelas", "voce", "voces", "eu", "ele", "ela", "eles", "elas", "meu",
+    "minha", "meus", "minhas", "seu", "sua", "seus", "suas", "ao", "aos", "mais", "muito",
+    "algum", "alguma", "algo", "alguem", "quando", "onde", "como", "porque", "porque", "qual",
+    "quais", "quem", "cliente", "grupo", "mensagem", "historico", "pediu", "pedido", "disse",
+    "falou", "confirma", "confirmar", "vez", "cintia", "torres", "luan", "sobre", "essa", "esse",
+    "ainda", "alguma vez", "ja pediu", "vai ter", "tera", "desse", "dessa", "desses", "dessas",
+    "disso", "nesse", "nessa", "nesses", "nessas", "nisso", "naquele", "naquela", "num", "numa",
+}
+
+
+def _extrair_palavras_chave(texto, minimo_letras=3):
+    """Extrai palavras-chave de uma pergunta em português (sem acento, minúsculas, sem
+    pontuação, sem as stopwords mais comuns) pra usar numa busca por ILIKE no histórico
+    completo de um grupo. Não é NLP de verdade - é um filtro simples, mas suficiente pra achar
+    os termos concretos (nomes, produtos, ingredientes, valores) que tendem a se repetir
+    literalmente na conversa original, que é exatamente o tipo de busca que essa memória
+    permanente precisa fazer (ex: perguntar sobre "salmão" acha a mensagem que citou "salmão")."""
+    texto_norm = normalizar_texto(texto)
+    palavras = re.findall(r"[a-z0-9]+", texto_norm)
+    vistas = set()
+    resultado = []
+    for p in palavras:
+        if len(p) < minimo_letras or p in _STOPWORDS_BUSCA_HISTORICO or p in vistas:
+            continue
+        vistas.add(p)
+        resultado.append(p)
+    return resultado
+
+
+def buscar_mensagens_grupo_por_termos(grupo_jid, termos, limite=80):
+    """Busca em TODO o histórico já registrado do grupo (não só na janela recente) por
+    qualquer uma das palavras-chave informadas - é essa função que permite responder uma
+    pergunta sobre algo discutido há semanas/meses/anos, e não só o que está na janela de
+    contexto recente (que por padrão é só as últimas ~30 mensagens). Sem DATABASE_URL
+    configurada, a busca fica limitada à janela do fallback em memória (que não sobrevive a
+    reinício do serviço) - a garantia de longo prazo depende do banco estar configurado."""
+    termos = [t for t in (termos or []) if t]
+    if not termos or not grupo_jid:
+        return []
+    if DATABASE_URL:
+        try:
+            condicoes = " OR ".join(["conteudo ILIKE %s"] * len(termos))
+            params = [grupo_jid] + [f"%{t}%" for t in termos] + [limite]
+            with db_cursor() as cur:
+                cur.execute(
+                    f"SELECT autor, eh_equipe, conteudo, criado_em FROM mensagens_grupo "
+                    f"WHERE grupo_jid = %s AND ({condicoes}) ORDER BY criado_em DESC LIMIT %s",
+                    params,
+                )
+                return list(reversed(cur.fetchall()))
+        except Exception as e:
+            print(f"[buscar_mensagens_grupo_por_termos] erro: {e}", flush=True)
+            return []
+    with _mensagens_grupo_lock:
+        candidatas = list(_mensagens_grupo_memoria.get(grupo_jid, []))
+    termos_norm = [normalizar_texto(t) for t in termos]
+    achadas = [
+        m for m in candidatas
+        if any(t in normalizar_texto(m.get("conteudo", "")) for t in termos_norm)
+    ]
+    return achadas[-limite:]
+
+
 def buscar_pedido_pendente(cliente_nome):
     """Pega o pedido pendente mais antigo daquele cliente - do banco de dados quando
     disponivel (nesse caso a tarefa fica aberta, permitindo varias rodadas de correcao
@@ -3044,29 +3358,46 @@ def _bloco_regras_para_prompt(cliente=None):
 
 SYSTEM_PROMPT_CONSULTA_GRUPO = """Você é a Cintia, assistente virtual da Correria. {pessoa_nome} te
 perguntou algo no privado sobre o grupo de WhatsApp "{grupo_nome}", pra não precisar abrir o grupo
-pra conferir. Hoje é {data_hoje}. Abaixo está o histórico recente de mensagens desse grupo, cada uma
-com a data/hora real em que aconteceu (calculada por código, use isso pra qualquer recorte temporal
-tipo "hoje"/"ontem"/"essa semana"/"mais recente" - nunca calcule ou suponha sozinho).
+pra conferir. Hoje é {data_hoje}. Abaixo está o histórico de mensagens desse grupo, cada uma com a
+data/hora real em que aconteceu (calculada por código, use isso pra qualquer recorte temporal tipo
+"hoje"/"ontem"/"essa semana"/"mais recente" - nunca calcule ou suponha sozinho).
+
+MEMÓRIA PERMANENTE, NÃO SÓ MENSAGENS RECENTES: essa consulta segue o fluxo IDENTIFICAR CLIENTE
+(já feito, é "{grupo_nome}") → PESQUISAR HISTÓRICO → LOCALIZAR INFORMAÇÕES RELACIONADAS →
+VERIFICAR ALTERAÇÕES POSTERIORES → IDENTIFICAR VERSÃO CORRETA → RESPONDER. Por isso você recebe
+TRÊS fontes, que podem se complementar: (1) a MEMÓRIA PERMANENTE DO CLIENTE, se vier preenchida -
+fatos estruturados que já foram organizados e sobrevivem além de qualquer janela de mensagens,
+inclusive de meses ou anos atrás; (2) o HISTÓRICO RECENTE do grupo; (3) MENSAGENS MAIS ANTIGAS
+encontradas por busca de palavra-chave, quando a pergunta parecer se referir a algo que pode ter
+sido dito há mais tempo do que o histórico recente cobre. Nunca responda só com base no histórico
+recente quando a memória permanente ou a busca antiga trouxerem algo relevante - é exatamente pra
+isso que elas existem. Se a pergunta for sobre "já aconteceu alguma vez" / "já pediu antes" /
+"antigamente"/"antes" e nenhuma das três fontes trouxer nada relacionado, diga claramente "Não
+encontrei essa informação no histórico" (ou algo natural equivalente) em vez de inventar ou supor -
+memória permanente não significa inventar lembrança que não está registrada.
 
 NÃO RESPONDA DE IMEDIATO: primeiro entenda exatamente o que foi perguntado (quem perguntou, sobre
-o que, de que período), depois analise o histórico abaixo relacionando as mensagens relevantes
-(inclusive as que vieram antes/depois de uma resposta curta tipo "sim"/"pode"/"fechado" pra saber a
-que ela se refere), só então responda. A informação MAIS RECENTE sempre vale sobre uma mais antiga
-(ex: cliente disse "quarta às 14h" e depois "melhor quinta às 16h" = o estado atual é quinta às
-16h, nunca cite a quarta como se ainda valesse). Entenda confirmação pelo SIGNIFICADO da frase, não
-por uma palavra fixa - "fechado", "pode vir", "combinado", "por mim pode ser" confirmam tanto
-quanto "confirmado" literalmente.
+o que, de que período), depois analise as fontes acima relacionando o que for relevante (inclusive
+mensagens que vieram antes/depois de uma resposta curta tipo "sim"/"pode"/"fechado" pra saber a que
+ela se refere), só então responda. A informação MAIS RECENTE sempre vale sobre uma mais antiga (ex:
+cliente disse "quarta às 14h" e depois "melhor quinta às 16h" = o estado atual é quinta às 16h,
+nunca cite a quarta como se ainda valesse) - mas se {pessoa_nome} perguntar especificamente sobre o
+passado (ex: "qual era o valor antes da alteração?", "o que ficou combinado em agosto?"), responda
+com a informação daquele período, deixando claro que é uma versão antiga e qual é a atual. Entenda
+confirmação pelo SIGNIFICADO da frase, não por uma palavra fixa - "fechado", "pode vir",
+"combinado", "por mim pode ser" confirmam tanto quanto "confirmado" literalmente.
 
-Responda a pergunta de {pessoa_nome} usando SOMENTE essas mensagens (e as regras abaixo, se houver)
-como base. Antes de dizer que não sabe, verifique se já procurou o suficiente no histórico abaixo -
-só diga "não tenho esse registro" depois de realmente ter olhado. Classifique internamente cada
+Responda a pergunta de {pessoa_nome} usando SOMENTE essas fontes (e as regras abaixo, se houver)
+como base. Antes de dizer que não sabe, verifique se já procurou o suficiente - só diga "não tenho
+esse registro" depois de realmente ter olhado nas três fontes. Classifique internamente cada
 informação em FATO CONFIRMADO (está escrito claramente), CONCLUSÃO CONTEXTUAL (dá pra concluir com
 segurança juntando mensagens) ou DÚVIDA (não há evidência suficiente) - nunca apresente uma dúvida
 como se fosse fato; se for dúvida, diga isso com naturalidade (ex: "encontrei uma proposta de
-horário, mas não vi uma confirmação clara do cliente, então considero pendente ainda"). Responda de
-forma natural, objetiva e humanizada, como uma colega de equipe contando o que viu - curta quando a
-pergunta for simples, com o contexto necessário quando a resposta exigir explicação pra não virar
-interpretação errada.
+horário, mas não vi uma confirmação clara do cliente, então considero pendente ainda"). Se encontrar
+informação conflitante entre fontes, apresente a mais recente e mencione a existência da alteração
+quando isso for relevante pra resposta. Responda de forma natural, objetiva e humanizada, como uma
+colega de equipe contando o que viu - curta quando a pergunta for simples, com o contexto necessário
+quando a resposta exigir explicação pra não virar interpretação errada.
 
 PERGUNTA ESPECÍFICA = RESPOSTA ESPECÍFICA (nunca vire um resumo geral): {pessoa_nome} e o outro
 sócio (Torres/Luan) têm o mesmo nível de prioridade e autoridade pra esse tipo de consulta -
@@ -3077,8 +3408,9 @@ perguntado. Só acrescente informação além do que foi pedido quando for ESSEN
 interpretação errada (ex: avisar que o histórico disponível pode estar incompleto) - nunca só por
 completude ou gentileza.
 {contexto_conversa_dm}
-HISTÓRICO DO GRUPO:
+{fatos_cliente}HISTÓRICO RECENTE DO GRUPO:
 {historico}
+{historico_antigo}
 {regras_cliente}
 
 Responda SEMPRE E APENAS em JSON válido, sem bloco de código markdown (nada de ```):
@@ -3088,9 +3420,30 @@ Responda SEMPRE E APENAS em JSON válido, sem bloco de código markdown (nada de
 
 def responder_pergunta_sobre_grupo(pessoa_nome, pergunta, grupo_jid, grupo_nome, contexto_conversa_dm=""):
     mensagens = buscar_mensagens_recentes_grupo(grupo_jid)
-    if not mensagens:
+    bloco_fatos = _bloco_fatos_cliente_completo(grupo_nome)
+
+    # Pesquisa obrigatória na memória (não só nas mensagens recentes): extrai palavras-chave
+    # concretas da própria pergunta e busca em TODO o histórico já registrado do grupo, não só
+    # na janela recente - é isso que permite responder "o Terapia já pediu pra tirar o salmão
+    # dessa promoção?" mesmo que aquela conversa tenha sido há meses.
+    termos_busca = _extrair_palavras_chave(pergunta)
+    mensagens_antigas = buscar_mensagens_grupo_por_termos(grupo_jid, termos_busca, limite=80) if termos_busca else []
+    vistas = {(m.get("autor"), m.get("conteudo"), str(m.get("criado_em"))) for m in mensagens}
+    mensagens_antigas = [
+        m for m in mensagens_antigas
+        if (m.get("autor"), m.get("conteudo"), str(m.get("criado_em"))) not in vistas
+    ]
+
+    if not mensagens and not mensagens_antigas and not bloco_fatos:
         return f"Ainda não tenho nenhum histórico registrado do grupo \"{grupo_nome}\" pra consultar."
-    historico = _montar_historico_com_data(mensagens)
+
+    historico = _montar_historico_com_data(mensagens) if mensagens else "(sem mensagens na janela recente)"
+    bloco_historico_antigo = (
+        "MENSAGENS MAIS ANTIGAS ENCONTRADAS NA BUSCA POR PALAVRA-CHAVE (fora da janela recente "
+        "acima - releve pela DATA de cada uma, podem ser de semanas, meses ou anos atrás, nunca "
+        "trate como se fossem de agora):\n" + _montar_historico_com_data(mensagens_antigas)
+    ) if mensagens_antigas else ""
+
     agora = horario_bahia_agora()
     data_hoje = f"{agora.strftime('%d/%m/%Y')} ({_dia_semana_pt(agora.date())})"
     bloco_contexto_dm = (
@@ -3104,6 +3457,8 @@ def responder_pergunta_sobre_grupo(pessoa_nome, pergunta, grupo_jid, grupo_nome,
         .replace("{grupo_nome}", grupo_nome)
         .replace("{data_hoje}", data_hoje)
         .replace("{historico}", historico)
+        .replace("{historico_antigo}", bloco_historico_antigo)
+        .replace("{fatos_cliente}", bloco_fatos)
         .replace("{contexto_conversa_dm}", bloco_contexto_dm)
         .replace("{regras_cliente}", _bloco_regras_para_prompt(cliente=grupo_nome))
     )
