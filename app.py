@@ -1575,18 +1575,20 @@ def _finalizar_processamento_grupo(chave):
         # automatica (que dobra o custo/tempo dessa chamada quando acontece).
         resultado = chamar_claude(SYSTEM_PROMPT_ATENDIMENTO, prompt_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64, max_tokens=4000)
     except Exception as e:
-        # Antes disso ficava em silencio total (so um print no log) - o cliente nao recebia
-        # nenhuma resposta e a equipe nao ficava sabendo que uma mensagem falhou, parecendo
-        # que o bot simplesmente ignorou. Agora sempre avisa os dois lados.
+        # Rede de seguranca por codigo (pedido EXPLICITO do Torres, round 23, depois de um
+        # timeout real da API do Claude ter feito esse fallback aparecer no grupo de um
+        # cliente): erro tecnico NUNCA pode chegar ao cliente, em hipotese nenhuma - nem uma
+        # mensagem generica de "tive um probleminha, manda de novo". Uma versao anterior desse
+        # codigo mandava esse fallback pro proprio grupo do cliente (pra "avisar os dois
+        # lados") - isso expunha um problema tecnico interno direto pro cliente, o que e
+        # inaceitavel. Agora fica em SILENCIO TOTAL pro cliente quando da erro - so a equipe
+        # (Torres/Luan) e avisada em privado, e a resposta manual fica por conta deles.
         print(f"[_finalizar_processamento_grupo] erro claude: {e}", flush=True)
-        resposta_fallback = "Recebi sua mensagem! Tive um probleminha técnico aqui agora, pode mandar de novo em instantes? 🙏"
-        enviar_texto(remote_jid, resposta_fallback)
-        registrar_mensagem_grupo(remote_jid, grupo["nome"], "Cintia", resposta_fallback, True)
         aviso_erro = (
-            f"🚨 Atenção (erro técnico ao processar mensagem do cliente)\n"
+            f"🚨 Atenção (erro técnico ao processar mensagem do cliente - NADA foi respondido pro cliente)\n"
             f"*{grupo['nome']}* · {sender_name}\n\n"
             f"{conteudo_texto}\n\n"
-            f"Mandei um aviso de fallback pro cliente pedindo pra mandar de novo. Vale conferir manualmente."
+            f"Precisa responder manualmente - o sistema não vai tentar de novo sozinho e não avisou o cliente de nada."
         )
         for numero in TEAM_NUMBERS:
             enviar_texto(numero, aviso_erro)
