@@ -2632,6 +2632,49 @@ def listar_fatos_cliente(cliente_nome):
     return sorted(fatos, key=lambda f: f.get("atualizado_em") or "", reverse=True)
 
 
+def _seed_conhecimento_operacional_clientes():
+    """Carrega, uma unica vez (idempotente - registrar_fato_cliente so grava quando o valor
+    muda de verdade), um conjunto de fatos permanentes por cliente que o Torres trouxe de uma
+    outra memoria/documento (usado pra agendamento de posts no Metricool). Round 23: o Torres
+    pediu explicitamente pra IGNORAR tudo que e mecanica de postagem/Metricool/Drive (formato de
+    imagem, IDs de pasta, horario de post, etc - isso nao e trabalho da Cintia) e aproveitar so
+    as informacoes de "conferencia e inteligencia" - fatos sobre o cliente que ajudam ela a
+    entender contexto e revisar melhor. Cada entrada roda por registrar_fato_cliente, que so cria
+    historico/atualiza se o valor for diferente do que ja esta salvo - rodar isso de novo a cada
+    subida do servico e seguro e nao gera duplicidade nem barulho."""
+    fatos_seed = [
+        ("Terapia", "Funcionamento", "Funciona todos os dias, exceto terça-feira (fechado). "
+         "De quinta a domingo são as noites principais de música ao vivo."),
+        ("Terapia", "Conteúdo de terça-feira", "Às terças só é postada a arte promocional "
+         "rotativa do dia - nesse dia não tem vídeo nem imagem comum, só a promoção."),
+        ("Zurca", "Promoção semanal de cerveja", "Promoção recorrente de segunda a "
+         "quinta-feira, com uma marca de cerveja diferente por dia da semana - a marca de cada "
+         "dia pode mudar; sempre confirmar pela informação mais recente antes de responder qual "
+         "é a marca do dia."),
+        ("Dr. Fellipe Barbosa", "Conteúdo e legendas", "Conteúdo de medicina/cirurgia plástica. "
+         "Legendas sempre precisam passar por revisão antes de publicar. Costuma usar chamada "
+         "de ação pra geração de leads na legenda (ex: \"Comente LIPO\")."),
+        ("House and Co", "Formato de conteúdo", "Loja/varejo (retail). Só posta feed e Reels "
+         "na página principal do Instagram - não usa Stories."),
+        ("House and Co", "Revisão ortográfica", "Cliente pede atenção extra a erro de escrita "
+         "na arte - sinalizar de forma proativa qualquer erro encontrado."),
+        ("Latidos e miados", "Perfil do cliente", "Clínica veterinária. Conteúdo costuma seguir "
+         "datas de conscientização de saúde (Outubro Rosa, Novembro Azul, Natal, Ano Novo, etc.)."),
+        ("Asas do Brasil", "Tipo de conteúdo", "Reels e Stories de shows - todo o conteúdo é "
+         "filmagem do show em si, nunca bastidor."),
+        ("Olegario", "Marca/Instagram", "Instagram @olegarioboteco - também conhecido como "
+         "Mr. Bobo Olegário Steakhouse."),
+    ]
+    try:
+        for cliente_nome, assunto, valor in fatos_seed:
+            registrar_fato_cliente(cliente_nome, assunto, valor, solicitado_por="torres")
+    except Exception as e:
+        print(f"[_seed_conhecimento_operacional_clientes] erro ao carregar fatos iniciais: {e}", flush=True)
+
+
+_seed_conhecimento_operacional_clientes()
+
+
 def _bloco_assuntos_conhecidos_cliente(cliente_nome):
     """Bloco curto (só rótulo + valor atual) pra injetar no prompt de atendimento, ANTES de
     processar uma nova mensagem - a ideia é o modelo REUTILIZAR o mesmo texto de "assunto" já
