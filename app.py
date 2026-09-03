@@ -4558,6 +4558,85 @@ def health():
     return jsonify({"status": "ok", "service": "kingkong-whatsapp-webhook"})
 
 
+@app.route("/status-memoria", methods=["GET"])
+def status_memoria():
+    """Diagnóstico rápido e leve pra Torres conferir pelo navegador se o banco de dados
+    persistente está configurado e se já tem memória acumulada - sem precisar me dar acesso
+    direto ao banco (eu não tenho como conectar nele daqui). Devolve SÓ contagens e datas,
+    nunca o texto de nenhuma mensagem ou fato guardado - não é uma forma de ler conversas, só
+    de confirmar que a memória permanente está de pé e funcionando. Protegido por um token
+    simples opcional (env DEBUG_TOKEN) pra não expor nomes de cliente/volume de mensagens pra
+    qualquer um que ache a URL - se essa env não estiver configurada, o endpoint fica aberto
+    (funciona igual, só sem senha) e avisa isso no log."""
+    token_esperado = os.environ.get("DEBUG_TOKEN")
+    if token_esperado:
+        if request.args.get("token") != token_esperado:
+            return jsonify({"erro": "token inválido ou ausente - acesse com ?token=<o valor de DEBUG_TOKEN configurado no Railway>"}), 403
+    else:
+        print("[status_memoria] aviso: DEBUG_TOKEN não configurada, endpoint aberto sem senha", flush=True)
+
+    if not DATABASE_URL:
+        return jsonify({
+            "banco_de_dados_configurado": False,
+            "aviso": (
+                "DATABASE_URL não está configurada nas variáveis de ambiente do serviço no "
+                "Railway - toda a memória (mensagens de grupo, fatos permanentes de cliente, "
+                "tarefas, regras) está rodando em modo temporário e SE PERDE por completo a "
+                "cada reinício/redeploy do serviço. A garantia de memória de longo prazo não "
+                "existe enquanto isso não for corrigido."
+            ),
+        })
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) AS total, MIN(criado_em) AS mais_antiga, MAX(criado_em) AS mais_recente "
+                "FROM mensagens_grupo"
+            )
+            resumo_mensagens = cur.fetchone()
+            cur.execute(
+                "SELECT grupo_nome, COUNT(*) AS total FROM mensagens_grupo "
+                "GROUP BY grupo_nome ORDER BY total DESC LIMIT 20"
+            )
+            por_grupo = cur.fetchall()
+            cur.execute("SELECT COUNT(*) AS total FROM fatos_cliente")
+            total_fatos = cur.fetchone()["total"]
+            cur.execute("SELECT COUNT(*) AS total FROM fatos_cliente_historico")
+            total_fatos_historico = cur.fetchone()["total"]
+            cur.execute(
+                "SELECT cliente_nome, COUNT(*) AS total FROM fatos_cliente "
+                "GROUP BY cliente_nome ORDER BY total DESC LIMIT 20"
+            )
+            fatos_por_cliente = cur.fetchall()
+            cur.execute("SELECT COUNT(*) AS total FROM tarefas")
+            total_tarefas = cur.fetchone()["total"]
+            cur.execute("SELECT COUNT(*) AS total FROM regras_atendimento")
+            total_regras = cur.fetchone()["total"]
+        return jsonify({
+            "banco_de_dados_configurado": True,
+            "conexao": "ok - as tabelas existem e responderam normalmente",
+            "mensagens_de_grupo_guardadas_para_sempre": {
+                "total": resumo_mensagens["total"],
+                "mensagem_mais_antiga_registrada": str(resumo_mensagens["mais_antiga"]) if resumo_mensagens["mais_antiga"] else None,
+                "mensagem_mais_recente_registrada": str(resumo_mensagens["mais_recente"]) if resumo_mensagens["mais_recente"] else None,
+                "por_grupo_top_20": [{"grupo": r["grupo_nome"], "mensagens": r["total"]} for r in por_grupo],
+            },
+            "memoria_permanente_estruturada_por_cliente": {
+                "total_fatos_ativos": total_fatos,
+                "total_versoes_antigas_preservadas_no_historico": total_fatos_historico,
+                "por_cliente_top_20": [{"cliente": r["cliente_nome"], "fatos_ativos": r["total"]} for r in fatos_por_cliente],
+            },
+            "tarefas_de_designer_no_banco": total_tarefas,
+            "regras_de_atendimento_salvas": total_regras,
+        })
+    except Exception as e:
+        return jsonify({
+            "banco_de_dados_configurado": True,
+            "conexao": "erro",
+            "erro_ao_consultar": str(e),
+            "aviso": "DATABASE_URL está configurada mas a consulta falhou - pode ser banco fora do ar, credencial errada, ou tabela ainda não criada (o init_db roda uma vez quando o serviço sobe).",
+        }), 500
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, threaded=True)
