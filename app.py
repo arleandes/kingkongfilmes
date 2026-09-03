@@ -1002,7 +1002,7 @@ def chamar_claude(system_prompt, conteudo_usuario, imagem_base64=None, pdf_base6
         "https://api.anthropic.com/v1/messages",
         headers=headers,
         json={
-            "model": "claude-opus-5",
+            "model": "claude-sonnet-5",
             "max_tokens": max_tokens,
             "system": system_prompt,
             "messages": [{"role": "user", "content": messages_content}],
@@ -1736,6 +1736,22 @@ um pedido de lembrete não é um comando pro Tripa, um fato pra guardar não é 
    fica também disponível automaticamente nas respostas automáticas daquele grupo, e nunca vaza pra
    outro cliente.
 
+   ATENÇÃO - PEDIDO DE MUDANÇA NO PRÓPRIO SISTEMA (não é um fato simples nem uma regra de
+   atendimento de cliente): às vezes o que {pessoa_nome} está pedindo não é uma informação pra
+   guardar, é uma mudança em COMO VOCÊ MESMA FUNCIONA/SE COMPORTA de forma automática - ex: "não
+   comente mais sozinha no grupo Tripa", "passa a monitorar esse grupo novo", "pare de mandar
+   cobrança de horário", "sempre que acontecer X, faz Y sozinha". Isso é DIFERENTE de "regra:"/
+   "regra pro <cliente>:" (que já é um mecanismo real e funciona de verdade, mudando como você
+   responde automaticamente nos grupos de CLIENTE) e diferente de um fato solto de preferência.
+   Pedidos desse tipo tratam de configuração/comportamento interno do sistema (quais grupos são
+   monitorados, quando você fala sozinha em qual grupo, etc.) que você NÃO tem como simplesmente
+   "aprender" e passar a fazer sozinha - isso só funciona de verdade depois de uma alteração real
+   no código do sistema, feita por quem cuida da parte técnica. Marque "eh_pedido_mudanca_sistema"
+   como true nesses casos (além de "eh_fato_para_lembrar" e "fato_texto" normalmente, pra ficar
+   registrado). NUNCA prometa ou dê a entender que a mudança já está em vigor (nunca diga "vou
+   fazer isso a partir de agora", "não vou mais comentar sozinha") - seja honesta que anotou o
+   pedido, mas que só passa a valer de verdade depois de alguém implementar isso no código.
+
 3) PERGUNTA SOBRE O QUE ACONTECEU EM ALGUM GRUPO DE CLIENTE ESPECÍFICO (ex: "o que rolou no grupo
    do Terapia hoje?", "tem pedido pendente lá na Chicafé?", "o cliente Zurca já respondeu?") -
    {pessoa_nome} quer SABER/CONSULTAR algo sobre a conversa de UM grupo nomeado, SEM pedir nenhuma
@@ -1867,7 +1883,7 @@ pergunta de ambiguidade anterior sua.
 Responda SEMPRE E APENAS em JSON válido, numa única linha por valor, neste formato exato,
 sem usar bloco de código markdown (nada de ```) e sem quebras de linha dentro dos valores. Inclua
 TODAS as chaves sempre, mesmo vazias/false quando não se aplicarem:
-{"eh_pedido_de_lembrete": true ou false, "destinatario_lembrete": "torres, luan ou tripa - quem deve receber o lembrete", "eh_recorrente": true ou false, "recorrencia_dia_mes": "dia do mes (1-31) se for recorrente mensal, ou string vazia", "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_pergunta_sobre_grupo": true ou false, "grupo_perguntado": "nome do grupo mencionado, ou string vazia", "eh_pergunta_atividade_geral": true ou false, "eh_pergunta_operacional_geral": true ou false, "eh_comando_para_tripa": true ou false, "mensagem_tripa": "texto pronto pra encaminhar pro grupo Tripa, ou string vazia", "tem_cobranca": true ou false, "horario_cobranca_iso": "horario ISO da cobranca, ou string vazia", "pergunta_cobranca": "pergunta curta pra mandar na cobranca, ou string vazia", "eh_comando_briefing_cliente": true ou false, "briefing_cliente_nome": "nome do cliente/grupo mencionado (ou inferido do contexto), ou string vazia", "briefing_assunto": "pista curta do assunto a analisar, ou string vazia", "eh_pergunta_metricool_metricas": true ou false, "metricool_metrica_cliente": "nome do cliente/marca, ou string vazia", "metricool_metrica_rede": "instagram ou facebook", "metricool_metrica_tipo": "seguidores, reels ou posts", "metricool_metrica_dias": 30, "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/3/4/6/8/9/10 acima for verdadeiro"}
+{"eh_pedido_de_lembrete": true ou false, "destinatario_lembrete": "torres, luan ou tripa - quem deve receber o lembrete", "eh_recorrente": true ou false, "recorrencia_dia_mes": "dia do mes (1-31) se for recorrente mensal, ou string vazia", "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_pedido_mudanca_sistema": true ou false, "eh_pergunta_sobre_grupo": true ou false, "grupo_perguntado": "nome do grupo mencionado, ou string vazia", "eh_pergunta_atividade_geral": true ou false, "eh_pergunta_operacional_geral": true ou false, "eh_comando_para_tripa": true ou false, "mensagem_tripa": "texto pronto pra encaminhar pro grupo Tripa, ou string vazia", "tem_cobranca": true ou false, "horario_cobranca_iso": "horario ISO da cobranca, ou string vazia", "pergunta_cobranca": "pergunta curta pra mandar na cobranca, ou string vazia", "eh_comando_briefing_cliente": true ou false, "briefing_cliente_nome": "nome do cliente/grupo mencionado (ou inferido do contexto), ou string vazia", "briefing_assunto": "pista curta do assunto a analisar, ou string vazia", "eh_pergunta_metricool_metricas": true ou false, "metricool_metrica_cliente": "nome do cliente/marca, ou string vazia", "metricool_metrica_rede": "instagram ou facebook", "metricool_metrica_tipo": "seguidores, reels ou posts", "metricool_metrica_dias": 30, "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/3/4/6/8/9/10 acima for verdadeiro"}
 """
 
 
@@ -2060,15 +2076,17 @@ Antes de sinalizar qualquer erro, tenha certeza real de que ele existe.
   "erros" uma lista vazia - não force uma correção só para justificar a revisão. Um falso
   positivo (apontar erro que não existe) é pior que não encontrar nada, porque gera retrabalho e
   desconfiança à toa - na dúvida, seja conservador.
-- CRASE EM NOME DE PRATO/EXPRESSÃO ADVERBIAL "À + ESTILO": expressões como "à milanesa", "à
-  parmegiana", "à moda da casa", "à passarinho" (ex: "frango à passarinho" é um prato consagrado
-  em cardápios brasileiros) usam a crase CORRETAMENTE no padrão "à + jeito/estilo de preparo" -
-  não remova nem "corrija" esse acento grave achando que está errado, a não ser que você tenha
-  certeza real e consiga explicar exatamente por que a crase está mal empregada ali. Já aconteceu
-  de um revisor apontar erroneamente "FRANGO À PASSARINHO" como se devesse perder o acento - isso
-  é o tipo exato de falso positivo que essa regra existe pra evitar. Na dúvida sobre crase
-  específica de nome de prato/expressão de estilo, classifique como INCERTO, nunca aponte como
-  erro confirmado.
+- CRASE EM NOME DE PRATO/EXPRESSÃO DE ESTILO DE PREPARO: a crase (à) só existe quando a palavra
+  seguinte é FEMININA (é a fusão da preposição "a" com o artigo feminino "a"). Expressões como
+  "à milanesa", "à parmegiana", "à moda da casa", "à paulista" usam a crase CORRETAMENTE porque
+  "milanesa", "parmegiana", "moda", "paulista" são palavras femininas. MAS "passarinho" e "cavalo"
+  são palavras MASCULINAS ("o passarinho", "o cavalo") - por isso "frango A passarinho" e "bife A
+  cavalo" NUNCA levam crase (SEM acento no "a"); escrever "À passarinho" ou "À cavalo" é o erro,
+  não o contrário. Antes de decidir, sempre confira o gênero da palavra que vem logo depois do
+  "a"/"à": palavra feminina de estilo/moda → leva crase; palavra masculina (como passarinho,
+  cavalo) → nunca leva crase, mesmo sendo nome de prato consagrado. Não generalize "nome de prato
+  sempre leva crase" nem "nunca aponte erro de crase" - o que importa é o gênero da palavra, caso
+  a caso.
 
 ORDEM OBRIGATÓRIA: ler exatamente o que está escrito → ignorar caixa alta/baixa como critério →
 verificar se é nome próprio/marca/termo comercial → comparar com a forma correta → verificar se
@@ -4317,7 +4335,21 @@ def processar_dm(remote_jid, key, data):
             responder(f"Combinado! Vou lembrar {quem_recebe} {quando}: \"{texto_lembrete}\" 👍")
     elif resultado.get("eh_fato_para_lembrar") and resultado.get("fato_texto"):
         salvar_fato(pessoa, resultado["fato_texto"])
-        responder(f"Anotado! ✅ Vou lembrar: \"{resultado['fato_texto']}\"")
+        if resultado.get("eh_pedido_mudanca_sistema"):
+            # Rede de seguranca por codigo: pedido de mudanca de comportamento/configuracao do
+            # sistema (ex: "nao comente sozinha no Tripa", "monitora esse grupo novo") NUNCA pode
+            # soar como se ja estivesse valendo - isso so funciona de verdade depois de uma
+            # alteracao real no codigo, nao com uma "promessa" da IA. Fica so anotado como fato,
+            # pra quem cuida da parte tecnica ver depois, mas a resposta e honesta sobre o limite.
+            responder(
+                f"Entendi o que você quer: \"{resultado['fato_texto']}\" — mas isso é uma mudança "
+                f"de configuração/comportamento do sistema, não uma coisa que eu aprendo sozinha "
+                f"conversando. Anotei aqui pra não se perder, mas só passa a valer de verdade "
+                f"depois que alguém implementar isso no código. Vale confirmar com quem cuida "
+                f"dessa parte técnica pra garantir que foi aplicado. 🛠️"
+            )
+        else:
+            responder(f"Anotado! ✅ Vou lembrar: \"{resultado['fato_texto']}\"")
     elif resultado.get("eh_pergunta_atividade_geral"):
         pessoa_nome_geral = "Torres" if pessoa == "torres" else "Luan"
         responder(responder_atividade_geral_hoje(pessoa_nome_geral, texto))
