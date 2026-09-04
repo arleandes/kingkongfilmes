@@ -2337,6 +2337,32 @@ def _parece_pedido_de_conferencia(texto):
     return any(frase in texto_norm for frase in _FRASES_PEDIDO_CONFERENCIA)
 
 
+def _pedido_explicito_de_revisao_dm(caption, grupo_jid_dm):
+    """Round 24 - pedido explicito do Torres depois dela ter comentado/comparado uma foto
+    qualquer que ele mandou no privado SEM pedir nada (uma imagem solta, sem relação com
+    trabalho, acabou sendo "conferida" contra um pedido pendente só porque o cliente tinha
+    sido citado minutos antes na conversa). Antes, TODA imagem/PDF mandado no privado
+    disparava revisao automatica; agora só revisa de verdade quando existe um pedido
+    EXPLICITO: a legenda da propria midia pede conferencia (ex: "confere isso"), a legenda
+    já nomeia um cliente (convenção "Arte <cliente>" - sinal de que é pra revisar mesmo), ou
+    a ÚLTIMA mensagem de texto que a pessoa mandou nessa conversa (antes dessa mídia) pedia
+    revisão (ex: "vou te mandar uma arte, confere pra mim" e só depois manda a foto). Sem
+    nenhum desses sinais, NUNCA "chuta" que é pedido de revisão - só guarda a mídia (pra caso
+    a pessoa peça a conferência depois, em texto solto) e não comenta o conteúdo."""
+    if _parece_pedido_de_conferencia(caption):
+        return True
+    if extrair_cliente_da_legenda(caption):
+        return True
+    if not grupo_jid_dm:
+        return False
+    # [:-1] descarta a propria midia atual, ja registrada no historico antes de chegar aqui -
+    # queremos a mensagem de texto ANTERIOR a ela, no maximo.
+    anteriores = buscar_mensagens_recentes_grupo(grupo_jid_dm, limite=4)[:-1]
+    if anteriores and _parece_pedido_de_conferencia(anteriores[-1].get("conteudo", "")):
+        return True
+    return False
+
+
 def _guardar_ultima_arte(chave_conversa, key, message_type, caption, cliente_nome):
     with _ultima_arte_lock:
         _ultima_arte_por_conversa[chave_conversa] = {
@@ -2431,7 +2457,26 @@ def revisar_arte_dm(numero, key, data, message_type, grupo_jid_dm=None):
     ex: "confere essa arte do Terapia"), TAMBEM roda a conferencia de conteudo completa contra
     o pedido pendente daquele cliente - o gatilho "arte + cliente" só existe aqui e no grupo
     Tripa, nunca em grupo de cliente nem em qualquer outro grupo (isso é garantido lá em cima,
-    no dispatch do webhook: só TRIPA_DESIGNER_JID e DM chamam essas funções de revisão)."""
+    no dispatch do webhook: só TRIPA_DESIGNER_JID e DM chamam essas funções de revisão).
+
+    Round 24: só roda revisão de verdade quando há um PEDIDO EXPLÍCITO (ver
+    _pedido_explicito_de_revisao_dm) - antes, qualquer imagem/PDF mandado no privado virava
+    revisão automática, e uma foto qualquer (sem relação com trabalho) podia acabar sendo
+    "comparada" contra um pedido pendente só por coincidência de contexto, gerando um
+    comentário confuso sobre uma peça que ninguém pediu pra conferir. Sem pedido explícito, só
+    guarda a mídia (pra uma conferência futura em texto solto) e confirma o recebimento, sem
+    nenhum comentário sobre o conteúdo."""
+    message = data.get("message", {})
+    caption_bruta = (
+        message.get("imageMessage", {}).get("caption", "")
+        if "image" in message_type.lower()
+        else message.get("documentMessage", {}).get("caption", "")
+    )
+    if grupo_jid_dm and not _pedido_explicito_de_revisao_dm(caption_bruta, grupo_jid_dm):
+        _guardar_ultima_arte(grupo_jid_dm, key, message_type, caption_bruta, extrair_cliente_da_legenda(caption_bruta))
+        enviar_texto(numero, "Recebi! Se quiser que eu confira (ortografia ou o pedido do cliente), é só pedir 🙂")
+        return {"skipped": "sem pedido explícito de revisão, só guardado"}
+
     imagem_base64, pdf_base64, caption, aviso = extrair_midia_para_revisao(key, data, message_type)
     if aviso:
         enviar_texto(numero, aviso)
