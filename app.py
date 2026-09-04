@@ -1852,14 +1852,37 @@ um pedido de lembrete não é um comando pro Tripa, um fato pra guardar não é 
    o número de dias do período pedido (ex: "essa semana" = 7, "esse mês"/"último mês" = 30, "hoje" =
    1 - assuma 30 se não ficar claro).
 
+12) COMANDO PRA MARCAR UM PEDIDO/TAREFA PENDENTE DA TRIPA COMO RESOLVIDO (ex: "esse já foi
+   resolvido", "esse card já foi feito por Tripa", "pode marcar como concluído", "esse pedido do
+   Grupo lembrete já foi feito", "já foi resolvido", "pode tirar esse daí") - {pessoa_nome}/Luan
+   está avisando que um PEDIDO DE ARTE que ainda estava em aberto (normalmente porque você MESMA
+   acabou de citar isso, ex: no "📋 Resumo do fim do expediente" ou numa resposta sobre
+   pendências) já foi resolvido/feito/concluído na prática, e o status precisa ser atualizado de
+   verdade. Marque "eh_marcar_pedido_concluido" como true.
+
+   RESOLUÇÃO DE REFERÊNCIA (MUITO IMPORTANTE - NÃO pergunte "qual card?" à toa): mensagens curtas
+   como "esse", "isso", "esse card", "esse pedido", "aquele" quase nunca vêm soltas - elas se
+   referem ao pedido/cliente que VOCÊ MESMA citou nas ÚLTIMAS MENSAGENS acima, ou ao único cliente
+   mencionado na conversa recente. Preencha "pedido_cliente_referencia" com o nome desse cliente,
+   seguindo esta ordem antes de considerar ambíguo: (1) se sua última mensagem listou UM ÚNICO
+   pedido pendente e a mensagem atual claramente fecha aquele assunto (mesmo sem citar nome
+   nenhum), use o cliente daquele único pedido; (2) se {pessoa_nome} já citou o nome do cliente,
+   nessa mensagem ou em alguma das últimas mensagens da conversa sobre o mesmo assunto, use esse
+   nome; (3) se sua última mensagem listou MAIS DE UM pedido e nada na conversa deixa claro qual
+   deles, ou nenhum pedido foi mencionado na conversa recente, aí sim deixe "pedido_cliente_referencia"
+   vazio - só nesse caso (ambiguidade real) o sistema vai perguntar qual é. Nunca escolha um nome
+   ao acaso quando houver mais de uma possibilidade real, mas também nunca deixe vazio só porque o
+   nome não veio explícito na mensagem atual - o objetivo é NUNCA obrigar {pessoa_nome}/Luan a
+   repetir uma informação que a conversa já deixou clara.
+
 5) QUALQUER OUTRA COISA (comentário, resposta a um lembrete anterior, pedido/comando que não se
    encaixa nos tipos acima) - preencha "resposta_conversa" com uma resposta natural e útil, como
    uma colega de equipe responderia no privado. Se os FATOS QUE VOCÊ JÁ SABE (se houver, no topo
    deste prompt) tiverem a resposta pra uma pergunta, use-os pra responder direto. Se for um
    pedido/comando que você ainda não tem como executar automaticamente, confirme que entendeu e que
    vai anotar/repassar, sem inventar que já fez algo que não fez. Nunca deixe esse campo vazio
-   quando nenhum dos tipos 1/2/3/4/6/8/9/10 acima se aplicar - toda mensagem privada precisa de
-   resposta. IMPORTANTE: se {pessoa_nome} estiver claramente selecionando/pedindo de volta algo
+   quando nenhum dos tipos 1/2/3/4/6/8/9/10/11/12 acima se aplicar - toda mensagem privada precisa
+   de resposta. IMPORTANTE: se {pessoa_nome} estiver claramente selecionando/pedindo de volta algo
    que VOCÊ (Cintia) apresentou nas ÚLTIMAS MENSAGENS acima (ex: "gostei da segunda", "manda só a
    número 2", "essa aí mesmo", "manda de novo"), REUTILIZE o conteúdo exato que você já mandou -
    não regenere nem invente uma versão nova, copie literalmente a opção/texto que já foi mostrado.
@@ -1902,7 +1925,7 @@ pergunta de ambiguidade anterior sua.
 Responda SEMPRE E APENAS em JSON válido, numa única linha por valor, neste formato exato,
 sem usar bloco de código markdown (nada de ```) e sem quebras de linha dentro dos valores. Inclua
 TODAS as chaves sempre, mesmo vazias/false quando não se aplicarem:
-{"eh_pedido_de_lembrete": true ou false, "destinatario_lembrete": "torres, luan ou tripa - quem deve receber o lembrete", "eh_recorrente": true ou false, "recorrencia_dia_mes": "dia do mes (1-31) se for recorrente mensal, ou string vazia", "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_pedido_mudanca_sistema": true ou false, "eh_pergunta_sobre_grupo": true ou false, "grupo_perguntado": "nome do grupo mencionado, ou string vazia", "eh_pergunta_atividade_geral": true ou false, "eh_pergunta_operacional_geral": true ou false, "eh_comando_para_tripa": true ou false, "mensagem_tripa": "texto pronto pra encaminhar pro grupo Tripa, ou string vazia", "tem_cobranca": true ou false, "horario_cobranca_iso": "horario ISO da cobranca, ou string vazia", "pergunta_cobranca": "pergunta curta pra mandar na cobranca, ou string vazia", "eh_comando_briefing_cliente": true ou false, "briefing_cliente_nome": "nome do cliente/grupo mencionado (ou inferido do contexto), ou string vazia", "briefing_assunto": "pista curta do assunto a analisar, ou string vazia", "eh_pergunta_metricool_metricas": true ou false, "metricool_metrica_cliente": "nome do cliente/marca, ou string vazia", "metricool_metrica_rede": "instagram ou facebook", "metricool_metrica_tipo": "seguidores, reels ou posts", "metricool_metrica_dias": 30, "eh_dica_resposta_cliente": true ou false, "dica_cliente_nome": "nome do cliente mencionado, ou string vazia", "dica_pergunta_cliente": "o que o cliente perguntou/falou, ou string vazia", "dica_resposta_sugerida": "o texto da resposta escrito pela pessoa, ou string vazia", "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/3/4/6/8/9/10 acima for verdadeiro"}
+{"eh_pedido_de_lembrete": true ou false, "destinatario_lembrete": "torres, luan ou tripa - quem deve receber o lembrete", "eh_recorrente": true ou false, "recorrencia_dia_mes": "dia do mes (1-31) se for recorrente mensal, ou string vazia", "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_pedido_mudanca_sistema": true ou false, "eh_pergunta_sobre_grupo": true ou false, "grupo_perguntado": "nome do grupo mencionado, ou string vazia", "eh_pergunta_atividade_geral": true ou false, "eh_pergunta_operacional_geral": true ou false, "eh_comando_para_tripa": true ou false, "mensagem_tripa": "texto pronto pra encaminhar pro grupo Tripa, ou string vazia", "tem_cobranca": true ou false, "horario_cobranca_iso": "horario ISO da cobranca, ou string vazia", "pergunta_cobranca": "pergunta curta pra mandar na cobranca, ou string vazia", "eh_comando_briefing_cliente": true ou false, "briefing_cliente_nome": "nome do cliente/grupo mencionado (ou inferido do contexto), ou string vazia", "briefing_assunto": "pista curta do assunto a analisar, ou string vazia", "eh_pergunta_metricool_metricas": true ou false, "metricool_metrica_cliente": "nome do cliente/marca, ou string vazia", "metricool_metrica_rede": "instagram ou facebook", "metricool_metrica_tipo": "seguidores, reels ou posts", "metricool_metrica_dias": 30, "eh_dica_resposta_cliente": true ou false, "dica_cliente_nome": "nome do cliente mencionado, ou string vazia", "dica_pergunta_cliente": "o que o cliente perguntou/falou, ou string vazia", "dica_resposta_sugerida": "o texto da resposta escrito pela pessoa, ou string vazia", "eh_marcar_pedido_concluido": true ou false, "pedido_cliente_referencia": "nome do cliente do pedido a marcar como resolvido, resolvido pelo contexto quando vier como referência tipo esse/isso, ou string vazia se genuinamente ambíguo", "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/3/4/6/8/9/10/11/12 acima for verdadeiro"}
 """
 
 
@@ -4618,6 +4641,48 @@ def processar_dm(remote_jid, key, data):
                 f"Ficou assim pra mandar pro {grupo_nome_dica}:\n\n\"{resposta_corrigida_dica}\"\n\n"
                 "Confirma que posso mandar? (responde \"sim\" ou \"não\")"
             )
+    elif resultado.get("eh_marcar_pedido_concluido"):
+        # Torres/Luan avisando que um pedido de arte pendente ja foi resolvido/feito - o caso
+        # mais comum e uma referencia curta ("esse ja foi resolvido") logo depois da propria
+        # Cintia ter citado o pedido (ex: no resumo de fim de expediente), entao o classificador
+        # ja tenta resolver "esse"/"isso" usando o contexto da conversa antes de chegar aqui. So
+        # perguntamos de novo quando sobra mais de uma possibilidade real (round 24 - antes disso
+        # ela ficava perguntando "qual card?" mesmo com um so pedido em aberto, obrigando repetir).
+        nome_pedido_ref = (resultado.get("pedido_cliente_referencia") or "").strip()
+        if not nome_pedido_ref:
+            pendentes_agora = listar_tarefas_pendentes()
+            if not pendentes_agora:
+                responder("Não achei nenhum pedido em aberto agora pra marcar como resolvido - já deve estar tudo certo por aqui.")
+            elif len(pendentes_agora) == 1:
+                tarefa_unica = pendentes_agora[0]
+                adicionar_evento_tarefa(
+                    tarefa_unica["id"], "concluido_manual",
+                    f"Marcado como resolvido manualmente por {pessoa}",
+                    autor=pessoa, novo_status=STATUS_CONCLUIDO,
+                )
+                responder(f"Perfeito. Vou considerar o pedido do {tarefa_unica.get('cliente_nome')} como resolvido. ✅")
+            else:
+                opcoes_pendentes = ", ".join(
+                    f"{t.get('cliente_nome')} ({_STATUS_LEGIVEL.get(t.get('status'), t.get('status'))})"
+                    for t in pendentes_agora
+                )
+                responder(f"Tem mais de um pedido em aberto agora, qual deles: {opcoes_pendentes}?")
+        else:
+            candidatos_pedido = identificar_grupos_candidatos(nome_pedido_ref)
+            nome_cliente_pedido = GRUPOS[candidatos_pedido[0]]["nome"] if len(candidatos_pedido) == 1 else nome_pedido_ref
+            tarefa_referenciada = buscar_tarefa_pendente_por_cliente(nome_cliente_pedido)
+            if not tarefa_referenciada:
+                responder(
+                    f"Não achei nenhum pedido em aberto do {nome_cliente_pedido} pra marcar como "
+                    "resolvido - já deve estar concluído, ou é outro cliente?"
+                )
+            else:
+                adicionar_evento_tarefa(
+                    tarefa_referenciada["id"], "concluido_manual",
+                    f"Marcado como resolvido manualmente por {pessoa}",
+                    autor=pessoa, novo_status=STATUS_CONCLUIDO,
+                )
+                responder(f"Perfeito. Vou considerar o pedido do {nome_cliente_pedido} como resolvido. ✅")
     elif tinha_pendente:
         responder("Combinado, marquei como resolvido! ✅")
     else:
