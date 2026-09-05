@@ -976,7 +976,18 @@ def transcrever_audio(caminho_arquivo):
     return resp.json().get("text", "")
 
 
-def chamar_claude(system_prompt, conteudo_usuario, imagem_base64=None, pdf_base64=None, max_tokens=1500, timeout=30, _tentativa=1):
+def chamar_claude(system_prompt, conteudo_usuario, imagem_base64=None, pdf_base64=None, max_tokens=1500, timeout=30, thinking_budget=0, _tentativa=1):
+    """thinking_budget > 0 liga o raciocínio estendido de verdade (extended thinking da API) -
+    o modelo recebe um orçamento de tokens DEDICADO só pra "pensar antes de responder" (igual o
+    que a gente vê aqui nessa conversa, passo a passo, antes de comprometer uma resposta final),
+    em vez de decidir tudo numa única passada. Round 24, pedido do Torres depois de sentir que o
+    raciocínio da Cintia no WhatsApp era mais raso/rígido que o daqui - o texto do prompt já era
+    bom, o que faltava era dar a ela esse espaço de deliberação de verdade antes de comprometer a
+    resposta. Custa mais tempo/tokens por chamada, por isso só vale a pena ligar nos pontos onde a
+    qualidade do raciocínio importa mais (atendimento automático de cliente, classificador do
+    privado) - não em toda chamada mecânica (correção de texto, formatação de métrica etc).
+    max_tokens continua sendo o orçamento pra RESPOSTA final; o orçamento de pensamento é somado
+    por cima dele, nunca tirado dele (senão sobraria menos espaço pra resposta de verdade)."""
     messages_content = []
     if imagem_base64:
         messages_content.append({
@@ -998,15 +1009,21 @@ def chamar_claude(system_prompt, conteudo_usuario, imagem_base64=None, pdf_base6
     if ANTHROPIC_WORKSPACE_ID:
         headers["anthropic-workspace-id"] = ANTHROPIC_WORKSPACE_ID
 
+    payload = {
+        "model": "claude-sonnet-5",
+        "max_tokens": max_tokens + thinking_budget if thinking_budget else max_tokens,
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": messages_content}],
+    }
+    if thinking_budget:
+        # Extended thinking exige budget_tokens >= 1024 e max_tokens estritamente maior que
+        # o budget - garantido acima somando thinking_budget ao max_tokens do chamador.
+        payload["thinking"] = {"type": "enabled", "budget_tokens": max(thinking_budget, 1024)}
+
     resp = requests.post(
         "https://api.anthropic.com/v1/messages",
         headers=headers,
-        json={
-            "model": "claude-sonnet-5",
-            "max_tokens": max_tokens,
-            "system": system_prompt,
-            "messages": [{"role": "user", "content": messages_content}],
-        },
+        json=payload,
         timeout=timeout,
     )
     if resp.status_code >= 400:
@@ -1026,7 +1043,7 @@ def chamar_claude(system_prompt, conteudo_usuario, imagem_base64=None, pdf_base6
     bloco_texto = next((b for b in blocos if b.get("type") == "text"), None)
     if bloco_texto is None:
         tipos_encontrados = [b.get("type") for b in blocos]
-        print(f"[chamar_claude] ERRO: nenhum bloco 'text' na resposta (tipos encontrados: {tipos_encontrados}, max_tokens={max_tokens})", flush=True)
+        print(f"[chamar_claude] ERRO: nenhum bloco 'text' na resposta (tipos encontrados: {tipos_encontrados}, max_tokens={max_tokens}, thinking_budget={thinking_budget})", flush=True)
         # Bug real de producao (visto nos logs): quando estoura max_tokens ainda dentro do
         # bloco de "thinking" (raciocinio), a resposta nunca chega a ter um bloco de texto -
         # sem essa rede de seguranca isso virava um RuntimeError silencioso, que em varios
@@ -1041,7 +1058,7 @@ def chamar_claude(system_prompt, conteudo_usuario, imagem_base64=None, pdf_base6
             print(f"[chamar_claude] tentando de novo com max_tokens={novo_max_tokens} (era {max_tokens})", flush=True)
             return chamar_claude(
                 system_prompt, conteudo_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64,
-                max_tokens=novo_max_tokens, timeout=timeout, _tentativa=2,
+                max_tokens=novo_max_tokens, timeout=timeout, thinking_budget=thinking_budget, _tentativa=2,
             )
         raise RuntimeError(f"Resposta do Claude sem bloco de texto (tipos: {tipos_encontrados})")
     texto = bloco_texto["text"].strip()
@@ -1572,8 +1589,10 @@ def _finalizar_processamento_grupo(chave):
     try:
         # Esse prompt cresceu bastante ao longo das rodadas (varias secoes de regras) - usa um
         # max_tokens maior que o padrao pra reduzir a chance de precisar da tentativa extra
-        # automatica (que dobra o custo/tempo dessa chamada quando acontece).
-        resultado = chamar_claude(SYSTEM_PROMPT_ATENDIMENTO, prompt_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64, max_tokens=4000)
+        # automatica (que dobra o custo/tempo dessa chamada quando acontece). thinking_budget
+        # liga o raciocinio estendido de verdade (round 24, pedido do Torres) - ESSE e o ponto
+        # de maior impacto pra isso, e a resposta que vai direto pro cliente.
+        resultado = chamar_claude(SYSTEM_PROMPT_ATENDIMENTO, prompt_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64, max_tokens=4000, thinking_budget=2000)
     except Exception as e:
         # Rede de seguranca por codigo (pedido EXPLICITO do Torres, round 23, depois de um
         # timeout real da API do Claude ter feito esse fallback aparecer no grupo de um
@@ -4452,10 +4471,13 @@ def processar_dm(remote_jid, key, data):
         .replace("{lista_grupos}", lista_grupos)
     )
     try:
-        # Classificador de TODA mensagem do privado - cresceu bastante (10 tipos, nota de
+        # Classificador de TODA mensagem do privado - cresceu bastante (12 tipos, nota de
         # continuacao, etc.) e roda em toda mensagem, entao vale max_tokens maior que o padrao
-        # pra reduzir a chance de precisar da tentativa extra automatica.
-        resultado = chamar_claude(prompt_sistema, texto, max_tokens=3200)
+        # pra reduzir a chance de precisar da tentativa extra automatica. thinking_budget liga
+        # o raciocinio estendido (round 24) - e exatamente aqui que Torres/Luan sentiam a
+        # diferenca pro Claude "normal": resolver referencia de contexto, decidir entre tipos
+        # parecidos, etc. se beneficia de um espaco de deliberacao de verdade antes de decidir.
+        resultado = chamar_claude(prompt_sistema, texto, max_tokens=3200, thinking_budget=2000)
     except Exception as e:
         responder("Tive um problema pra processar sua mensagem agora, pode mandar de novo?")
         return {"erro_claude": str(e), "lembrete_anterior_resolvido": tinha_pendente}
