@@ -976,18 +976,28 @@ def transcrever_audio(caminho_arquivo):
     return resp.json().get("text", "")
 
 
-def chamar_claude(system_prompt, conteudo_usuario, imagem_base64=None, pdf_base64=None, max_tokens=1500, timeout=30, thinking_budget=0, _tentativa=1):
+def chamar_claude(system_prompt, conteudo_usuario, imagem_base64=None, pdf_base64=None, max_tokens=1500, timeout=30, thinking_budget=0, _tentativa=1, _sem_thinking_forcado=False):
     """thinking_budget > 0 liga o raciocínio estendido de verdade (extended thinking da API) -
-    o modelo recebe um orçamento de tokens DEDICADO só pra "pensar antes de responder" (igual o
-    que a gente vê aqui nessa conversa, passo a passo, antes de comprometer uma resposta final),
-    em vez de decidir tudo numa única passada. Round 24, pedido do Torres depois de sentir que o
-    raciocínio da Cintia no WhatsApp era mais raso/rígido que o daqui - o texto do prompt já era
-    bom, o que faltava era dar a ela esse espaço de deliberação de verdade antes de comprometer a
-    resposta. Custa mais tempo/tokens por chamada, por isso só vale a pena ligar nos pontos onde a
-    qualidade do raciocínio importa mais (atendimento automático de cliente, classificador do
-    privado) - não em toda chamada mecânica (correção de texto, formatação de métrica etc).
-    max_tokens continua sendo o orçamento pra RESPOSTA final; o orçamento de pensamento é somado
-    por cima dele, nunca tirado dele (senão sobraria menos espaço pra resposta de verdade)."""
+    o modelo recebe um espaço dedicado só pra "pensar antes de responder" (igual o que a gente vê
+    aqui nessa conversa, passo a passo, antes de comprometer uma resposta final), em vez de decidir
+    tudo numa única passada. Round 24, pedido do Torres depois de sentir que o raciocínio da Cintia
+    no WhatsApp era mais raso/rígido que o daqui - o texto do prompt já era bom, o que faltava era
+    dar a ela esse espaço de deliberação de verdade antes de comprometer a resposta. Custa mais
+    tempo/tokens por chamada, por isso só vale a pena ligar nos pontos onde a qualidade do
+    raciocínio importa mais (atendimento automático de cliente, classificador do privado) - não em
+    toda chamada mecânica (correção de texto, formatação de métrica etc).
+    max_tokens continua sendo o orçamento pra RESPOSTA final; o espaço de pensamento é somado por
+    cima dele, nunca tirado dele (senão sobraria menos espaço pra resposta de verdade).
+
+    Round 24 bugfix (visto em produção, log real): esse modelo NÃO aceita o formato antigo de
+    extended thinking ("thinking": {"type": "enabled", "budget_tokens": N}) - a API respondeu
+    400 dizendo pra usar "thinking.type.adaptive" + "output_config.effort" nesse modelo. Corrigido
+    abaixo pro formato novo (budget_tokens vira um nível de esforço: baixo/médio/alto). Além disso,
+    _sem_thinking_forcado é uma rede de segurança: se por qualquer motivo futuro a API voltar a
+    rejeitar o parâmetro de raciocínio (modelo trocado, formato mudando de novo etc.), a chamada
+    NUNCA falha por causa disso sozinha - tenta de novo uma vez sem pedir raciocínio estendido,
+    em vez de deixar cliente/equipe sem resposta nenhuma por causa de um parâmetro que nem é
+    essencial pra resposta em si."""
     messages_content = []
     if imagem_base64:
         messages_content.append({
@@ -1009,16 +1019,24 @@ def chamar_claude(system_prompt, conteudo_usuario, imagem_base64=None, pdf_base6
     if ANTHROPIC_WORKSPACE_ID:
         headers["anthropic-workspace-id"] = ANTHROPIC_WORKSPACE_ID
 
+    thinking_ligado = thinking_budget and not _sem_thinking_forcado
     payload = {
         "model": "claude-sonnet-5",
-        "max_tokens": max_tokens + thinking_budget if thinking_budget else max_tokens,
+        "max_tokens": max_tokens + thinking_budget if thinking_ligado else max_tokens,
         "system": system_prompt,
         "messages": [{"role": "user", "content": messages_content}],
     }
-    if thinking_budget:
-        # Extended thinking exige budget_tokens >= 1024 e max_tokens estritamente maior que
-        # o budget - garantido acima somando thinking_budget ao max_tokens do chamador.
-        payload["thinking"] = {"type": "enabled", "budget_tokens": max(thinking_budget, 1024)}
+    if thinking_ligado:
+        # Esse modelo usa "adaptive" + um nível de esforço (não mais "enabled" + budget_tokens
+        # exato) - mapeia o orçamento em tokens que o chamador pediu pra um nível de esforço.
+        if thinking_budget < 1500:
+            esforco = "low"
+        elif thinking_budget < 4000:
+            esforco = "medium"
+        else:
+            esforco = "high"
+        payload["thinking"] = {"type": "adaptive"}
+        payload["output_config"] = {"effort": esforco}
 
     resp = requests.post(
         "https://api.anthropic.com/v1/messages",
@@ -1028,6 +1046,18 @@ def chamar_claude(system_prompt, conteudo_usuario, imagem_base64=None, pdf_base6
     )
     if resp.status_code >= 400:
         print(f"[chamar_claude] ERRO {resp.status_code}: {resp.text[:1000]}", flush=True)
+        # Rede de seguranca: se o erro foi especificamente sobre o parametro de raciocinio
+        # estendido (formato incompativel com o modelo, por exemplo) e ainda nao tentamos sem
+        # ele, tenta de novo IMEDIATAMENTE sem thinking - a resposta em si nao depende disso,
+        # entao um parametro extra rejeitado pela API nunca deveria derrubar a chamada inteira
+        # e deixar cliente/equipe sem resposta nenhuma.
+        if thinking_ligado and "thinking" in resp.text.lower() and _tentativa == 1:
+            print(f"[chamar_claude] tentando de novo sem raciocinio estendido (parametro rejeitado pela API)", flush=True)
+            return chamar_claude(
+                system_prompt, conteudo_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64,
+                max_tokens=max_tokens, timeout=timeout, thinking_budget=thinking_budget,
+                _tentativa=2, _sem_thinking_forcado=True,
+            )
         raise RuntimeError(f"Claude API {resp.status_code}: {resp.text[:500]}")
     resp_json = resp.json()
     stop_reason = resp_json.get("stop_reason")
