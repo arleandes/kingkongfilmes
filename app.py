@@ -1754,13 +1754,20 @@ um pedido de lembrete não é um comando pro Tripa, um fato pra guardar não é 
    fazer isso a partir de agora", "não vou mais comentar sozinha") - seja honesta que anotou o
    pedido, mas que só passa a valer de verdade depois de alguém implementar isso no código.
 
-3) PERGUNTA SOBRE O QUE ACONTECEU EM ALGUM GRUPO DE CLIENTE ESPECÍFICO (ex: "o que rolou no grupo
-   do Terapia hoje?", "tem pedido pendente lá na Chicafé?", "o cliente Zurca já respondeu?") -
+3) PERGUNTA SOBRE O QUE ACONTECEU EM ALGUM GRUPO ESPECÍFICO, DE CLIENTE OU INTERNO (ex: "o que
+   rolou no grupo do Terapia hoje?", "tem pedido pendente lá na Chicafé?", "o cliente Zurca já
+   respondeu?", "teve atividade no grupo da Tripa?", "o que rolou na Gestão hoje?") -
    {pessoa_nome} quer SABER/CONSULTAR algo sobre a conversa de UM grupo nomeado, SEM pedir nenhuma
    ação nova (isso é diferente do tipo 4: se a mensagem pede pra REPASSAR/ENCAMINHAR algo pro Tripa,
    mesmo que cite o nome de um cliente, é tipo 4, não tipo 3). Preencha "grupo_perguntado" com o
-   nome do grupo mencionado, o mais parecido possível com um destes grupos de cliente conhecidos:
+   nome do grupo mencionado - o mais parecido possível com um destes grupos de cliente conhecidos:
    {lista_grupos}
+   OU, se a pergunta for especificamente sobre um dos grupos INTERNOS "Tripa" (equipe de design) ou
+   "Gestão", preencha "grupo_perguntado" com "tripa" ou "gestao" respectivamente - esses dois também
+   são tipo 3 normalmente, mesmo não aparecendo na lista de clientes acima (o histórico dos dois
+   também fica registrado e pode ser consultado). NUNCA confunda uma pergunta sobre o grupo Tripa
+   especificamente com o tipo 6 (que é sobre TODOS os grupos de uma vez, sem citar nenhum nome) -
+   "teve atividade na Tripa?" cita um grupo específico (Tripa), então é tipo 3, não tipo 6.
 
 6) PERGUNTA SOBRE ATIVIDADE GERAL, EM TODOS OS GRUPOS (ex: "algum grupo teve atividade hoje?",
    "quais grupos tiveram movimento hoje?", "teve alguma coisa acontecendo hoje?", "alguma
