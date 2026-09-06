@@ -2010,8 +2010,10 @@ um pedido de lembrete não é um comando pro Tripa, um fato pra guardar não é 
    ESSA resposta em áudio" depois de você ter sugerido um texto - nunca invente um texto novo
    quando a pessoa está pedindo pra converter algo que já existe na conversa). Preencha
    "destino_audio" com: "privado" se o áudio é só pra {pessoa_nome} mesmo (aqui, nessa conversa);
-   "tripa" se é pro grupo da Tripa; ou o nome do cliente/grupo, se for uma resposta em áudio pro
-   grupo de um cliente específico.
+   "torres" ou "luan" se o pedido for pra mandar esse áudio DIRETO pro privado de um deles
+   especificamente (ex: "{pessoa_nome} pedindo pra mandar um áudio pro Luan" - vai direto pro
+   WhatsApp pessoal do Luan, não é pra um grupo); "tripa" se é pro grupo da Tripa; ou o nome do
+   cliente/grupo, se for uma resposta em áudio pro grupo de um cliente específico.
 
 5) QUALQUER OUTRA COISA (comentário, resposta a um lembrete anterior, pedido/comando que não se
    encaixa nos tipos acima) - preencha "resposta_conversa" com uma resposta natural e útil, como
@@ -4887,13 +4889,22 @@ def processar_dm(remote_jid, key, data):
     elif resultado.get("eh_pedido_de_audio") and resultado.get("texto_audio"):
         # Round 25, pedido do Torres: só manda nota de voz (com onda sonora, como se alguém
         # tivesse gravado ali na hora) quando ELE ou o Luan pedirem explicitamente - nunca
-        # decide sozinha trocar texto por áudio. "privado" sai na hora (baixo risco, é só pra
-        # quem pediu); Tripa e grupo de cliente passam por confirmação antes, igual ao "passa
-        # pra Tripa" e à "dica de resposta pro cliente" - grupo de cliente é sensível demais
-        # pra sair sem revisão, e gerar áudio tem custo (ElevenLabs cobra por caractere).
+        # decide sozinha trocar texto por áudio. Pra pessoa (você mesmo ou o outro da equipe)
+        # sai na hora, sem confirmar (baixo risco, fica só entre vocês); Tripa e grupo de
+        # cliente passam por confirmação antes, igual ao "passa pra Tripa" e à "dica de
+        # resposta pro cliente" - grupo de cliente é sensível demais pra sair sem revisão, e
+        # gerar áudio tem custo (ElevenLabs cobra por caractere). Depois de mandar pra uma
+        # pessoa, SEMPRE avisa quem pediu com um texto de confirmação (pedido explícito do
+        # Torres - antes disso o áudio saía mudo, sem nenhuma confirmação em texto).
         texto_para_audio = resultado["texto_audio"]
         destino_audio = (resultado.get("destino_audio") or "privado").strip().lower()
-        if destino_audio in ("privado", "eu", "mim", "aqui", ""):
+        numero_pessoa_audio, nome_pessoa_audio = {
+            "torres": (TORRES_NUMBER, "Torres"),
+            "luan": (LUAN_NUMBER, "Luan"),
+        }.get(destino_audio, (None, None))
+        if destino_audio in ("privado", "eu", "mim", "aqui", "") or numero_pessoa_audio == numero:
+            # É pra quem tá pedindo mesmo - seja porque pediu "manda pra mim", seja porque
+            # pediu "manda pro Torres" sendo o próprio Torres quem tá pedindo.
             audio_b64 = gerar_audio_elevenlabs(texto_para_audio)
             if not audio_b64:
                 responder(
@@ -4902,6 +4913,22 @@ def processar_dm(remote_jid, key, data):
                 )
             elif not enviar_audio(numero, audio_b64):
                 responder(f"Gerei o áudio mas não consegui enviar - aqui vai em texto mesmo:\n\n{texto_para_audio}")
+            else:
+                responder("Prontinho, te mandei o áudio! 🎙️")
+        elif numero_pessoa_audio:
+            # Pedido pra mandar áudio pro OUTRO da equipe (ex: Torres pedindo pra mandar pro
+            # Luan) - sai direto também (é só entre vocês dois), mas sempre confirma pra quem
+            # pediu que o áudio foi mandado de verdade.
+            audio_b64 = gerar_audio_elevenlabs(texto_para_audio)
+            if not audio_b64:
+                responder(
+                    f"Não consegui gerar o áudio agora (serviço de voz não respondeu) - aqui vai o "
+                    f"texto que era pra mandar pro {nome_pessoa_audio}:\n\n{texto_para_audio}"
+                )
+            elif not enviar_audio(numero_pessoa_audio, audio_b64):
+                responder(f"Gerei o áudio mas não consegui enviar pro {nome_pessoa_audio} - não mandei nada.")
+            else:
+                responder(f"Prontinho, mandei o áudio pro {nome_pessoa_audio}! 🎙️")
         elif destino_audio == "tripa":
             _comandos_pendentes[pessoa] = {
                 "mensagem_tripa": "", "tem_cobranca": False, "horario_cobranca": None, "pergunta_cobranca": "",
