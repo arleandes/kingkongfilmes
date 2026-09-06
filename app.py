@@ -72,6 +72,13 @@ ZAPI_INSTANCE_ID = os.environ.get("ZAPI_INSTANCE_ID", "")
 ZAPI_INSTANCE_TOKEN = os.environ.get("ZAPI_INSTANCE_TOKEN", "")
 ZAPI_CLIENT_TOKEN = os.environ.get("ZAPI_CLIENT_TOKEN", "")
 
+# ElevenLabs (round 25) - so usado quando Torres/Luan pedem explicitamente pra Cintia mandar
+# uma nota de voz de verdade (com onda sonora, como se alguem tivesse gravado na hora) em vez
+# de texto. ELEVENLABS_VOICE_ID e o ID de uma voz especifica escolhida na conta ElevenLabs
+# (Voice Library) - sem isso configurado, o recurso fica desligado (ver gerar_audio_elevenlabs).
+ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
+ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "")
+
 TORRES_NUMBER = os.environ.get("TORRES_NUMBER", "5571999394216")
 LUAN_NUMBER = os.environ.get("LUAN_NUMBER", "5571992200583")
 TEAM_NUMBERS = [TORRES_NUMBER, LUAN_NUMBER]
@@ -846,6 +853,68 @@ def _enviar_midia_zapi(numero_ou_jid: str, media_base64: str, mediatype: str, ca
             print(f"[enviar_midia_zapi] ERRO {resp.status_code}: {resp.text[:500]}", flush=True)
     except Exception as e:
         print(f"[enviar_midia_zapi] falhou: {e}", flush=True)
+
+
+def gerar_audio_elevenlabs(texto):
+    """Gera a fala (mp3, em base64) pro texto pedido usando a ElevenLabs. Retorna None (e loga o
+    motivo) se a conta nao estiver configurada ou a chamada falhar - quem chama SEMPRE precisa
+    tratar o None e avisar a pessoa que pediu, nunca falhar em silencio (mesma regra de nunca
+    deixar cliente/equipe sem resposta nenhuma)."""
+    if not ELEVENLABS_API_KEY or not ELEVENLABS_VOICE_ID:
+        print("[gerar_audio_elevenlabs] ELEVENLABS_API_KEY/ELEVENLABS_VOICE_ID nao configurados - recurso de audio desligado", flush=True)
+        return None
+    try:
+        resp = requests.post(
+            f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
+            headers={
+                "xi-api-key": ELEVENLABS_API_KEY,
+                "Content-Type": "application/json",
+                "Accept": "audio/mpeg",
+            },
+            json={
+                "text": texto,
+                "model_id": "eleven_multilingual_v2",
+                "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+            },
+            timeout=30,
+        )
+        if resp.status_code >= 400:
+            print(f"[gerar_audio_elevenlabs] ERRO {resp.status_code}: {resp.text[:500]}", flush=True)
+            return None
+        return base64.b64encode(resp.content).decode("utf-8")
+    except Exception as e:
+        print(f"[gerar_audio_elevenlabs] falhou: {e}", flush=True)
+        return None
+
+
+def enviar_audio(numero_ou_jid: str, audio_base64: str) -> bool:
+    """Manda uma nota de voz DE VERDADE (com onda sonora e "gravando audio...", como se alguem
+    tivesse segurado o microfone ali na hora) - so a Z-API suporta isso hoje (o parametro
+    "waveform" e especifico dela; a Evolution API mandaria como anexo de audio comum, sem a
+    aparencia de nota de voz). Retorna True/False - quem chama precisa avisar a pessoa em caso
+    de falha, nunca deixar isso passar em silencio."""
+    if WHATSAPP_PROVIDER != "zapi":
+        print("[enviar_audio] nota de voz com aparencia de gravacao so suportada com a Z-API por enquanto", flush=True)
+        return False
+    try:
+        resp = requests.post(
+            _zapi_url("send-audio"),
+            headers=_zapi_headers(),
+            json={
+                "phone": _jid_para_zapi_phone(numero_ou_jid),
+                "audio": f"data:audio/mpeg;base64,{audio_base64}",
+                "waveform": True,
+                "delayTyping": 3,
+            },
+            timeout=40,
+        )
+        if resp.status_code >= 400:
+            print(f"[enviar_audio] ERRO {resp.status_code}: {resp.text[:500]}", flush=True)
+            return False
+        return True
+    except Exception as e:
+        print(f"[enviar_audio] falhou: {e}", flush=True)
+        return False
 
 
 def baixar_midia(message_key):
@@ -1931,14 +2000,27 @@ um pedido de lembrete não é um comando pro Tripa, um fato pra guardar não é 
    nome não veio explícito na mensagem atual - o objetivo é NUNCA obrigar {pessoa_nome}/Luan a
    repetir uma informação que a conversa já deixou clara.
 
+13) PEDIDO PRA VOCÊ MANDAR UM ÁUDIO (nota de voz de verdade, com onda sonora, como se alguém
+   tivesse gravado ali na hora) EM VEZ DE TEXTO (ex: "manda isso em áudio", "responde por voz",
+   "manda um áudio pro Zurca avisando que já foi", "manda um áudio pra Tripa perguntando sobre X",
+   "me manda isso em áudio") - SÓ {pessoa_nome}/Luan podem pedir isso, e só quando pedirem
+   EXPLICITAMENTE (nunca decida sozinha mandar áudio em vez de texto sem ter sido pedido). Marque
+   "eh_pedido_de_audio" como true e preencha "texto_audio" com o texto exato que deve virar fala
+   (reutilize um texto que você mesma já ofereceu nas ÚLTIMAS MENSAGENS se for o caso, ex: "manda
+   ESSA resposta em áudio" depois de você ter sugerido um texto - nunca invente um texto novo
+   quando a pessoa está pedindo pra converter algo que já existe na conversa). Preencha
+   "destino_audio" com: "privado" se o áudio é só pra {pessoa_nome} mesmo (aqui, nessa conversa);
+   "tripa" se é pro grupo da Tripa; ou o nome do cliente/grupo, se for uma resposta em áudio pro
+   grupo de um cliente específico.
+
 5) QUALQUER OUTRA COISA (comentário, resposta a um lembrete anterior, pedido/comando que não se
    encaixa nos tipos acima) - preencha "resposta_conversa" com uma resposta natural e útil, como
    uma colega de equipe responderia no privado. Se os FATOS QUE VOCÊ JÁ SABE (se houver, no topo
    deste prompt) tiverem a resposta pra uma pergunta, use-os pra responder direto. Se for um
    pedido/comando que você ainda não tem como executar automaticamente, confirme que entendeu e que
    vai anotar/repassar, sem inventar que já fez algo que não fez. Nunca deixe esse campo vazio
-   quando nenhum dos tipos 1/2/3/4/6/8/9/10/11/12 acima se aplicar - toda mensagem privada precisa
-   de resposta. IMPORTANTE: se {pessoa_nome} estiver claramente selecionando/pedindo de volta algo
+   quando nenhum dos tipos 1/2/3/4/6/8/9/10/11/12/13 acima se aplicar - toda mensagem privada
+   precisa de resposta. IMPORTANTE: se {pessoa_nome} estiver claramente selecionando/pedindo de volta algo
    que VOCÊ (Cintia) apresentou nas ÚLTIMAS MENSAGENS acima (ex: "gostei da segunda", "manda só a
    número 2", "essa aí mesmo", "manda de novo"), REUTILIZE o conteúdo exato que você já mandou -
    não regenere nem invente uma versão nova, copie literalmente a opção/texto que já foi mostrado.
@@ -1981,7 +2063,7 @@ pergunta de ambiguidade anterior sua.
 Responda SEMPRE E APENAS em JSON válido, numa única linha por valor, neste formato exato,
 sem usar bloco de código markdown (nada de ```) e sem quebras de linha dentro dos valores. Inclua
 TODAS as chaves sempre, mesmo vazias/false quando não se aplicarem:
-{"eh_pedido_de_lembrete": true ou false, "destinatario_lembrete": "torres, luan ou tripa - quem deve receber o lembrete", "eh_recorrente": true ou false, "recorrencia_dia_mes": "dia do mes (1-31) se for recorrente mensal, ou string vazia", "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_pedido_mudanca_sistema": true ou false, "eh_pergunta_sobre_grupo": true ou false, "grupo_perguntado": "nome do grupo mencionado, ou string vazia", "eh_pergunta_atividade_geral": true ou false, "eh_pergunta_operacional_geral": true ou false, "eh_comando_para_tripa": true ou false, "mensagem_tripa": "texto pronto pra encaminhar pro grupo Tripa, ou string vazia", "tem_cobranca": true ou false, "horario_cobranca_iso": "horario ISO da cobranca, ou string vazia", "pergunta_cobranca": "pergunta curta pra mandar na cobranca, ou string vazia", "eh_comando_briefing_cliente": true ou false, "briefing_cliente_nome": "nome do cliente/grupo mencionado (ou inferido do contexto), ou string vazia", "briefing_assunto": "pista curta do assunto a analisar, ou string vazia", "eh_pergunta_metricool_metricas": true ou false, "metricool_metrica_cliente": "nome do cliente/marca, ou string vazia", "metricool_metrica_rede": "instagram ou facebook", "metricool_metrica_tipo": "seguidores, reels ou posts", "metricool_metrica_dias": 30, "eh_dica_resposta_cliente": true ou false, "dica_cliente_nome": "nome do cliente mencionado, ou string vazia", "dica_pergunta_cliente": "o que o cliente perguntou/falou, ou string vazia", "dica_resposta_sugerida": "o texto da resposta escrito pela pessoa, ou string vazia", "eh_marcar_pedido_concluido": true ou false, "pedido_cliente_referencia": "nome do cliente do pedido a marcar como resolvido, resolvido pelo contexto quando vier como referência tipo esse/isso, ou string vazia se genuinamente ambíguo", "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/3/4/6/8/9/10/11/12 acima for verdadeiro"}
+{"eh_pedido_de_lembrete": true ou false, "destinatario_lembrete": "torres, luan ou tripa - quem deve receber o lembrete", "eh_recorrente": true ou false, "recorrencia_dia_mes": "dia do mes (1-31) se for recorrente mensal, ou string vazia", "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_pedido_mudanca_sistema": true ou false, "eh_pergunta_sobre_grupo": true ou false, "grupo_perguntado": "nome do grupo mencionado, ou string vazia", "eh_pergunta_atividade_geral": true ou false, "eh_pergunta_operacional_geral": true ou false, "eh_comando_para_tripa": true ou false, "mensagem_tripa": "texto pronto pra encaminhar pro grupo Tripa, ou string vazia", "tem_cobranca": true ou false, "horario_cobranca_iso": "horario ISO da cobranca, ou string vazia", "pergunta_cobranca": "pergunta curta pra mandar na cobranca, ou string vazia", "eh_comando_briefing_cliente": true ou false, "briefing_cliente_nome": "nome do cliente/grupo mencionado (ou inferido do contexto), ou string vazia", "briefing_assunto": "pista curta do assunto a analisar, ou string vazia", "eh_pergunta_metricool_metricas": true ou false, "metricool_metrica_cliente": "nome do cliente/marca, ou string vazia", "metricool_metrica_rede": "instagram ou facebook", "metricool_metrica_tipo": "seguidores, reels ou posts", "metricool_metrica_dias": 30, "eh_dica_resposta_cliente": true ou false, "dica_cliente_nome": "nome do cliente mencionado, ou string vazia", "dica_pergunta_cliente": "o que o cliente perguntou/falou, ou string vazia", "dica_resposta_sugerida": "o texto da resposta escrito pela pessoa, ou string vazia", "eh_marcar_pedido_concluido": true ou false, "pedido_cliente_referencia": "nome do cliente do pedido a marcar como resolvido, resolvido pelo contexto quando vier como referência tipo esse/isso, ou string vazia se genuinamente ambíguo", "eh_pedido_de_audio": true ou false, "destino_audio": "privado, tripa, ou nome do cliente/grupo mencionado, ou string vazia", "texto_audio": "texto exato que deve virar fala, ou string vazia", "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/3/4/6/8/9/10/11/12/13 acima for verdadeiro"}
 """
 
 
@@ -4410,6 +4492,21 @@ def processar_dm(remote_jid, key, data):
             _comandos_pendentes.pop(pessoa, None)
             responder(f"Show, mandei pro {nome_cliente_resposta}! ✅ Já guardei esse atendimento pra lembrar depois.")
             return {"resposta_cliente_confirmada": True, "cliente": nome_cliente_resposta}
+        elif confirma is True and pendente.get("eh_pedido_audio"):
+            jid_destino_audio = pendente["jid_destino_audio"]
+            nome_destino_audio = pendente.get("nome_destino_audio", "grupo")
+            texto_audio_confirmado = pendente["texto_audio_pendente"]
+            _comandos_pendentes.pop(pessoa, None)
+            audio_b64_confirmado = gerar_audio_elevenlabs(texto_audio_confirmado)
+            if not audio_b64_confirmado:
+                responder("Não consegui gerar o áudio agora (serviço de voz não respondeu) - não mandei nada, quer que eu tente de novo?")
+                return {"audio_falhou_geracao": True}
+            if not enviar_audio(jid_destino_audio, audio_b64_confirmado):
+                responder("Gerei o áudio mas não consegui enviar pro WhatsApp - não mandei nada, quer que eu tente de novo?")
+                return {"audio_falhou_envio": True}
+            registrar_mensagem_grupo(jid_destino_audio, nome_destino_audio, "Cintia (equipe)", f"[áudio] {texto_audio_confirmado}", True)
+            responder(f"Prontinho, mandei o áudio pro {nome_destino_audio}! 🎙️")
+            return {"audio_confirmado": True, "destino": nome_destino_audio}
         elif confirma is True:
             enviar_texto(TRIPA_DESIGNER_JID, pendente["mensagem_tripa"])
             aviso_cobranca = ""
@@ -4787,6 +4884,59 @@ def processar_dm(remote_jid, key, data):
                     autor=pessoa, novo_status=STATUS_CONCLUIDO,
                 )
                 responder(f"Perfeito. Vou considerar o pedido do {nome_cliente_pedido} como resolvido. ✅")
+    elif resultado.get("eh_pedido_de_audio") and resultado.get("texto_audio"):
+        # Round 25, pedido do Torres: só manda nota de voz (com onda sonora, como se alguém
+        # tivesse gravado ali na hora) quando ELE ou o Luan pedirem explicitamente - nunca
+        # decide sozinha trocar texto por áudio. "privado" sai na hora (baixo risco, é só pra
+        # quem pediu); Tripa e grupo de cliente passam por confirmação antes, igual ao "passa
+        # pra Tripa" e à "dica de resposta pro cliente" - grupo de cliente é sensível demais
+        # pra sair sem revisão, e gerar áudio tem custo (ElevenLabs cobra por caractere).
+        texto_para_audio = resultado["texto_audio"]
+        destino_audio = (resultado.get("destino_audio") or "privado").strip().lower()
+        if destino_audio in ("privado", "eu", "mim", "aqui", ""):
+            audio_b64 = gerar_audio_elevenlabs(texto_para_audio)
+            if not audio_b64:
+                responder(
+                    "Não consegui gerar o áudio agora (serviço de voz não respondeu ou não está "
+                    f"configurado) - aqui vai em texto mesmo:\n\n{texto_para_audio}"
+                )
+            elif not enviar_audio(numero, audio_b64):
+                responder(f"Gerei o áudio mas não consegui enviar - aqui vai em texto mesmo:\n\n{texto_para_audio}")
+        elif destino_audio == "tripa":
+            _comandos_pendentes[pessoa] = {
+                "mensagem_tripa": "", "tem_cobranca": False, "horario_cobranca": None, "pergunta_cobranca": "",
+                "criado_em": time.time(),
+                "eh_pedido_audio": True,
+                "jid_destino_audio": TRIPA_DESIGNER_JID,
+                "texto_audio_pendente": texto_para_audio,
+                "nome_destino_audio": "Tripa",
+            }
+            responder(
+                f"Vou gerar e mandar um áudio pra Tripa dizendo:\n\n\"{texto_para_audio}\"\n\n"
+                "Confirma que posso mandar? (responde \"sim\" ou \"não\")"
+            )
+        else:
+            candidatos_audio = identificar_grupos_candidatos(destino_audio)
+            if not candidatos_audio:
+                responder(f"Não achei o cliente/grupo \"{destino_audio}\" pra mandar esse áudio. Pode confirmar o nome certinho?")
+            elif len(candidatos_audio) > 1:
+                nomes_candidatos_audio = ", ".join(GRUPOS[jid]["nome"] for jid in candidatos_audio)
+                responder(f"Encontrei mais de um cliente relacionado a \"{destino_audio}\": {nomes_candidatos_audio}. Pra qual deles é esse áudio?")
+            else:
+                jid_audio = candidatos_audio[0]
+                nome_audio = GRUPOS[jid_audio]["nome"]
+                _comandos_pendentes[pessoa] = {
+                    "mensagem_tripa": "", "tem_cobranca": False, "horario_cobranca": None, "pergunta_cobranca": "",
+                    "criado_em": time.time(),
+                    "eh_pedido_audio": True,
+                    "jid_destino_audio": jid_audio,
+                    "texto_audio_pendente": texto_para_audio,
+                    "nome_destino_audio": nome_audio,
+                }
+                responder(
+                    f"Vou gerar e mandar um áudio pro {nome_audio} dizendo:\n\n\"{texto_para_audio}\"\n\n"
+                    "Confirma que posso mandar? (responde \"sim\" ou \"não\")"
+                )
     elif tinha_pendente:
         responder("Combinado, marquei como resolvido! ✅")
     else:
