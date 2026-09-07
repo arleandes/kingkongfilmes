@@ -5471,6 +5471,28 @@ def _pedido_status_label(status):
     }.get(status, status)
 
 
+# Round 27 (parte 3): Torres perguntou se dava pra "acompanhar o chat" - decidiu, entre as
+# opcoes apresentadas, so melhorar o painel que ja existe (sem trocar de ferramenta/
+# reescrever o sistema). Nav simples compartilhada entre as paginas do painel, pra dar pra
+# ir e voltar entre "Pedidos" e "Conversas" sem digitar URL.
+def _nav_painel_html(token, ativo):
+    token_qs = f"?token={html.escape(token)}" if token else ""
+    abas = (("pedidos", "Pedidos", "/painel-pedidos"), ("conversas", "Conversas", "/painel-conversas"))
+    links = "".join(
+        f'<a class="aba{" aba-ativa" if chave == ativo else ""}" href="{rota}{token_qs}">{label}</a>'
+        for chave, label, rota in abas
+    )
+    return f'<nav class="painel-nav">{links}</nav>'
+
+
+_PAINEL_NAV_CSS = """
+  .painel-nav { display:flex; gap:4px; margin-top:14px; }
+  .painel-nav .aba { color:#fff; opacity:.65; text-decoration:none; font-size:13px; font-weight:600; padding:8px 14px; border-radius:8px 8px 0 0; }
+  .painel-nav .aba:hover { opacity:.9; }
+  .painel-nav .aba-ativa { opacity:1; background:#f4f5f7; color:#1c1c1e; }
+"""
+
+
 def _render_painel_pedidos_html(token, pedidos, mensagem=None):
     token_qs = f"?token={html.escape(token)}" if token else ""
     ordem_status = (
@@ -5547,12 +5569,14 @@ def _render_painel_pedidos_html(token, pedidos, mensagem=None):
   .form-status input[type=text] {{ flex:1; min-width:140px; }}
   .form-status button {{ margin-top:0; padding:8px 14px; }}
   .vazio {{ text-align:center; color:#8a8a8e; padding:30px 0; }}
+  {_PAINEL_NAV_CSS}
 </style>
 </head>
 <body>
 <header>
   <h1>Painel de Pedidos - Cintia</h1>
   <p>Escreva aqui o que precisa mudar no comportamento da Cintia (isso NAO e pra regra de atendimento de cliente - pra isso continua sendo "regra: ..." direto no WhatsApp, que já é instantâneo). Cada pedido fica registrado nesta fila e passa por implementação e teste antes de ir pro ar.</p>
+  {_nav_painel_html(token, "pedidos")}
 </header>
 <div class="container">
   {mensagem_html}
@@ -5629,6 +5653,118 @@ def painel_pedidos_atualizar(pedido_id):
     token = request.args.get("token", "")
     token_qs = f"?token={token}" if token else ""
     return redirect(f"/painel-pedidos{token_qs}")
+
+
+# Round 27 (parte 3): Torres perguntou se dava pra migrar tudo pra outra ferramenta (Lovable)
+# pra ter um painel de regras + acompanhamento de chat. Como o motor da Cintia é Python
+# testado em 27 rodadas e o backend do Lovable roda em outra linguagem (reescrever do zero
+# seria arriscado), a decisão foi só melhorar o painel que já existe aqui: uma segunda aba,
+# só de LEITURA, mostrando o histórico recente de mensagens de um grupo (cliente ou interno)
+# direto no navegador. Reaproveita a MESMA tabela/fallback (mensagens_grupo) que já alimenta
+# a pergunta "o que rolou no grupo tal" no privado - nenhuma tabela nova, nenhuma variável
+# de ambiente nova (mesmo DEBUG_TOKEN dos outros painéis).
+_LIMITE_MENSAGENS_PAINEL_CONVERSAS = 200
+
+
+def _render_painel_conversas_html(token, grupo_selecionado_jid, mensagens, grupos_ordenados):
+    token_qs = f"?token={html.escape(token)}" if token else ""
+
+    opcoes_grupo = ['<option value="">Selecione um grupo…</option>']
+    for jid, nome in grupos_ordenados:
+        selected = " selected" if jid == grupo_selecionado_jid else ""
+        opcoes_grupo.append(f'<option value="{html.escape(jid)}"{selected}>{html.escape(nome)}</option>')
+
+    bolhas = []
+    for m in mensagens:
+        autor = m.get("autor") or "?"
+        conteudo = m.get("conteudo") or ""
+        classe = "bolha-equipe" if m.get("eh_equipe") else "bolha-cliente"
+        criado_em = m.get("criado_em")
+        if hasattr(criado_em, "strftime"):
+            data_str = criado_em.strftime("%d/%m %H:%M")
+        else:
+            data_str = str(criado_em or "")[:16].replace("T", " ")
+        bolhas.append(f"""
+        <div class="bolha {classe}">
+          <div class="bolha-topo"><strong>{html.escape(autor)}</strong><span>{data_str}</span></div>
+          <div class="bolha-texto">{html.escape(conteudo)}</div>
+        </div>""")
+
+    if not grupo_selecionado_jid:
+        corpo = '<div class="vazio">Selecione um grupo acima pra ver o histórico recente de mensagens.</div>'
+    elif bolhas:
+        corpo = "".join(bolhas)
+    else:
+        corpo = '<div class="vazio">Nenhuma mensagem registrada ainda pra esse grupo.</div>'
+
+    return f"""<!doctype html>
+<html lang="pt-br">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Painel de Conversas - Cintia</title>
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background:#f4f5f7; margin:0; padding:0 0 60px; color:#1c1c1e; }}
+  header {{ background:#1c1c1e; color:#fff; padding:20px; }}
+  header h1 {{ margin:0; font-size:20px; }}
+  header p {{ margin:6px 0 0; opacity:.75; font-size:13px; max-width:640px; }}
+  .container {{ max-width:720px; margin:0 auto; padding:20px; }}
+  .form-grupo {{ background:#fff; border-radius:12px; padding:16px 20px; box-shadow:0 1px 3px rgba(0,0,0,.08); margin-bottom:20px; }}
+  select {{ width:100%; box-sizing:border-box; padding:10px; border:1px solid #d0d0d5; border-radius:8px; font-size:14px; font-family:inherit; }}
+  label {{ display:block; font-size:13px; font-weight:600; margin-bottom:6px; }}
+  .bolha {{ background:#fff; border-radius:12px; padding:10px 14px; box-shadow:0 1px 3px rgba(0,0,0,.06); margin-bottom:8px; border-left:4px solid #d0d0d5; }}
+  .bolha-equipe {{ border-left-color:#0a84ff; }}
+  .bolha-cliente {{ border-left-color:#8a8a8e; }}
+  .bolha-topo {{ display:flex; justify-content:space-between; gap:10px; font-size:12px; color:#8a8a8e; margin-bottom:4px; }}
+  .bolha-topo strong {{ color:#1c1c1e; }}
+  .bolha-texto {{ font-size:14px; line-height:1.45; white-space:pre-wrap; }}
+  .vazio {{ text-align:center; color:#8a8a8e; padding:30px 0; }}
+  {_PAINEL_NAV_CSS}
+</style>
+</head>
+<body>
+<header>
+  <h1>Painel de Conversas - Cintia</h1>
+  <p>Histórico recente de mensagens de um grupo (cliente ou interno), só pra leitura - não manda nada. Mostra as últimas {_LIMITE_MENSAGENS_PAINEL_CONVERSAS} mensagens registradas.</p>
+  {_nav_painel_html(token, "conversas")}
+</header>
+<div class="container">
+  <div class="form-grupo">
+    <label>Grupo</label>
+    <form method="GET" action="/painel-conversas">
+      <input type="hidden" name="token" value="{html.escape(token)}">
+      <select name="grupo" onchange="this.form.submit()">{"".join(opcoes_grupo)}</select>
+      <noscript><button type="submit">Ver</button></noscript>
+    </form>
+  </div>
+  {corpo}
+</div>
+</body>
+</html>"""
+
+
+@app.route("/painel-conversas", methods=["GET"])
+def painel_conversas():
+    """Segunda aba do painel (round 27): mostra o histórico recente de mensagens de um
+    grupo (cliente ou interno, mesma lista GRUPOS já cadastrada) direto no navegador, sem
+    precisar abrir o WhatsApp - só leitura, não manda nada e não precisa de confirmação.
+    Reaproveita buscar_mensagens_recentes_grupo (mesma tabela/fallback que já alimenta a
+    pergunta "o que rolou no grupo tal" no privado). Mesmo token opcional (DEBUG_TOKEN) das
+    outras rotas do painel."""
+    if not _checar_token_painel():
+        return jsonify({"erro": "token inválido ou ausente - acesse com ?token=<o valor de DEBUG_TOKEN configurado no Railway>"}), 403
+
+    token = request.args.get("token", "")
+    grupo_jid = request.args.get("grupo", "").strip()
+    if grupo_jid and grupo_jid not in GRUPOS:
+        grupo_jid = ""
+
+    grupos_ordenados = sorted(
+        ((jid, info["nome"]) for jid, info in GRUPOS.items()),
+        key=lambda item: item[1].lower(),
+    )
+    mensagens = buscar_mensagens_recentes_grupo(grupo_jid, limite=_LIMITE_MENSAGENS_PAINEL_CONVERSAS) if grupo_jid else []
+    return _render_painel_conversas_html(token, grupo_jid, mensagens, grupos_ordenados)
 
 
 @app.route("/status-memoria", methods=["GET"])
