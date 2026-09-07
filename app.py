@@ -1327,11 +1327,18 @@ são 4 pedidos, é 1 só. Quando você receber várias mensagens da mesma leva (
 lista abaixo), trate-as como fragmentos da MESMA fala, salvo se ficar claro que mudou de assunto de
 verdade no meio (ex: termina de pedir a arte e depois, sem relação, comenta sobre um vídeo antigo -
 aí são dois assuntos). Antes de responder/organizar o pedido, reconstrua mentalmente: (1) qual
-assunto está sendo discutido; (2) a mensagem é um PEDIDO NOVO, um COMPLEMENTO/correção de algo que
-já estava sendo pedido (ex: cliente disse "Heineken" e depois "melhor Brahma" - o pedido final é
-Brahma, a informação mais recente substitui a anterior, não soma as duas), ou uma APROVAÇÃO do que
-a equipe já entregou (ex: "perfeito", "pode postar" depois de um card enviado - isso não é um pedido
-novo)? (3) existe alguma referência implícita ("esse", "aquele", "o de ontem", "igual à semana
+assunto está sendo discutido; (2) a mensagem é um PEDIDO NOVO (uma peça que ainda não existe, do
+zero), um COMPLEMENTO/correção de algo que já estava sendo pedido ANTES de a peça ficar pronta (ex:
+cliente disse "Heineken" e depois "melhor Brahma", ainda durante a organização do pedido - o pedido
+final é Brahma, a informação mais recente substitui a anterior, não soma as duas), um AJUSTE EM
+PEÇA JÁ EXISTENTE/JÁ ENVIADA (ex: o HISTÓRICO RECENTE DO GRUPO mostra que uma arte sobre esse mesmo
+assunto já foi enviada/postada - seja porque aparece uma entrada "[conteúdo da imagem enviada]:
+..." descrevendo uma peça parecida, seja porque o texto deixa claro que já existe algo pronto - e
+agora o cliente só quer mudar um detalhe pontual dela, tipo horário, preço, texto ou data, mantendo
+o resto igual), ou uma APROVAÇÃO do que a equipe já entregou (ex: "perfeito", "pode postar" depois
+de um card enviado - isso não é um pedido novo)? Não confunda AJUSTE com PEDIDO NOVO: se a peça já
+existe (já foi criada/enviada antes) e o cliente só quer mudar um detalhe dela, isso NUNCA é um
+pedido do zero, mesmo que a mensagem pareça um pedido de arte à primeira vista. (3) existe alguma referência implícita ("esse", "aquele", "o de ontem", "igual à semana
 passada", "só muda a data/preço") que só faz sentido olhando pro HISTÓRICO RECENTE DO GRUPO (se
 vier preenchido abaixo)? Tente resolver a referência usando esse histórico; se não conseguir
 identificar com razoável confiança do que se trata, NUNCA invente - marque "duvida_geral" true e,
@@ -1516,6 +1523,21 @@ simples, um item por linha. Se faltar alguma informação importante pra fazer a
 claramente no pedido também. Quando "tipo" NÃO for "arte", inclua as duas chaves mesmo assim, só
 que com string vazia "" nas duas.
 
+AJUSTE EM PEÇA JÁ EXISTENTE (bug real já reportado - NÃO REPITA: uma peça que JÁ tinha sido feita e
+enviada foi tratada como pedido novo do zero e mandada pro designer como se fosse a primeira vez,
+o que gerou trabalho duplicado e deixou o cliente com a impressão de que ninguém lê o histórico):
+antes de marcar "tipo" como "arte", sempre confira primeiro se o HISTÓRICO RECENTE DO GRUPO (ou uma
+entrada "[conteúdo da imagem enviada]: ..."/"[conteúdo do PDF enviado]: ...") já mostra uma peça
+sobre esse mesmo assunto/promoção/evento. Se sim, e a mensagem atual só pede pra mudar um detalhe
+pontual dela (horário, preço, data, um texto específico), marque "eh_ajuste_peca_existente" como
+true. Nesse caso: "tipo" continua "arte" (a equipe de design ainda precisa editar o arquivo), mas
+"pedido_organizado_designer" NUNCA deve ser escrito como se fosse um pedido novo do zero - descreva
+SÓ a mudança pontual, deixando claro que é um ajuste numa peça que já existe (ex: "Ajustar o card já
+enviado da promoção Amstel: mudar o horário de 20h pra até 19h, mantendo o resto igual - NÃO é uma
+peça nova."). Quando não houver nenhuma peça anterior equivalente no histórico (é realmente um
+pedido do zero), "eh_ajuste_peca_existente" é false. Inclua esse campo em toda resposta, mesmo
+quando "tipo" não for "arte" (nesse caso, sempre false).
+
 DESCRIÇÃO DA MÍDIA RECEBIDA (memória de arquivos): se essa mensagem veio com uma imagem ou PDF
 anexado (você vai ver o arquivo de verdade, não só a legenda), preencha "descricao_midia" com uma
 frase curta e objetiva descrevendo o que esse arquivo mostra (ex: "Foto de um cardápio com prato
@@ -1583,6 +1605,7 @@ Responda SEMPRE E APENAS em JSON válido, neste formato exato, sem nenhum texto 
   "opcoes_resposta": ["sugestão 1 de resposta pra equipe avaliar", "sugestão 2 (opcional)"],
   "tipo_peca_designer": "classificação curta do material (Card, Story, Carrossel, Banner, Flyer, Selo...), ou string vazia se tipo nao for arte",
   "pedido_organizado_designer": "pedido de arte organizado pro designer, ou string vazia se tipo nao for arte",
+  "eh_ajuste_peca_existente": true ou false,
   "eh_promessa": true ou false,
   "texto_promessa": "resumo curto do compromisso assumido com o cliente (com prazo/acao), ou string vazia",
   "descricao_midia": "descrição curta do que a imagem/PDF anexado mostra, ou string vazia se não veio arquivo",
@@ -1887,9 +1910,16 @@ def _finalizar_processamento_grupo(chave):
     encaminhado_designer = False
     if resultado.get("tipo") == "arte" and pedido_designer:
         tipo_peca = resultado.get("tipo_peca_designer") or "Arte"
+        # Bug real ja reportado (round 27, parte 7): uma peca que JA tinha sido feita e
+        # enviada era tratada como pedido novo do zero e mandada pro designer como se
+        # fosse a primeira vez - rotulo diferente aqui pra deixar isso obvio pra quem le
+        # a mensagem no grupo Tripa, em vez de parecer mais uma "SOLICITAÇÃO" nova igual
+        # a qualquer outra.
+        eh_ajuste_existente = bool(resultado.get("eh_ajuste_peca_existente"))
+        rotulo_solicitacao = f"AJUSTE em peça já existente ({tipo_peca})" if eh_ajuste_existente else tipo_peca
         mensagem_tripa = (
             f"*CLIENTE:* {grupo['nome']}\n"
-            f"*SOLICITAÇÃO:* {tipo_peca}\n"
+            f"*SOLICITAÇÃO:* {rotulo_solicitacao}\n"
             f"*DESCRIÇÃO:* {pedido_designer}"
         )
         enviar_texto(TRIPA_DESIGNER_JID, mensagem_tripa)
@@ -1897,8 +1927,14 @@ def _finalizar_processamento_grupo(chave):
             enviar_midia(TRIPA_DESIGNER_JID, midia_b64, tipo_midia, caption=f"Anexo do pedido - {grupo['nome']}", nome_arquivo=nome_arquivo)
         encaminhado_designer = True
         # Guarda o pedido pra poder comparar depois com a arte finalizada, quando o
-        # designer postar ela no grupo Tripa citando o cliente na legenda.
-        registrar_pedido_pendente(grupo["nome"], pedido_designer, grupo_jid=remote_jid, tipo_peca=tipo_peca)
+        # designer postar ela no grupo Tripa citando o cliente na legenda. Mantem o
+        # registro mesmo sendo ajuste (a equipe ainda precisa editar e entregar de novo),
+        # so com o tipo_peca marcado como ajuste pra aparecer certo no painel/lista de
+        # pendentes, em vez de contar como uma peca nova do zero.
+        registrar_pedido_pendente(
+            grupo["nome"], pedido_designer, grupo_jid=remote_jid,
+            tipo_peca=f"Ajuste - {tipo_peca}" if eh_ajuste_existente else tipo_peca,
+        )
 
     # Avisa Torres e Luan sobre TODO atendimento feito no grupo (nao so os chateados),
     # pra eles ficarem sempre por dentro do que o robo fez - inclusive quando ficou em
