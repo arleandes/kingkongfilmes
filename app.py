@@ -4803,6 +4803,34 @@ def processar_dm(remote_jid, key, data):
         "de perguntar ou a um pedido de poucas mensagens atrás):\n"
         + "\n".join(f"- {m['autor']}: {m['conteudo']}" for m in historico_dm) + "\n\n"
     ) if historico_dm else ""
+
+    # Round 27 (parte 5): Torres pediu memória de TODA a conversa, não só uma janela fixa de
+    # mensagens recentes - em vez de inflar esse prompt com milhares de mensagens brutas em
+    # TODA chamada (custaria uma fortuna em tokens a cada mensagem, pra sempre, e nem resolveria
+    # de verdade: o mesmo limite simplesmente reapareceria mais na frente quando a conversa
+    # crescesse além dele de novo), reaproveitamos a MESMA busca por palavra-chave em TODO o
+    # histórico já registrado no banco (sem limite de tempo/quantidade) que já existia pra
+    # perguntas sobre grupo de cliente (round 21) - agora também pro histórico do próprio DM.
+    # O histórico completo de cada conversa já fica salvo pra sempre no Postgres (nunca é
+    # apagado); isso só ativa a busca nele quando a mensagem atual tem alguma palavra-chave
+    # concreta, e injeta só o que achar de FORA da janela recente acima - assim ela tem acesso
+    # de verdade a qualquer coisa já dita, de qualquer época, sem pagar o custo de reler tudo em
+    # toda mensagem.
+    chaves_ja_no_contexto_dm = {(m.get("autor"), m.get("conteudo")) for m in historico_dm}
+    termos_busca_dm = _extrair_palavras_chave(texto)
+    mensagens_antigas_dm = [
+        m for m in buscar_mensagens_grupo_por_termos(grupo_jid_dm, termos_busca_dm, limite=15)
+        if (m.get("autor"), m.get("conteudo")) not in chaves_ja_no_contexto_dm
+    ] if termos_busca_dm else []
+    if mensagens_antigas_dm:
+        contexto_conversa += (
+            "MENSAGENS MAIS ANTIGAS DESSA MESMA CONVERSA QUE PODEM SER RELEVANTES (achadas "
+            "buscando por palavras da mensagem atual em TODO o histórico já registrado, de "
+            "qualquer época, não só as recentes acima - use quando a pessoa estiver se "
+            "referindo a algo de mais tempo atrás):\n"
+            + "\n".join(f"- {m['autor']}: {m['conteudo']}" for m in mensagens_antigas_dm) + "\n\n"
+        )
+
     lista_grupos = "\n".join(
         f"- {info['nome']}" for info in GRUPOS.values() if not info.get("interno")
     )
