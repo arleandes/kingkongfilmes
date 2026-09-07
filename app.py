@@ -35,6 +35,7 @@
 import os
 import re
 import json
+import html
 import base64
 import tempfile
 import time
@@ -43,7 +44,7 @@ import unicodedata
 from contextlib import contextmanager
 from datetime import datetime, date, timezone, timedelta
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -144,6 +145,24 @@ STATUS_PENDENTE = "PENDENTE"
 STATUS_EM_EXECUCAO = "EM_EXECUCAO"
 STATUS_AGUARDANDO_CORRECAO = "AGUARDANDO_CORRECAO"
 STATUS_CONCLUIDO = "CONCLUIDO"
+
+# Painel de pedidos de mudanca (round 26) - fila onde Torres/Luan escrevem, num
+# formulario simples pelo navegador, pedidos de mudanca de COMPORTAMENTO DO SISTEMA (nao
+# e pra regra de atendimento, que ja tem o mecanismo "regra:"/"regra pro cliente:" direto
+# no WhatsApp, instantaneo, sem precisar de deploy nenhum). O painel so guarda e organiza
+# o pedido - NAO gera nem sobe codigo sozinho. Cada pedido ainda passa pela implementacao,
+# teste (suite de regressao) e deploy manuais de sempre, so tira o trabalho de abrir uma
+# conversa e reexplicar o contexto toda vez.
+STATUS_PEDIDO_PENDENTE = "PENDENTE"
+STATUS_PEDIDO_EM_ANDAMENTO = "EM_ANDAMENTO"
+STATUS_PEDIDO_PRECISA_ESCLARECIMENTO = "PRECISA_ESCLARECIMENTO"
+STATUS_PEDIDO_CONCLUIDO = "CONCLUIDO"
+STATUS_PEDIDOS_VALIDOS = {
+    STATUS_PEDIDO_PENDENTE,
+    STATUS_PEDIDO_EM_ANDAMENTO,
+    STATUS_PEDIDO_PRECISA_ESCLARECIMENTO,
+    STATUS_PEDIDO_CONCLUIDO,
+}
 
 _db_pool = None
 
@@ -284,7 +303,22 @@ def init_db():
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_fatos_cliente_historico_fato ON fatos_cliente_historico (fato_id)"
             )
-        print(f"[init_db] banco de dados pronto (schema '{DB_SCHEMA}', tabelas tarefas/tarefas_eventos/regras_atendimento/fatos_memoria/mensagens_grupo/fatos_cliente/fatos_cliente_historico)", flush=True)
+            # Fila do painel de pedidos de mudanca (round 26, ver comentario acima de
+            # STATUS_PEDIDO_PENDENTE).
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS pedidos_mudanca (
+                    id SERIAL PRIMARY KEY,
+                    autor TEXT NOT NULL,
+                    titulo TEXT NOT NULL,
+                    descricao TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'PENDENTE',
+                    resposta TEXT,
+                    criado_em TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    atualizado_em TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_pedidos_mudanca_status ON pedidos_mudanca (status, criado_em)")
+        print(f"[init_db] banco de dados pronto (schema '{DB_SCHEMA}', tabelas tarefas/tarefas_eventos/regras_atendimento/fatos_memoria/mensagens_grupo/fatos_cliente/fatos_cliente_historico/pedidos_mudanca)", flush=True)
     except Exception as e:
         print(f"[init_db] erro ao inicializar banco de dados: {e}", flush=True)
 
@@ -373,6 +407,100 @@ def listar_fatos():
             return []
     with _fatos_lock:
         return [r["texto"] for r in _fatos_memoria]
+
+
+# Fila do painel de pedidos de mudanca (round 26) - ver comentario junto de
+# STATUS_PEDIDO_PENDENTE mais acima pra entender o que e (e o que NAO e) esse painel.
+# Mesmo padrao hibrido banco+fallback em memoria das regras/fatos acima.
+_pedidos_mudanca_memoria = []
+_pedidos_mudanca_lock = threading.Lock()
+_pedidos_mudanca_proximo_id_memoria = 1
+
+
+def criar_pedido_mudanca(autor, titulo, descricao):
+    """Registra um novo pedido na fila, sempre como PENDENTE. Devolve o id do pedido."""
+    if DATABASE_URL:
+        try:
+            with db_cursor(commit=True) as cur:
+                cur.execute(
+                    "INSERT INTO pedidos_mudanca (autor, titulo, descricao) VALUES (%s, %s, %s) RETURNING id",
+                    (autor, titulo, descricao),
+                )
+                return cur.fetchone()["id"]
+        except Exception as e:
+            print(f"[criar_pedido_mudanca] banco de dados falhou, usando fallback em memoria: {e}", flush=True)
+    global _pedidos_mudanca_proximo_id_memoria
+    with _pedidos_mudanca_lock:
+        novo_id = _pedidos_mudanca_proximo_id_memoria
+        _pedidos_mudanca_proximo_id_memoria += 1
+        agora = datetime.now(timezone.utc)
+        _pedidos_mudanca_memoria.append({
+            "id": novo_id, "autor": autor, "titulo": titulo, "descricao": descricao,
+            "status": STATUS_PEDIDO_PENDENTE, "resposta": None,
+            "criado_em": agora, "atualizado_em": agora,
+        })
+        return novo_id
+
+
+def listar_pedidos_mudanca():
+    """Devolve todos os pedidos, mais recentes primeiro, com os ja CONCLUIDOS jogados pro
+    final da lista (pra fila de trabalho real ficar sempre visivel primeiro)."""
+    if DATABASE_URL:
+        try:
+            with db_cursor() as cur:
+                cur.execute(
+                    "SELECT id, autor, titulo, descricao, status, resposta, criado_em, atualizado_em "
+                    "FROM pedidos_mudanca "
+                    "ORDER BY (status = %s), criado_em DESC",
+                    (STATUS_PEDIDO_CONCLUIDO,),
+                )
+                return cur.fetchall()
+        except Exception as e:
+            print(f"[listar_pedidos_mudanca] erro: {e}", flush=True)
+            return []
+    with _pedidos_mudanca_lock:
+        pendentes = [p for p in _pedidos_mudanca_memoria if p["status"] != STATUS_PEDIDO_CONCLUIDO]
+        concluidos = [p for p in _pedidos_mudanca_memoria if p["status"] == STATUS_PEDIDO_CONCLUIDO]
+        pendentes.sort(key=lambda p: p["criado_em"], reverse=True)
+        concluidos.sort(key=lambda p: p["criado_em"], reverse=True)
+        return pendentes + concluidos
+
+
+def atualizar_pedido_mudanca(pedido_id, status=None, resposta=None):
+    """Atualiza status e/ou resposta de um pedido existente. resposta=None significa "nao
+    mexer nesse campo" (pra permitir so trocar o status sem apagar uma nota ja escrita)."""
+    if DATABASE_URL:
+        try:
+            with db_cursor(commit=True) as cur:
+                if status and resposta is not None:
+                    cur.execute(
+                        "UPDATE pedidos_mudanca SET status=%s, resposta=%s, atualizado_em=now() WHERE id=%s",
+                        (status, resposta, pedido_id),
+                    )
+                elif status:
+                    cur.execute(
+                        "UPDATE pedidos_mudanca SET status=%s, atualizado_em=now() WHERE id=%s",
+                        (status, pedido_id),
+                    )
+                elif resposta is not None:
+                    cur.execute(
+                        "UPDATE pedidos_mudanca SET resposta=%s, atualizado_em=now() WHERE id=%s",
+                        (resposta, pedido_id),
+                    )
+            return True
+        except Exception as e:
+            print(f"[atualizar_pedido_mudanca] erro: {e}", flush=True)
+            return False
+    with _pedidos_mudanca_lock:
+        for p in _pedidos_mudanca_memoria:
+            if p["id"] == pedido_id:
+                if status:
+                    p["status"] = status
+                if resposta is not None:
+                    p["resposta"] = resposta
+                p["atualizado_em"] = datetime.now(timezone.utc)
+                return True
+    return False
 
 
 # Historico leve de mensagens por grupo (equipe e cliente), pra Torres/Luan poderem
@@ -5130,6 +5258,187 @@ def webhook_zapi():
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "service": "kingkong-whatsapp-webhook"})
+
+
+def _checar_token_painel():
+    """Mesmo esquema de senha simples e opcional do /status-memoria (env DEBUG_TOKEN) -
+    reaproveitado aqui pro painel de pedidos, pra nao criar uma segunda variavel de
+    ambiente so pra isso. Sem DEBUG_TOKEN configurada, o painel fica aberto (e avisa no
+    log), exatamente como o /status-memoria ja se comporta hoje."""
+    token_esperado = os.environ.get("DEBUG_TOKEN")
+    if token_esperado:
+        return request.args.get("token") == token_esperado
+    print("[painel_pedidos] aviso: DEBUG_TOKEN nao configurada, painel aberto sem senha", flush=True)
+    return True
+
+
+def _pedido_status_label(status):
+    return {
+        STATUS_PEDIDO_PENDENTE: "🟡 Pendente",
+        STATUS_PEDIDO_EM_ANDAMENTO: "🔵 Em andamento",
+        STATUS_PEDIDO_PRECISA_ESCLARECIMENTO: "🟠 Precisa de esclarecimento",
+        STATUS_PEDIDO_CONCLUIDO: "🟢 Concluído",
+    }.get(status, status)
+
+
+def _render_painel_pedidos_html(token, pedidos, mensagem=None):
+    token_qs = f"?token={html.escape(token)}" if token else ""
+    ordem_status = (
+        STATUS_PEDIDO_PENDENTE,
+        STATUS_PEDIDO_EM_ANDAMENTO,
+        STATUS_PEDIDO_PRECISA_ESCLARECIMENTO,
+        STATUS_PEDIDO_CONCLUIDO,
+    )
+
+    cards = []
+    for p in pedidos:
+        status_atual = p["status"]
+        opcoes_status = "".join(
+            f'<option value="{s}"{" selected" if s == status_atual else ""}>{_pedido_status_label(s)}</option>'
+            for s in ordem_status
+        )
+        resposta_html = ""
+        if p.get("resposta"):
+            resposta_html = f'<div class="resposta"><strong>Nota:</strong> {html.escape(p["resposta"])}</div>'
+        criado_em = p["criado_em"]
+        data_str = criado_em.strftime("%d/%m/%Y %H:%M") if hasattr(criado_em, "strftime") else str(criado_em)
+        cards.append(f"""
+        <div class="card status-{status_atual.lower()}">
+          <div class="card-topo">
+            <span class="badge">{_pedido_status_label(status_atual)}</span>
+            <span class="meta">#{p['id']} · {html.escape(p['autor'])} · {data_str}</span>
+          </div>
+          <h3>{html.escape(p['titulo'])}</h3>
+          <p>{html.escape(p['descricao'])}</p>
+          {resposta_html}
+          <form method="POST" action="/painel-pedidos/{p['id']}/atualizar{token_qs}" class="form-status">
+            <select name="status">{opcoes_status}</select>
+            <input type="text" name="resposta" placeholder="Nota/resposta (opcional)">
+            <button type="submit">Salvar</button>
+          </form>
+        </div>""")
+
+    mensagem_html = f'<div class="flash">{html.escape(mensagem)}</div>' if mensagem else ""
+
+    return f"""<!doctype html>
+<html lang="pt-br">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Painel de Pedidos - Cintia</title>
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background:#f4f5f7; margin:0; padding:0 0 60px; color:#1c1c1e; }}
+  header {{ background:#1c1c1e; color:#fff; padding:20px; }}
+  header h1 {{ margin:0; font-size:20px; }}
+  header p {{ margin:6px 0 0; opacity:.75; font-size:13px; max-width:640px; }}
+  .container {{ max-width:720px; margin:0 auto; padding:20px; }}
+  .flash {{ background:#e6f7ee; border:1px solid #34c759; color:#1a6b3c; padding:12px 16px; border-radius:8px; margin-bottom:20px; font-size:14px; }}
+  .form-novo {{ background:#fff; border-radius:12px; padding:20px; box-shadow:0 1px 3px rgba(0,0,0,.08); margin-bottom:28px; }}
+  .form-novo h2 {{ margin-top:0; font-size:16px; }}
+  h2 {{ font-size:16px; }}
+  label {{ display:block; font-size:13px; font-weight:600; margin:12px 0 4px; }}
+  select, input[type=text], textarea {{ width:100%; box-sizing:border-box; padding:10px; border:1px solid #d0d0d5; border-radius:8px; font-size:14px; font-family:inherit; }}
+  textarea {{ min-height:100px; resize:vertical; }}
+  button {{ margin-top:14px; background:#1c1c1e; color:#fff; border:none; padding:10px 18px; border-radius:8px; font-size:14px; cursor:pointer; }}
+  button:hover {{ opacity:.85; }}
+  .card {{ background:#fff; border-radius:12px; padding:16px 20px; box-shadow:0 1px 3px rgba(0,0,0,.06); margin-bottom:14px; border-left:4px solid #d0d0d5; }}
+  .card.status-pendente {{ border-left-color:#e6b400; }}
+  .card.status-em_andamento {{ border-left-color:#0a84ff; }}
+  .card.status-precisa_esclarecimento {{ border-left-color:#ff9500; }}
+  .card.status-concluido {{ border-left-color:#34c759; opacity:.8; }}
+  .card-topo {{ display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:6px; margin-bottom:6px; }}
+  .badge {{ font-size:12px; font-weight:600; }}
+  .meta {{ font-size:12px; color:#8a8a8e; }}
+  .card h3 {{ margin:4px 0 8px; font-size:16px; }}
+  .card p {{ margin:0 0 10px; font-size:14px; line-height:1.45; white-space:pre-wrap; }}
+  .resposta {{ background:#f4f5f7; border-radius:8px; padding:8px 12px; font-size:13px; margin-bottom:10px; }}
+  .form-status {{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; }}
+  .form-status select {{ width:auto; }}
+  .form-status input[type=text] {{ flex:1; min-width:140px; }}
+  .form-status button {{ margin-top:0; padding:8px 14px; }}
+  .vazio {{ text-align:center; color:#8a8a8e; padding:30px 0; }}
+</style>
+</head>
+<body>
+<header>
+  <h1>Painel de Pedidos - Cintia</h1>
+  <p>Escreva aqui o que precisa mudar no comportamento da Cintia (isso NAO e pra regra de atendimento de cliente - pra isso continua sendo "regra: ..." direto no WhatsApp, que já é instantâneo). Cada pedido fica registrado nesta fila e passa por implementação e teste antes de ir pro ar.</p>
+</header>
+<div class="container">
+  {mensagem_html}
+  <div class="form-novo">
+    <h2>Novo pedido</h2>
+    <form method="POST" action="/painel-pedidos{token_qs}">
+      <label>Quem está pedindo</label>
+      <select name="autor" required>
+        <option value="Torres">Torres</option>
+        <option value="Luan">Luan</option>
+      </select>
+      <label>Título curto</label>
+      <input type="text" name="titulo" placeholder="Ex: Cintia não deve comentar arte sozinha no Tripa" required>
+      <label>Descrição (quanto mais detalhe e exemplo, melhor)</label>
+      <textarea name="descricao" placeholder="Explique o que deve acontecer, em que situação, e (se der) um exemplo real." required></textarea>
+      <button type="submit">Enviar pedido</button>
+    </form>
+  </div>
+  <h2>Pedidos ({len(pedidos)})</h2>
+  {"".join(cards) if cards else '<div class="vazio">Nenhum pedido ainda.</div>'}
+</div>
+</body>
+</html>"""
+
+
+@app.route("/painel-pedidos", methods=["GET", "POST"])
+def painel_pedidos():
+    """Painel simples (round 26) pra Torres/Luan escreverem pedidos de mudanca de
+    COMPORTAMENTO DO SISTEMA sem precisar abrir uma conversa reexplicando o contexto toda
+    vez. Deliberadamente NAO gera nem sobe codigo sozinho: cada pedido so entra numa fila
+    (banco, com fallback em memoria igual o resto do app) que ainda e implementada, testada
+    (suite de regressao) e publicada manualmente, do mesmo jeito de sempre - só tira o
+    trabalho de escrever tudo de novo numa conversa. Regra de ATENDIMENTO DE CLIENTE
+    continua sendo o comando "regra:"/"regra pro cliente:" direto no WhatsApp (instantâneo,
+    sem deploy, já existia antes desse painel). Protegido pelo mesmo token opcional
+    (DEBUG_TOKEN) do /status-memoria."""
+    if not _checar_token_painel():
+        return jsonify({"erro": "token inválido ou ausente - acesse com ?token=<o valor de DEBUG_TOKEN configurado no Railway>"}), 403
+
+    token = request.args.get("token", "")
+    token_qs = f"?token={token}" if token else ""
+
+    if request.method == "POST":
+        autor = (request.form.get("autor") or "").strip()
+        titulo = (request.form.get("titulo") or "").strip()
+        descricao = (request.form.get("descricao") or "").strip()
+        sep = "&" if token_qs else "?"
+        if autor and titulo and descricao:
+            criar_pedido_mudanca(autor, titulo, descricao)
+            return redirect(f"/painel-pedidos{token_qs}{sep}enviado=1")
+        return redirect(f"/painel-pedidos{token_qs}{sep}erro=1")
+
+    mensagem = None
+    if request.args.get("enviado"):
+        mensagem = "Pedido enviado! Já está na fila abaixo."
+    elif request.args.get("erro"):
+        mensagem = "Preencha quem está pedindo, título e descrição antes de enviar."
+
+    pedidos = listar_pedidos_mudanca()
+    return _render_painel_pedidos_html(token, pedidos, mensagem)
+
+
+@app.route("/painel-pedidos/<int:pedido_id>/atualizar", methods=["POST"])
+def painel_pedidos_atualizar(pedido_id):
+    """Atualiza status/nota de um pedido existente - usado pelo formulariozinho de cada
+    card no painel. Mesma trava de token do /painel-pedidos."""
+    if not _checar_token_painel():
+        return jsonify({"erro": "token inválido ou ausente"}), 403
+    status = request.form.get("status")
+    if status not in STATUS_PEDIDOS_VALIDOS:
+        return jsonify({"erro": "status inválido"}), 400
+    resposta = request.form.get("resposta") or None
+    atualizar_pedido_mudanca(pedido_id, status=status, resposta=resposta)
+    token = request.args.get("token", "")
+    token_qs = f"?token={token}" if token else ""
+    return redirect(f"/painel-pedidos{token_qs}")
 
 
 @app.route("/status-memoria", methods=["GET"])
