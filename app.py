@@ -1476,9 +1476,14 @@ imagem, PDF, áudio (já vem transcrito), vídeo, e principalmente o HISTÓRICO 
 (se vier preenchido) contam junto. Uma foto mandada antes pode ser referenciada depois como "aquela
 foto", um PDF como "aquele documento", um áudio como "o que eu expliquei" - use o histórico pra
 resolver essas referências (nunca invente o que uma referência antiga quer dizer se o histórico não
-deixar claro). Ter acesso a toda essa memória não significa citar tudo na resposta: normalmente
-resposta ao cliente é curta e direta (2-4 frases), mesmo quando você entendeu/considerou uma
-conversa inteira por trás.
+deixar claro). Além do histórico recente, pode vir também um bloco "MENSAGENS MAIS ANTIGAS DESSE
+MESMO GRUPO" - são mensagens de qualquer época (não só as recentes) encontradas porque batem com
+palavras da mensagem atual; trate-as com o MESMO peso do histórico recente pra resolver referências
+e, principalmente, pra checar se uma peça/assunto já foi tratado antes (ver "AJUSTE EM PEÇA JÁ
+EXISTENTE" abaixo) mesmo quando isso aconteceu há tempo suficiente pra ter saído do histórico
+recente. Ter acesso a toda essa memória não significa citar tudo na resposta: normalmente resposta
+ao cliente é curta e direta (2-4 frases), mesmo quando você entendeu/considerou uma conversa inteira
+por trás.
 
 INFORMAÇÃO CONFIRMADA x SUPOSIÇÃO: antes de afirmar qualquer coisa concreta pro cliente (prazo,
 valor, se algo foi aprovado, se um material está certo), classifique mentalmente se aquilo é
@@ -1526,9 +1531,11 @@ que com string vazia "" nas duas.
 AJUSTE EM PEÇA JÁ EXISTENTE (bug real já reportado - NÃO REPITA: uma peça que JÁ tinha sido feita e
 enviada foi tratada como pedido novo do zero e mandada pro designer como se fosse a primeira vez,
 o que gerou trabalho duplicado e deixou o cliente com a impressão de que ninguém lê o histórico):
-antes de marcar "tipo" como "arte", sempre confira primeiro se o HISTÓRICO RECENTE DO GRUPO (ou uma
-entrada "[conteúdo da imagem enviada]: ..."/"[conteúdo do PDF enviado]: ...") já mostra uma peça
-sobre esse mesmo assunto/promoção/evento. Se sim, e a mensagem atual só pede pra mudar um detalhe
+antes de marcar "tipo" como "arte", sempre confira primeiro se o HISTÓRICO RECENTE DO GRUPO, o bloco
+"MENSAGENS MAIS ANTIGAS DESSE MESMO GRUPO" (quando vier preenchido - cobre qualquer época, não só
+os últimos minutos/horas), ou uma entrada "[conteúdo da imagem enviada]: ..."/"[conteúdo do PDF
+enviado]: ..." em qualquer um desses dois já mostra uma peça sobre esse mesmo assunto/promoção/
+evento. Se sim, e a mensagem atual só pede pra mudar um detalhe
 pontual dela (horário, preço, data, um texto específico), marque "eh_ajuste_peca_existente" como
 true. Nesse caso: "tipo" continua "arte" (a equipe de design ainda precisa editar o arquivo), mas
 "pedido_organizado_designer" NUNCA deve ser escrito como se fosse um pedido novo do zero - descreva
@@ -1808,13 +1815,40 @@ def _finalizar_processamento_grupo(chave):
     # Mensagens anteriores desse mesmo grupo (excluindo a leva atual, que ja esta em
     # conteudo_texto) - da pro modelo condicoes de resolver referencias tipo "aquele",
     # "o de ontem", "igual a semana passada", em vez de tentar adivinhar sem contexto.
-    historico_grupo = buscar_mensagens_recentes_grupo(remote_jid, limite=12 + len(textos))
+    # Round 27 (parte 8, pedido explicito do Torres apos o bug do card da Amstel): esse
+    # limite era 12 - baixo demais, o mesmo tipo de problema ja tinha acontecido no privado
+    # (round 27 parte 4/5) por causa de janela curta. Aumentado pra 50 (mais folego numa
+    # conversa longa de ida-e-volta) e complementado, logo abaixo, com busca por palavra-chave
+    # em TODO o historico ja registrado desse grupo (sem limite de tempo/quantidade) - mesmo
+    # mecanismo ja usado no privado, sem precisar de nenhum banco novo/pago: o Postgres que ja
+    # roda no Railway guarda esse historico pra sempre, o gargalo nunca foi armazenamento, foi
+    # só quanto disso entra em cada chamada de classificacao.
+    historico_grupo = buscar_mensagens_recentes_grupo(remote_jid, limite=50 + len(textos))
     historico_grupo = historico_grupo[:-len(textos)] if len(historico_grupo) > len(textos) else []
     bloco_historico = (
         "HISTÓRICO RECENTE DO GRUPO (mais antigo primeiro, pra ajudar a entender referências\n"
         "a pedidos/materiais anteriores):\n"
         + "\n".join(f"- {m['autor']}: {m['conteudo']}" for m in historico_grupo) + "\n\n"
     ) if historico_grupo else ""
+
+    # Busca por palavra-chave em TODO o historico ja registrado desse grupo (nao so a janela
+    # recente de 30 acima) - encontra referencias a algo tratado ha mais tempo (ex: uma peca
+    # enviada ha semanas, fora da janela recente), essencial pro classificador conseguir
+    # aplicar de verdade a checagem de "eh_ajuste_peca_existente" mesmo quando a peca original
+    # ja saiu do historico recente.
+    chaves_ja_no_contexto_grupo = {(m.get("autor"), m.get("conteudo")) for m in historico_grupo}
+    termos_busca_grupo = _extrair_palavras_chave(conteudo_texto)
+    mensagens_antigas_grupo = [
+        m for m in buscar_mensagens_grupo_por_termos(remote_jid, termos_busca_grupo, limite=15)
+        if (m.get("autor"), m.get("conteudo")) not in chaves_ja_no_contexto_grupo
+    ] if termos_busca_grupo else []
+    bloco_historico_antigo_grupo = (
+        "MENSAGENS MAIS ANTIGAS DESSE MESMO GRUPO QUE PODEM SER RELEVANTES (achadas buscando\n"
+        "por palavras da mensagem atual em TODO o histórico já registrado desse grupo, de\n"
+        "qualquer época, não só as recentes acima - use principalmente pra checar se uma\n"
+        "peça/assunto já foi tratado antes, mesmo que tenha saído do histórico recente):\n"
+        + "\n".join(f"- {m['autor']}: {m['conteudo']}" for m in mensagens_antigas_grupo) + "\n\n"
+    ) if mensagens_antigas_grupo else ""
 
     dentro_horario = dentro_do_horario_comercial()
     regras_extras = listar_regras(cliente=grupo["nome"])
@@ -1830,6 +1864,7 @@ def _finalizar_processamento_grupo(chave):
         f"{bloco_regras}"
         f"{bloco_fatos_conhecidos}"
         f"{bloco_historico}"
+        f"{bloco_historico_antigo_grupo}"
         f"Nome do cliente: {sender_name}\n"
         f"Grupo: {grupo['nome']}\n"
         f"Está dentro do horário comercial agora? {'sim' if dentro_horario else 'não'}\n"
