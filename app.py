@@ -2073,6 +2073,24 @@ um pedido de lembrete não é um comando pro Tripa, um fato pra guardar não é 
    similar). Você NÃO corrige nem envia aqui - só identifica a intenção e extrai os textos, quem
    revisa o português e organiza o envio (com aprovação antes de mandar pro cliente) é outra etapa.
 
+14) COMANDO PRA MANDAR UM TEXTO PRONTO, JÁ FINALIZADO, DIRETO PRO GRUPO DE UM CLIENTE (aviso/
+   anúncio decidido pela equipe, NÃO é resposta a uma pergunta que o cliente fez) - ex: "manda esse
+   texto pro grupo do Zurca: Olá! Passando pra avisar que hoje é feriado...", "avisa o Terapia que
+   hoje não teremos atendimento, manda esse texto: ...", "envie isso no grupo do Zurca", "manda pro
+   grupo do cliente X" (depois de {pessoa_nome} já ter ditado um texto pronto numa mensagem anterior
+   aqui mesmo). DIFERENTE do tipo 11 (dica de resposta): lá {pessoa_nome} está respondendo algo que
+   um CLIENTE perguntou/falou; aqui não tem pergunta nenhuma de cliente envolvida, é um comunicado
+   que a equipe decidiu mandar por conta própria. DIFERENTE do tipo 4: o destino aqui é sempre um
+   grupo de CLIENTE, nunca o Tripa (equipe interna de design). Marque "eh_comando_para_grupo_cliente"
+   como true e preencha "texto_comando_grupo_cliente" com o texto exato a mandar (se {pessoa_nome} já
+   ditou esse texto pronto numa mensagem anterior e só agora disse pra qual grupo mandar, REUTILIZE
+   esse texto exato das ÚLTIMAS MENSAGENS - nunca invente um texto novo nem resuma o que foi dito) e
+   "grupo_cliente_comando_nome" com o nome do cliente/grupo mencionado (o mais parecido possível com
+   um cliente cadastrado, ou string vazia se {pessoa_nome} ainda não disse pra qual grupo é - nesse
+   caso você NÃO envia nada, só confirma que anotou o texto e pergunta pra qual grupo é). Você NÃO
+   corrige nem envia aqui - só identifica a intenção e extrai o texto/destino, quem organiza o envio
+   (sempre com preview e aprovação antes de mandar pro cliente, igual ao tipo 11) é outra etapa.
+
 9) COMANDO PRA ANALISAR A CONVERSA DE UM CLIENTE E MONTAR UM BRIEFING PRA TRIPA (ex: "Cintia,
    analise o pedido do Terapia e passa pra Tripa", "veja o que ficou decidido com o Zurca sobre a
    promoção e manda pro designer", "pega tudo que foi resolvido no grupo do Terapia sobre o
@@ -2149,7 +2167,7 @@ um pedido de lembrete não é um comando pro Tripa, um fato pra guardar não é 
    deste prompt) tiverem a resposta pra uma pergunta, use-os pra responder direto. Se for um
    pedido/comando que você ainda não tem como executar automaticamente, confirme que entendeu e que
    vai anotar/repassar, sem inventar que já fez algo que não fez. Nunca deixe esse campo vazio
-   quando nenhum dos tipos 1/2/3/4/6/8/9/10/11/12/13 acima se aplicar - toda mensagem privada
+   quando nenhum dos tipos 1/2/3/4/6/8/9/10/11/12/13/14 acima se aplicar - toda mensagem privada
    precisa de resposta. IMPORTANTE: se {pessoa_nome} estiver claramente selecionando/pedindo de volta algo
    que VOCÊ (Cintia) apresentou nas ÚLTIMAS MENSAGENS acima (ex: "gostei da segunda", "manda só a
    número 2", "essa aí mesmo", "manda de novo"), REUTILIZE o conteúdo exato que você já mandou -
@@ -2193,7 +2211,7 @@ pergunta de ambiguidade anterior sua.
 Responda SEMPRE E APENAS em JSON válido, numa única linha por valor, neste formato exato,
 sem usar bloco de código markdown (nada de ```) e sem quebras de linha dentro dos valores. Inclua
 TODAS as chaves sempre, mesmo vazias/false quando não se aplicarem:
-{"eh_pedido_de_lembrete": true ou false, "destinatario_lembrete": "torres, luan ou tripa - quem deve receber o lembrete", "eh_recorrente": true ou false, "recorrencia_dia_mes": "dia do mes (1-31) se for recorrente mensal, ou string vazia", "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_pedido_mudanca_sistema": true ou false, "eh_pergunta_sobre_grupo": true ou false, "grupo_perguntado": "nome do grupo mencionado, ou string vazia", "eh_pergunta_atividade_geral": true ou false, "eh_pergunta_operacional_geral": true ou false, "eh_comando_para_tripa": true ou false, "mensagem_tripa": "texto pronto pra encaminhar pro grupo Tripa, ou string vazia", "tem_cobranca": true ou false, "horario_cobranca_iso": "horario ISO da cobranca, ou string vazia", "pergunta_cobranca": "pergunta curta pra mandar na cobranca, ou string vazia", "eh_comando_briefing_cliente": true ou false, "briefing_cliente_nome": "nome do cliente/grupo mencionado (ou inferido do contexto), ou string vazia", "briefing_assunto": "pista curta do assunto a analisar, ou string vazia", "eh_pergunta_metricool_metricas": true ou false, "metricool_metrica_cliente": "nome do cliente/marca, ou string vazia", "metricool_metrica_rede": "instagram ou facebook", "metricool_metrica_tipo": "seguidores, reels ou posts", "metricool_metrica_dias": 30, "eh_dica_resposta_cliente": true ou false, "dica_cliente_nome": "nome do cliente mencionado, ou string vazia", "dica_pergunta_cliente": "o que o cliente perguntou/falou, ou string vazia", "dica_resposta_sugerida": "o texto da resposta escrito pela pessoa, ou string vazia", "eh_marcar_pedido_concluido": true ou false, "pedido_cliente_referencia": "nome do cliente do pedido a marcar como resolvido, resolvido pelo contexto quando vier como referência tipo esse/isso, ou string vazia se genuinamente ambíguo", "eh_pedido_de_audio": true ou false, "destino_audio": "privado, tripa, ou nome do cliente/grupo mencionado, ou string vazia", "texto_audio": "texto exato que deve virar fala, ou string vazia", "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/3/4/6/8/9/10/11/12/13 acima for verdadeiro"}
+{"eh_pedido_de_lembrete": true ou false, "destinatario_lembrete": "torres, luan ou tripa - quem deve receber o lembrete", "eh_recorrente": true ou false, "recorrencia_dia_mes": "dia do mes (1-31) se for recorrente mensal, ou string vazia", "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_pedido_mudanca_sistema": true ou false, "eh_pergunta_sobre_grupo": true ou false, "grupo_perguntado": "nome do grupo mencionado, ou string vazia", "eh_pergunta_atividade_geral": true ou false, "eh_pergunta_operacional_geral": true ou false, "eh_comando_para_tripa": true ou false, "mensagem_tripa": "texto pronto pra encaminhar pro grupo Tripa, ou string vazia", "tem_cobranca": true ou false, "horario_cobranca_iso": "horario ISO da cobranca, ou string vazia", "pergunta_cobranca": "pergunta curta pra mandar na cobranca, ou string vazia", "eh_comando_briefing_cliente": true ou false, "briefing_cliente_nome": "nome do cliente/grupo mencionado (ou inferido do contexto), ou string vazia", "briefing_assunto": "pista curta do assunto a analisar, ou string vazia", "eh_pergunta_metricool_metricas": true ou false, "metricool_metrica_cliente": "nome do cliente/marca, ou string vazia", "metricool_metrica_rede": "instagram ou facebook", "metricool_metrica_tipo": "seguidores, reels ou posts", "metricool_metrica_dias": 30, "eh_dica_resposta_cliente": true ou false, "dica_cliente_nome": "nome do cliente mencionado, ou string vazia", "dica_pergunta_cliente": "o que o cliente perguntou/falou, ou string vazia", "dica_resposta_sugerida": "o texto da resposta escrito pela pessoa, ou string vazia", "eh_marcar_pedido_concluido": true ou false, "pedido_cliente_referencia": "nome do cliente do pedido a marcar como resolvido, resolvido pelo contexto quando vier como referência tipo esse/isso, ou string vazia se genuinamente ambíguo", "eh_pedido_de_audio": true ou false, "destino_audio": "privado, tripa, ou nome do cliente/grupo mencionado, ou string vazia", "texto_audio": "texto exato que deve virar fala, ou string vazia", "eh_comando_para_grupo_cliente": true ou false, "grupo_cliente_comando_nome": "nome do cliente/grupo mencionado, ou string vazia se ainda nao foi dito", "texto_comando_grupo_cliente": "texto exato (pronto, ja finalizado) pra mandar pro grupo do cliente, reaproveitado de uma mensagem anterior se for o caso, ou string vazia", "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/3/4/6/8/9/10/11/12/13/14 acima for verdadeiro"}
 """
 
 
@@ -4972,6 +4990,61 @@ def processar_dm(remote_jid, key, data):
                 f"Ficou assim pra mandar pro {grupo_nome_dica}:\n\n\"{resposta_corrigida_dica}\"\n\n"
                 "Confirma que posso mandar? (responde \"sim\" ou \"não\")"
             )
+    elif resultado.get("eh_comando_para_grupo_cliente") and resultado.get("texto_comando_grupo_cliente"):
+        # Round 27, bug real reportado pelo Torres: ele ditou um texto pronto (aviso de feriado)
+        # e pediu pra mandar no grupo do Zurca - a Cintia respondeu "vou enviar"/"combinado, vou
+        # enviar" DUAS vezes seguidas, mas nao tinha NENHUM mecanismo de verdade por tras disso
+        # (confirmado nos logs: todos os campos da classificacao vieram vazios/false, so caiu no
+        # "resposta_conversa" generico) - ela so prometeu, sem enviar nada, exatamente o tipo de
+        # promessa vazia que o round 23 ja tinha identificado como problema. Diferente da "dica de
+        # resposta pro cliente" (tipo 11, que responde uma pergunta que o cliente fez), aqui e um
+        # comunicado que a equipe decidiu mandar por conta propria. Reaproveita o MESMO mecanismo
+        # de confirmacao da dica de resposta (mesmas chaves em _comandos_pendentes) - grupo de
+        # cliente e sensivel demais pra sair sem revisao, pelo mesmo motivo de sempre.
+        nome_mencionado_comando_grupo = (resultado.get("grupo_cliente_comando_nome") or "").strip()
+        texto_bruto_comando_grupo = resultado["texto_comando_grupo_cliente"]
+        if not nome_mencionado_comando_grupo:
+            responder(
+                f"Anotei o texto que você quer mandar:\n\n\"{texto_bruto_comando_grupo}\"\n\n"
+                "Pra qual grupo/cliente é?"
+            )
+        else:
+            candidatos_comando_grupo = identificar_grupos_candidatos(nome_mencionado_comando_grupo)
+            if not candidatos_comando_grupo:
+                responder(
+                    f"Entendi que é pra mandar uma mensagem pro grupo \"{nome_mencionado_comando_grupo}\", mas "
+                    "não achei esse cliente cadastrado. Pode confirmar o nome certinho?"
+                )
+            elif len(candidatos_comando_grupo) > 1:
+                nomes_candidatos_comando_grupo = ", ".join(GRUPOS[jid]["nome"] for jid in candidatos_comando_grupo)
+                responder(
+                    f"Encontrei mais de um cliente relacionado a \"{nome_mencionado_comando_grupo}\": "
+                    f"{nomes_candidatos_comando_grupo}. Pra qual deles é essa mensagem?"
+                )
+            else:
+                grupo_jid_comando = candidatos_comando_grupo[0]
+                grupo_nome_comando = GRUPOS[grupo_jid_comando]["nome"]
+                try:
+                    resultado_correcao_comando = chamar_claude(SYSTEM_PROMPT_CORRECAO_CONSERVADORA, texto_bruto_comando_grupo)
+                    texto_corrigido_comando_grupo = resultado_correcao_comando.get("texto_corrigido") or texto_bruto_comando_grupo
+                except Exception as e:
+                    print(f"[comando_para_grupo_cliente] erro ao corrigir texto, usando o original: {e}", flush=True)
+                    texto_corrigido_comando_grupo = texto_bruto_comando_grupo
+                _comandos_pendentes[pessoa] = {
+                    "mensagem_tripa": texto_corrigido_comando_grupo,
+                    "tem_cobranca": False,
+                    "horario_cobranca": None,
+                    "pergunta_cobranca": "",
+                    "criado_em": time.time(),
+                    "eh_resposta_cliente": True,
+                    "jid_destino": grupo_jid_comando,
+                    "cliente_nome_resposta": grupo_nome_comando,
+                    "pergunta_cliente_resposta": "",
+                }
+                responder(
+                    f"Ficou assim pra mandar pro {grupo_nome_comando}:\n\n\"{texto_corrigido_comando_grupo}\"\n\n"
+                    "Confirma que posso mandar? (responde \"sim\" ou \"não\")"
+                )
     elif resultado.get("eh_marcar_pedido_concluido"):
         # Torres/Luan avisando que um pedido de arte pendente ja foi resolvido/feito - o caso
         # mais comum e uma referencia curta ("esse ja foi resolvido") logo depois da propria
