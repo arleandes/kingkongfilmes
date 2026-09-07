@@ -2160,6 +2160,18 @@ um pedido de lembrete não é um comando pro Tripa, um fato pra guardar não é 
    nome não veio explícito na mensagem atual - o objetivo é NUNCA obrigar {pessoa_nome}/Luan a
    repetir uma informação que a conversa já deixou clara.
 
+   MAIS DE UM PEDIDO DE UMA VEZ (bug real já reportado - NÃO REPITA): é muito comum, logo depois
+   que você lista mais de um pedido pendente (no "📋 Resumo do fim do expediente" ou na sua própria
+   pergunta "qual deles: X, Y?"), {pessoa_nome}/Luan fechar TODOS eles de uma vez, não só um. Preste
+   atenção em qual desses dois casos é: (a) referência GENÉRICA/PLURAL sem citar nome de cliente
+   nenhum (ex: "os dois", "os dois pedidos", "ambos", "todos", "todos os pedidos", "tudo que tá
+   pendente", "pode fechar geral") - aqui marque "eh_marcar_todos_pedidos_pendentes" como true e
+   deixe "pedido_cliente_referencia" vazio; (b) dois ou mais nomes de cliente citados explicitamente
+   na mesma mensagem (ex: "o do Grupo lembrete e o do Zurca já foram feitos", "Zurca, Terapia e
+   Grupo lembrete resolvidos") - aqui coloque TODOS os nomes citados em "pedido_cliente_referencia",
+   separados por " e " (ex: "Grupo lembrete e Zurca"), nunca descarte nenhum dos nomes citados nem
+   junte tudo como se fosse um cliente só.
+
 13) PEDIDO PRA VOCÊ MANDAR UM ÁUDIO (nota de voz de verdade, com onda sonora, como se alguém
    tivesse gravado ali na hora) EM VEZ DE TEXTO (ex: "manda isso em áudio", "responde por voz",
    "manda um áudio pro Zurca avisando que já foi", "manda um áudio pra Tripa perguntando sobre X",
@@ -2225,7 +2237,7 @@ pergunta de ambiguidade anterior sua.
 Responda SEMPRE E APENAS em JSON válido, numa única linha por valor, neste formato exato,
 sem usar bloco de código markdown (nada de ```) e sem quebras de linha dentro dos valores. Inclua
 TODAS as chaves sempre, mesmo vazias/false quando não se aplicarem:
-{"eh_pedido_de_lembrete": true ou false, "destinatario_lembrete": "torres, luan ou tripa - quem deve receber o lembrete", "eh_recorrente": true ou false, "recorrencia_dia_mes": "dia do mes (1-31) se for recorrente mensal, ou string vazia", "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_pedido_mudanca_sistema": true ou false, "eh_pergunta_sobre_grupo": true ou false, "grupo_perguntado": "nome do grupo mencionado, ou string vazia", "eh_pergunta_atividade_geral": true ou false, "eh_pergunta_operacional_geral": true ou false, "eh_comando_para_tripa": true ou false, "mensagem_tripa": "texto pronto pra encaminhar pro grupo Tripa, ou string vazia", "tem_cobranca": true ou false, "horario_cobranca_iso": "horario ISO da cobranca, ou string vazia", "pergunta_cobranca": "pergunta curta pra mandar na cobranca, ou string vazia", "eh_comando_briefing_cliente": true ou false, "briefing_cliente_nome": "nome do cliente/grupo mencionado (ou inferido do contexto), ou string vazia", "briefing_assunto": "pista curta do assunto a analisar, ou string vazia", "eh_pergunta_metricool_metricas": true ou false, "metricool_metrica_cliente": "nome do cliente/marca, ou string vazia", "metricool_metrica_rede": "instagram ou facebook", "metricool_metrica_tipo": "seguidores, reels ou posts", "metricool_metrica_dias": 30, "eh_dica_resposta_cliente": true ou false, "dica_cliente_nome": "nome do cliente mencionado, ou string vazia", "dica_pergunta_cliente": "o que o cliente perguntou/falou, ou string vazia", "dica_resposta_sugerida": "o texto da resposta escrito pela pessoa, ou string vazia", "eh_marcar_pedido_concluido": true ou false, "pedido_cliente_referencia": "nome do cliente do pedido a marcar como resolvido, resolvido pelo contexto quando vier como referência tipo esse/isso, ou string vazia se genuinamente ambíguo", "eh_pedido_de_audio": true ou false, "destino_audio": "privado, tripa, ou nome do cliente/grupo mencionado, ou string vazia", "texto_audio": "texto exato que deve virar fala, ou string vazia", "eh_comando_para_grupo_cliente": true ou false, "grupo_cliente_comando_nome": "nome do cliente/grupo mencionado, ou string vazia se ainda nao foi dito", "texto_comando_grupo_cliente": "texto exato (pronto, ja finalizado) pra mandar pro grupo do cliente, reaproveitado de uma mensagem anterior se for o caso, ou string vazia", "eh_comando_para_compor_aviso_cliente": true ou false, "grupo_cliente_compor_nome": "nome do cliente/grupo mencionado, ou string vazia se ainda nao foi dito", "instrucao_aviso_cliente": "a descricao/instrucao completa do que precisa ser comunicado, preservando todos os detalhes dados, ou string vazia", "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/3/4/6/8/9/10/11/12/13/14/15 acima for verdadeiro"}
+{"eh_pedido_de_lembrete": true ou false, "destinatario_lembrete": "torres, luan ou tripa - quem deve receber o lembrete", "eh_recorrente": true ou false, "recorrencia_dia_mes": "dia do mes (1-31) se for recorrente mensal, ou string vazia", "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_pedido_mudanca_sistema": true ou false, "eh_pergunta_sobre_grupo": true ou false, "grupo_perguntado": "nome do grupo mencionado, ou string vazia", "eh_pergunta_atividade_geral": true ou false, "eh_pergunta_operacional_geral": true ou false, "eh_comando_para_tripa": true ou false, "mensagem_tripa": "texto pronto pra encaminhar pro grupo Tripa, ou string vazia", "tem_cobranca": true ou false, "horario_cobranca_iso": "horario ISO da cobranca, ou string vazia", "pergunta_cobranca": "pergunta curta pra mandar na cobranca, ou string vazia", "eh_comando_briefing_cliente": true ou false, "briefing_cliente_nome": "nome do cliente/grupo mencionado (ou inferido do contexto), ou string vazia", "briefing_assunto": "pista curta do assunto a analisar, ou string vazia", "eh_pergunta_metricool_metricas": true ou false, "metricool_metrica_cliente": "nome do cliente/marca, ou string vazia", "metricool_metrica_rede": "instagram ou facebook", "metricool_metrica_tipo": "seguidores, reels ou posts", "metricool_metrica_dias": 30, "eh_dica_resposta_cliente": true ou false, "dica_cliente_nome": "nome do cliente mencionado, ou string vazia", "dica_pergunta_cliente": "o que o cliente perguntou/falou, ou string vazia", "dica_resposta_sugerida": "o texto da resposta escrito pela pessoa, ou string vazia", "eh_marcar_pedido_concluido": true ou false, "eh_marcar_todos_pedidos_pendentes": true ou false, "pedido_cliente_referencia": "nome(s) do(s) cliente(s) do(s) pedido(s) a marcar como resolvido, resolvido pelo contexto quando vier como referência tipo esse/isso, varios nomes separados por \" e \" se mais de um for citado, ou string vazia se genuinamente ambíguo ou se eh_marcar_todos_pedidos_pendentes for true","eh_pedido_de_audio": true ou false, "destino_audio": "privado, tripa, ou nome do cliente/grupo mencionado, ou string vazia", "texto_audio": "texto exato que deve virar fala, ou string vazia", "eh_comando_para_grupo_cliente": true ou false, "grupo_cliente_comando_nome": "nome do cliente/grupo mencionado, ou string vazia se ainda nao foi dito", "texto_comando_grupo_cliente": "texto exato (pronto, ja finalizado) pra mandar pro grupo do cliente, reaproveitado de uma mensagem anterior se for o caso, ou string vazia", "eh_comando_para_compor_aviso_cliente": true ou false, "grupo_cliente_compor_nome": "nome do cliente/grupo mencionado, ou string vazia se ainda nao foi dito", "instrucao_aviso_cliente": "a descricao/instrucao completa do que precisa ser comunicado, preservando todos os detalhes dados, ou string vazia", "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/3/4/6/8/9/10/11/12/13/14/15 acima for verdadeiro"}
 """
 
 
@@ -4777,7 +4789,14 @@ def processar_dm(remote_jid, key, data):
     # classificada isolada, sem noção do que tinha acabado de ser perguntado/
     # combinado, e por isso um "sim"/"isso"/"está público" solto não fazia sentido
     # pra ela fora do fluxo de confirmação pendente.
-    historico_dm = buscar_mensagens_recentes_grupo(grupo_jid_dm, limite=13)[:-1]
+    # Round 27 (parte 4): Torres reportou, com print real, uma troca de ~10 mensagens indo e
+    # voltando sobre os MESMOS 2 pedidos pendentes (Grupo lembrete/Zurca) sem ela conseguir
+    # fechar - o limite antigo (13) fazia a mensagem que citava os nomes dos 2 pedidos (o
+    # "📋 Resumo do fim do expediente") sair da janela de contexto bem no meio da conversa,
+    # justamente quando mais precisava dela. Aumentado pra 40 pra cobrir conversas mais longas
+    # de vai-e-vem sem perder o começo do assunto (custo extra de tokens é desprezível perto do
+    # ganho de não perder contexto no meio de uma conversa real).
+    historico_dm = buscar_mensagens_recentes_grupo(grupo_jid_dm, limite=40)[:-1]
     contexto_conversa = (
         "ÚLTIMAS MENSAGENS DESSA CONVERSA (mais antiga primeiro - use pra entender o\n"
         "contexto, ex: se \"isso\"/\"esse\"/\"sim\" está se referindo a algo que você acabou\n"
@@ -5169,8 +5188,36 @@ def processar_dm(remote_jid, key, data):
         # ja tenta resolver "esse"/"isso" usando o contexto da conversa antes de chegar aqui. So
         # perguntamos de novo quando sobra mais de uma possibilidade real (round 24 - antes disso
         # ela ficava perguntando "qual card?" mesmo com um so pedido em aberto, obrigando repetir).
+        #
+        # Round 27 (parte 4, bug real com print): quando havia 2+ pedidos pendentes, uma
+        # referencia PLURAL ("os dois", "os dois pedidos") nao batia com nome nenhum de
+        # cliente, entao caia sempre no ramo de ambiguidade e ficava repetindo a MESMA
+        # pergunta "qual deles?" pra sempre, mesmo Torres respondendo repetidas vezes. E
+        # quando ele citava os dois nomes na mesma frase ("o grupo lembrete e o do zurca"),
+        # o classificador colocava os dois nomes juntos num "pedido_cliente_referencia" so
+        # (ex: "Grupo lembrete (TESTE) e Zurca"), que nao batia com NENHUM cliente cadastrado
+        # - ela respondia "não achei" com os dois nomes colados, sem fechar nenhum dos dois.
+        # Agora: referencia plural generica fecha TODOS os pedidos pendentes de uma vez
+        # (eh_marcar_todos_pedidos_pendentes), e uma referencia com varios nomes juntos e
+        # separada e resolvida um a um, em vez de tratada como um nome so.
+        marcar_todos_pendentes = bool(resultado.get("eh_marcar_todos_pedidos_pendentes"))
         nome_pedido_ref = (resultado.get("pedido_cliente_referencia") or "").strip()
-        if not nome_pedido_ref:
+
+        if marcar_todos_pendentes:
+            pendentes_agora = listar_tarefas_pendentes()
+            if not pendentes_agora:
+                responder("Não achei nenhum pedido em aberto agora pra marcar como resolvido - já deve estar tudo certo por aqui.")
+            else:
+                nomes_fechados = []
+                for tarefa in pendentes_agora:
+                    adicionar_evento_tarefa(
+                        tarefa["id"], "concluido_manual",
+                        f"Marcado como resolvido manualmente por {pessoa}",
+                        autor=pessoa, novo_status=STATUS_CONCLUIDO,
+                    )
+                    nomes_fechados.append(tarefa.get("cliente_nome"))
+                responder(f"Perfeito, marquei como resolvido: {', '.join(nomes_fechados)}. ✅")
+        elif not nome_pedido_ref:
             pendentes_agora = listar_tarefas_pendentes()
             if not pendentes_agora:
                 responder("Não achei nenhum pedido em aberto agora pra marcar como resolvido - já deve estar tudo certo por aqui.")
@@ -5187,23 +5234,56 @@ def processar_dm(remote_jid, key, data):
                     f"{t.get('cliente_nome')} ({_STATUS_LEGIVEL.get(t.get('status'), t.get('status'))})"
                     for t in pendentes_agora
                 )
-                responder(f"Tem mais de um pedido em aberto agora, qual deles: {opcoes_pendentes}?")
-        else:
-            candidatos_pedido = identificar_grupos_candidatos(nome_pedido_ref)
-            nome_cliente_pedido = GRUPOS[candidatos_pedido[0]]["nome"] if len(candidatos_pedido) == 1 else nome_pedido_ref
-            tarefa_referenciada = buscar_tarefa_pendente_por_cliente(nome_cliente_pedido)
-            if not tarefa_referenciada:
                 responder(
-                    f"Não achei nenhum pedido em aberto do {nome_cliente_pedido} pra marcar como "
-                    "resolvido - já deve estar concluído, ou é outro cliente?"
+                    f"Tem mais de um pedido em aberto agora, qual deles: {opcoes_pendentes}? "
+                    "(pode responder com os nomes ou dizer \"todos\"/\"os dois\")"
                 )
+        else:
+            nomes_referenciados = [
+                n.strip() for n in re.split(r"\s*(?:,| e | & )\s*", nome_pedido_ref) if n.strip()
+            ]
+            if len(nomes_referenciados) > 1:
+                # Mais de um nome citado na mesma mensagem - resolve cada um
+                # independentemente, em vez de tratar a frase toda como um nome de cliente só.
+                fechados, nao_encontrados = [], []
+                for nome_ref in nomes_referenciados:
+                    candidatos_ref = identificar_grupos_candidatos(nome_ref)
+                    nome_cliente_ref = GRUPOS[candidatos_ref[0]]["nome"] if len(candidatos_ref) == 1 else nome_ref
+                    tarefa_ref = buscar_tarefa_pendente_por_cliente(nome_cliente_ref)
+                    if tarefa_ref:
+                        adicionar_evento_tarefa(
+                            tarefa_ref["id"], "concluido_manual",
+                            f"Marcado como resolvido manualmente por {pessoa}",
+                            autor=pessoa, novo_status=STATUS_CONCLUIDO,
+                        )
+                        fechados.append(nome_cliente_ref)
+                    else:
+                        nao_encontrados.append(nome_cliente_ref)
+                partes_resposta = []
+                if fechados:
+                    partes_resposta.append(f"Marquei como resolvido: {', '.join(fechados)}. ✅")
+                if nao_encontrados:
+                    partes_resposta.append(
+                        f"Não achei pedido em aberto de: {', '.join(nao_encontrados)} - já deve "
+                        "estar concluído, ou é outro cliente?"
+                    )
+                responder(" ".join(partes_resposta))
             else:
-                adicionar_evento_tarefa(
-                    tarefa_referenciada["id"], "concluido_manual",
-                    f"Marcado como resolvido manualmente por {pessoa}",
-                    autor=pessoa, novo_status=STATUS_CONCLUIDO,
-                )
-                responder(f"Perfeito. Vou considerar o pedido do {nome_cliente_pedido} como resolvido. ✅")
+                candidatos_pedido = identificar_grupos_candidatos(nome_pedido_ref)
+                nome_cliente_pedido = GRUPOS[candidatos_pedido[0]]["nome"] if len(candidatos_pedido) == 1 else nome_pedido_ref
+                tarefa_referenciada = buscar_tarefa_pendente_por_cliente(nome_cliente_pedido)
+                if not tarefa_referenciada:
+                    responder(
+                        f"Não achei nenhum pedido em aberto do {nome_cliente_pedido} pra marcar como "
+                        "resolvido - já deve estar concluído, ou é outro cliente?"
+                    )
+                else:
+                    adicionar_evento_tarefa(
+                        tarefa_referenciada["id"], "concluido_manual",
+                        f"Marcado como resolvido manualmente por {pessoa}",
+                        autor=pessoa, novo_status=STATUS_CONCLUIDO,
+                    )
+                    responder(f"Perfeito. Vou considerar o pedido do {nome_cliente_pedido} como resolvido. ✅")
     elif resultado.get("eh_pedido_de_audio") and resultado.get("texto_audio"):
         # Round 25, pedido do Torres: só manda nota de voz (com onda sonora, como se alguém
         # tivesse gravado ali na hora) quando ELE ou o Luan pedirem explicitamente - nunca
