@@ -1447,6 +1447,22 @@ def chamar_claude(system_prompt, conteudo_usuario, imagem_base64=None, pdf_base6
         return json.loads(texto)
     except json.JSONDecodeError:
         print(f"[chamar_claude] resposta nao-JSON do Claude (stop_reason={stop_reason}): {texto[:800]}", flush=True)
+        # Bug real visto em producao (round 27 parte 12): "Unterminated string starting at:
+        # ..." ao revisar um PDF de 2 paginas cheio de itens (cardapio/programacao) - o
+        # bloco de texto veio CORTADO no meio de uma string (JSON incompleto), mas isso so
+        # e pego aqui, DEPOIS do bloco "nenhum bloco de texto" acima (que so cobre o caso de
+        # cortar ainda dentro do "thinking", sem chegar a escrever texto nenhum). Sem isso, uma
+        # resposta cortada no meio do texto de verdade sempre virava esse erro sem nenhuma
+        # tentativa a mais, mesmo o stop_reason ja indicando max_tokens claramente. Mesma rede
+        # de seguranca do caso acima: tenta UMA vez a mais com orcamento bem maior antes de
+        # desistir de verdade.
+        if stop_reason == "max_tokens" and _tentativa == 1:
+            novo_max_tokens = max(max_tokens * 3, max_tokens + 3000)
+            print(f"[chamar_claude] JSON cortado por max_tokens - tentando de novo com max_tokens={novo_max_tokens} (era {max_tokens})", flush=True)
+            return chamar_claude(
+                system_prompt, conteudo_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64,
+                max_tokens=novo_max_tokens, timeout=timeout, thinking_budget=thinking_budget, _tentativa=2,
+            )
         raise
 
 
@@ -4003,13 +4019,23 @@ def processar_revisao_grupo_designer(remote_jid, key, data):
     try:
         tem_erro, texto_resp, resultado = revisar_peca(imagem_base64, pdf_base64, caption)
     except Exception as e:
-        # Erro técnico de verdade (não é um veredito sobre a peça) - isso sim avisa sempre no
-        # grupo, mesmo em silêncio, porque senão o designer pensaria que foi revisada e passou.
+        # Bug real reportado por Torres (round 27 parte 12 - "ela só pode corrigir se agente
+        # pedir", "novamente Cintia querendo consertar as coisas no grupo de Tripa"): esse
+        # aviso de erro ERA mandado pro grupo sempre, mesmo quando a análise era só a
+        # verificação SILENCIOSA de fundo (ninguém pediu revisão - ex: um PDF de cliente
+        # encaminhado só pra equipe TRABALHAR em cima, tipo "corre pra fazer isso", não pra
+        # conferir). Isso fazia parecer que ela estava "tentando corrigir" uma peça que
+        # ninguém pediu revisão nenhuma - exatamente o tipo de interrupção não pedida que já
+        # foi corrigida antes pro veredito normal (_falar_no_grupo), mas esse caminho de erro
+        # técnico tinha ficado de fora daquela regra. Agora segue a MESMA regra: só avisa no
+        # grupo se havia um pedido explícito de conferência (legenda pedindo revisão) -  sem
+        # isso, fica só no log/histórico (silencioso), igual qualquer outro resultado dessa
+        # análise de fundo.
         print(f"[processar_revisao_grupo_designer] erro claude: {e}", flush=True)
-        enviar_texto(remote_jid, "Tive um problema pra revisar essa peça agora, pode mandar de novo em instantes?")
+        _falar_no_grupo("Tive um problema pra revisar essa peça agora, pode mandar de novo em instantes?")
         prefixo_legenda = f" (legenda: {caption})" if caption else ""
         _registrar_log_tripa(remote_jid, data, f"[imagem/arte enviada{prefixo_legenda} - erro ao revisar, não sei o que tinha nela]")
-        return {"erro_claude": str(e)}
+        return {"erro_claude": str(e), "avisou_grupo": pedido_explicito}
 
     pontos_ortografia = _formatar_pontos_ortografia(resultado)
 
