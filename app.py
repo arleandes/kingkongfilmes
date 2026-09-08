@@ -1188,13 +1188,27 @@ def salvar_midia_drive(cliente_nome, categoria, conteudo_bytes, nome_arquivo, mi
         return None
 
 
+def _nome_pasta_drive_grupo(grupo):
+    """Nome da pasta de topo dentro de 'Cintia Backup' pra esse grupo: nome do cliente pra
+    grupos de cliente; nomes fixos e limpos ("Tripa", "Gestão") pros grupos internos, em vez
+    do nome bruto de exibição (cheio de emoji/separadores, ex: "Correria • Gestão 💎"). Round
+    27 parte 9, expandido a pedido do Torres ("não só dos clientes") - inicialmente o backup
+    só cobria grupo de cliente, agora cobre todo mundo, cada um na sua própria pasta."""
+    if not grupo.get("interno"):
+        return grupo["nome"]
+    nome_lower = grupo["nome"].lower()
+    if "tripa" in nome_lower:
+        return "Tripa"
+    if "gest" in nome_lower:  # cobre "gestão"/"gestao"
+        return "Gestão"
+    return grupo["nome"]
+
+
 def salvar_midia_grupo_drive(grupo, sender_name, midia_base64, categoria, extensao, mimetype):
-    """Ponto único que decide se um arquivo recebido num GRUPO deve ser salvo no Google
-    Drive: só pra grupos de CLIENTE (nunca interno - Tripa/Gestão, que não têm "nome de
-    cliente" fazendo sentido na estrutura de pastas pedida pelo Torres), e só se tiver
-    mídia de verdade. Devolve o link salvo, ou None silenciosamente em qualquer caso que
-    não se aplique ou falhe."""
-    if grupo.get("interno") or not midia_base64:
+    """Ponto único que salva um arquivo recebido num GRUPO (de cliente OU interno - Tripa/
+    Gestão) no Google Drive, só se tiver mídia de verdade. Devolve o link salvo, ou None
+    silenciosamente em qualquer caso que não se aplique ou falhe."""
+    if not midia_base64:
         return None
     try:
         conteudo_bytes = base64.b64decode(midia_base64)
@@ -1202,7 +1216,8 @@ def salvar_midia_grupo_drive(grupo, sender_name, midia_base64, categoria, extens
         return None
     agora = horario_bahia_agora()
     nome_arquivo = f"{agora.strftime('%Hh%M')}_{sender_name}.{extensao}".replace("/", "-")
-    return salvar_midia_drive(grupo["nome"], categoria, conteudo_bytes, nome_arquivo, mimetype)
+    nome_pasta = _nome_pasta_drive_grupo(grupo)
+    return salvar_midia_drive(nome_pasta, categoria, conteudo_bytes, nome_arquivo, mimetype)
 
 
 _nomes_grupo_desconhecido_cache = {}
@@ -3800,6 +3815,18 @@ def processar_revisao_grupo_designer(remote_jid, key, data):
         if "audio" in tipo_lower or "ptt" in tipo_lower:
             transcricao = _transcrever_audio_tripa(key)
             conteudo_log_tripa = f"[áudio] {transcricao}" if transcricao else "[áudio enviado - não consegui transcrever]"
+        elif "video" in tipo_lower:
+            # Backup no Drive (round 27 parte 9, expandido: Torres pediu que cubra "não só
+            # clientes") - vídeo postado no Tripa também é salvo de verdade, com o link
+            # acrescentado ao log de texto já existente.
+            video_b64_tripa = baixar_midia(key)
+            link_video_tripa = salvar_midia_grupo_drive(
+                GRUPOS.get(remote_jid, {"nome": "Tripa", "interno": True}), data.get("pushName", "equipe"),
+                video_b64_tripa, "Vídeos", "mp4", "video/mp4",
+            )
+            conteudo_log_tripa = _extrair_texto_log_tripa(data, message_type)
+            if conteudo_log_tripa and link_video_tripa:
+                conteudo_log_tripa += f" (arquivo salvo: {link_video_tripa})"
         else:
             # Um texto solto pedindo conferencia (ex: "esta certo?"/"confere isso", sem reenviar
             # a peça) reconfere a ULTIMA arte enviada aqui - mesmo comportamento que ja existe no
@@ -3833,6 +3860,15 @@ def processar_revisao_grupo_designer(remote_jid, key, data):
         _registrar_log_tripa(remote_jid, data, f"[imagem/arquivo enviado{prefixo_legenda} - não consegui baixar pra revisar]")
         print(f"[processar_revisao_grupo_designer] {aviso}", flush=True)
         return {"skipped": aviso}
+
+    # Backup no Drive (round 27 parte 9, expandido: Torres pediu que cubra "não só clientes") -
+    # toda peça postada no Tripa também é salva de verdade, não só a análise em texto.
+    grupo_tripa = GRUPOS.get(remote_jid, {"nome": "Tripa", "interno": True})
+    link_drive_tripa = None
+    if imagem_base64:
+        link_drive_tripa = salvar_midia_grupo_drive(grupo_tripa, data.get("pushName", "equipe"), imagem_base64, "Fotos", "jpg", "image/jpeg")
+    elif pdf_base64:
+        link_drive_tripa = salvar_midia_grupo_drive(grupo_tripa, data.get("pushName", "equipe"), pdf_base64, "PDF", "pdf", "application/pdf")
 
     # A legenda da PRÓPRIA imagem já pode ser um pedido explícito (ex: legenda "confere isso" ou
     # "está certo?" junto com a peça) - só nesse caso ela fala no grupo automaticamente; sem isso,
@@ -3924,7 +3960,8 @@ def processar_revisao_grupo_designer(remote_jid, key, data):
     # texto que passaram por perto da imagem. Isso acontece MESMO quando ela ficou em silêncio no
     # grupo - analisar e guardar sempre, comentar só quando pedido.
     prefixo_legenda = f" (legenda: {caption})" if caption else ""
-    _registrar_log_tripa(remote_jid, data, f"[arte revisada{prefixo_legenda}] {veredito_final}")
+    sufixo_drive_tripa = f" (arquivo salvo: {link_drive_tripa})" if link_drive_tripa else ""
+    _registrar_log_tripa(remote_jid, data, f"[arte revisada{prefixo_legenda}] {veredito_final}{sufixo_drive_tripa}")
 
     return {"resultado": resultado, "cliente_identificado": cliente_nome, "comparacao": resultado_comparacao, "falou_no_grupo": pedido_explicito}
 
@@ -3940,8 +3977,9 @@ def processar_mensagem_grupo_gestao(remote_jid, key, data):
     explícito em texto."""
     message_type = data.get("messageType", "")
     tipo_lower = message_type.lower()
-    conteudo_log, _im, _pdf, _doc, _vid = extrair_conteudo_mensagem_grupo(key, data)
-    grupo_nome = GRUPOS.get(remote_jid, {}).get("nome", "Gestão")
+    conteudo_log, imagem_b64_gestao, pdf_b64_gestao, _doc, video_b64_gestao = extrair_conteudo_mensagem_grupo(key, data)
+    grupo_gestao = GRUPOS.get(remote_jid, {"nome": "Gestão", "interno": True})
+    grupo_nome = grupo_gestao.get("nome", "Gestão")
     sender_name = data.get("pushName", "equipe")
     _participant, eh_equipe = _detectar_participante_grupo(key, data)
 
@@ -3952,6 +3990,18 @@ def processar_mensagem_grupo_gestao(remote_jid, key, data):
         else:
             caption = message.get("documentMessage", {}).get("caption", "")
         _guardar_ultima_arte(remote_jid, key, message_type, caption, extrair_cliente_da_legenda(caption))
+
+    # Backup no Drive (round 27 parte 9, expandido: Torres pediu que cubra "não só clientes") -
+    # toda mídia postada no Gestão também é salva de verdade, com o link acrescentado ao log.
+    link_drive_gestao = None
+    if imagem_b64_gestao:
+        link_drive_gestao = salvar_midia_grupo_drive(grupo_gestao, sender_name, imagem_b64_gestao, "Fotos", "jpg", "image/jpeg")
+    elif pdf_b64_gestao:
+        link_drive_gestao = salvar_midia_grupo_drive(grupo_gestao, sender_name, pdf_b64_gestao, "PDF", "pdf", "application/pdf")
+    elif video_b64_gestao:
+        link_drive_gestao = salvar_midia_grupo_drive(grupo_gestao, sender_name, video_b64_gestao, "Vídeos", "mp4", "video/mp4")
+    if conteudo_log and link_drive_gestao:
+        conteudo_log += f" (arquivo salvo: {link_drive_gestao})"
 
     if conteudo_log:
         registrar_mensagem_grupo(remote_jid, grupo_nome, sender_name, conteudo_log, eh_equipe)
@@ -4823,7 +4873,24 @@ def processar_dm(remote_jid, key, data):
 
     # Foto ou PDF no privado = pedido de revisao de peca (nao de lembrete).
     if "image" in tipo_lower or "document" in tipo_lower:
-        registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, pessoa, "[enviou imagem/PDF pra revisão de arte]", True)
+        # Backup no Drive (round 27 parte 9, expandido: Torres pediu que cubra "não só
+        # clientes") - pasta própria "Torres"/"Luan" dentro de "Cintia Backup". Baixa a
+        # midia de novo aqui (separado do fluxo de revisão logo abaixo, que só baixa quando
+        # há pedido explícito) pra garantir que TODO arquivo enviado é salvo, não só os que
+        # geram revisão de verdade.
+        nome_pasta_dm = "Torres" if pessoa == "torres" else "Luan"
+        grupo_dm_drive = {"nome": nome_pasta_dm, "interno": False}
+        midia_b64_dm = baixar_midia(key)
+        link_dm = None
+        if midia_b64_dm:
+            if "image" in tipo_lower:
+                link_dm = salvar_midia_grupo_drive(grupo_dm_drive, pessoa, midia_b64_dm, "Fotos", "jpg", "image/jpeg")
+            else:
+                nome_doc_dm = message.get("documentMessage", {}).get("fileName", "arquivo.pdf")
+                extensao_dm = nome_doc_dm.rsplit(".", 1)[-1] if "." in nome_doc_dm else "pdf"
+                link_dm = salvar_midia_grupo_drive(grupo_dm_drive, pessoa, midia_b64_dm, "PDF", extensao_dm, "application/pdf")
+        sufixo_dm = f" (arquivo salvo: {link_dm})" if link_dm else ""
+        registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, pessoa, f"[enviou imagem/PDF pra revisão de arte]{sufixo_dm}", True)
         return revisar_arte_dm(numero, key, data, message_type, grupo_jid_dm=grupo_jid_dm)
 
     # Audio/PTT no privado: transcreve e trata como se fosse uma mensagem de texto normal
@@ -4848,7 +4915,15 @@ def processar_dm(remote_jid, key, data):
     # no historico mesmo assim, em vez de ficar completamente de fora do "sistema de defesa".
     elif "video" in tipo_lower:
         caption_video = message.get("videoMessage", {}).get("caption", "")
-        conteudo_video = f"[vídeo com a legenda: {caption_video}]" if caption_video else "[mandou um vídeo, sem legenda]"
+        # Backup no Drive (round 27 parte 9, expandido) - mesmo vídeo não sendo analisado por
+        # conteúdo, ainda é salvo de verdade na pasta "Torres"/"Luan".
+        video_b64_dm = baixar_midia(key)
+        link_video_dm = None
+        if video_b64_dm:
+            nome_pasta_dm = "Torres" if pessoa == "torres" else "Luan"
+            link_video_dm = salvar_midia_grupo_drive({"nome": nome_pasta_dm, "interno": False}, pessoa, video_b64_dm, "Vídeos", "mp4", "video/mp4")
+        sufixo_video_dm = f" (arquivo salvo: {link_video_dm})" if link_video_dm else ""
+        conteudo_video = (f"[vídeo com a legenda: {caption_video}]" if caption_video else "[mandou um vídeo, sem legenda]") + sufixo_video_dm
         registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, pessoa, conteudo_video, True)
         responder("Recebi o vídeo! Só não processo vídeo diretamente por aqui ainda (só imagem e PDF) - mas já fica registrado.")
         return {"video_registrado": True}
