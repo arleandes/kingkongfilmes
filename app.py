@@ -1668,6 +1668,25 @@ simples, um item por linha. Se faltar alguma informação importante pra fazer a
 claramente no pedido também. Quando "tipo" NÃO for "arte", inclua as duas chaves mesmo assim, só
 que com string vazia "" nas duas.
 
+NUNCA ENCAMINHAR PEDIDO SEM O MATERIAL DE VERDADE (bug real já reportado - NÃO REPITA: uma cliente
+mandou só "segue a lista de ofertas da semana", mas o arquivo não veio anexado de verdade nessa
+mensagem - mesmo assim foi montado um pedido de "Encarte" e mandado pro Tripa como se já fosse um
+pedido confirmado, quando na real nenhum material tinha chegado ainda; isso é tomar uma decisão sem
+ter certeza, o que nunca pode acontecer): quando "tipo" for "arte", mas o material essencial pra
+produzir a peça (a lista de produtos/preços, o texto do evento, a foto/PDF que o cliente disse que
+ia mandar, etc.) NÃO veio de verdade anexado nessa mensagem nem já está claramente disponível no
+histórico recente (ex: o cliente só anunciou a intenção - "segue a lista", "vou mandar já já", "aqui
+está" - mas nenhum arquivo/imagem/PDF chegou junto à mensagem, ou o texto ficou vago demais pra
+montar a peça de verdade), marque "material_recebido_completo" como false. Nesse caso continue
+respondendo o cliente normalmente, pedindo com naturalidade pra reenviar o que faltou (isso você TEM
+certeza que falta) - mas NUNCA trate esse pedido como se já estivesse pronto pra virar um trabalho
+confirmado; quem decide se encaminha ou não pro Tripa com base nesse campo é o código, não você, só
+preencha os outros campos ("pedido_organizado_designer" etc.) normalmente mesmo assim. Quando o
+material JÁ estiver completo (arquivo anexado nessa própria mensagem, detalhes completos escritos
+no texto, ou já resolvido claramente pelo histórico recente - ex: "a mesma lista de sempre" quando
+o histórico realmente mostra do que se trata), marque "material_recebido_completo" como true. Pra
+qualquer "tipo" que não seja "arte", marque sempre true (o campo não se aplica nesses casos).
+
 AJUSTE EM PEÇA JÁ EXISTENTE (bug real já reportado - NÃO REPITA: uma peça que JÁ tinha sido feita e
 enviada foi tratada como pedido novo do zero e mandada pro designer como se fosse a primeira vez,
 o que gerou trabalho duplicado e deixou o cliente com a impressão de que ninguém lê o histórico):
@@ -1752,6 +1771,7 @@ Responda SEMPRE E APENAS em JSON válido, neste formato exato, sem nenhum texto 
   "opcoes_resposta": ["sugestão 1 de resposta pra equipe avaliar", "sugestão 2 (opcional)"],
   "tipo_peca_designer": "classificação curta do material (Card, Story, Carrossel, Banner, Flyer, Selo...), ou string vazia se tipo nao for arte",
   "pedido_organizado_designer": "pedido de arte organizado pro designer, ou string vazia se tipo nao for arte",
+  "material_recebido_completo": true ou false,
   "eh_ajuste_peca_existente": true ou false,
   "eh_promessa": true ou false,
   "texto_promessa": "resumo curto do compromisso assumido com o cliente (com prazo/acao), ou string vazia",
@@ -2123,9 +2143,16 @@ def _finalizar_processamento_grupo(chave):
 
     # Pedido de arte: organiza e encaminha pro grupo Tripa Designer, junto com
     # todas as fotos/PDFs que o cliente mandou nessa leva de mensagens (se tiver).
+    # Bug real ja reportado (round 27 parte 11, Novo Mix): cliente disse "segue a lista de
+    # ofertas" mas o arquivo nao veio anexado de verdade - mesmo assim um pedido de "Encarte"
+    # foi montado e mandado pro Tripa como se ja fosse confirmado. Agora so encaminha quando o
+    # modelo confirma que o material de verdade chegou ("material_recebido_completo") - nunca
+    # trata uma intencao anunciada como se fosse um pedido pronto pra virar trabalho.
     pedido_designer = resultado.get("pedido_organizado_designer") or ""
+    material_completo = resultado.get("material_recebido_completo", True)
+    pedido_arte_pendente_material = resultado.get("tipo") == "arte" and pedido_designer and not material_completo
     encaminhado_designer = False
-    if resultado.get("tipo") == "arte" and pedido_designer:
+    if resultado.get("tipo") == "arte" and pedido_designer and material_completo:
         tipo_peca = resultado.get("tipo_peca_designer") or "Arte"
         # Bug real ja reportado (round 27, parte 7): uma peca que JA tinha sido feita e
         # enviada era tratada como pedido novo do zero e mandada pro designer como se
@@ -2182,6 +2209,9 @@ def _finalizar_processamento_grupo(chave):
         f"*{grupo['nome']}* · {sender_name}\n\n"
         f"{resultado.get('resumo_interno', conteudo_texto)}"
         + ("\n\n📐 Encaminhei o pedido pra Tripa." if encaminhado_designer else "")
+        + ("\n\n⏳ Cliente sinalizou um pedido de arte, mas o material (lista/arquivo) ainda não "
+           "chegou de verdade - já pedi pra reenviar, NÃO encaminhei nada pra Tripa ainda."
+           if pedido_arte_pendente_material else "")
         + bloco_opcoes
     )
     for numero in TEAM_NUMBERS:
@@ -2308,6 +2338,22 @@ um pedido de lembrete não é um comando pro Tripa, um fato pra guardar não é 
    grupo Tripa nesse horário (ex: "Ei! Como está o pedido do Terapia? O prazo é até as 10h 👀").
    IMPORTANTE: você NUNCA envia isso direto - só organiza o conteúdo, quem decide se confirma o
    envio é sempre {pessoa_nome} (vai ver um preview antes).
+   USE O CONTEÚDO REAL DO ARQUIVO (bug real já reportado - NÃO REPITA: {pessoa_nome} encaminhou um
+   PDF com a programação de um cliente pedindo pra organizar e mandar pra Tripa, e a mensagem
+   gerada saiu genérica, tipo "segue a arte/pedido conforme o material em anexo", sem contar o que
+   estava escrito no arquivo de verdade): quando o pedido a ser encaminhado se refere a uma
+   imagem/PDF enviado antes nessa mesma conversa (ex: "organiza esse pedido e manda pra tripa" logo
+   depois de um arquivo), procure no {contexto_conversa} uma entrada "[conteúdo do arquivo
+   enviado]: ..." correspondente e USE esse conteúdo de verdade (os itens, dias, preços, horários
+   que estiverem lá) pra escrever "mensagem_tripa" - nunca escreva um texto vago tipo "conforme o
+   material em anexo"/"segue o pedido do cliente" quando a descrição real do arquivo já está
+   disponível no histórico. Se não encontrar nenhuma descrição de conteúdo correspondente no
+   histórico (arquivo não foi descrito, ou a referência não bate com nenhum), diga isso claramente
+   dentro da própria "mensagem_tripa" (ex: "não tenho o conteúdo do arquivo aqui pra conferir,
+   confirmar direto com o cliente") em vez de inventar um resumo do que pode estar no arquivo -
+   lembre que {pessoa_nome} sempre vê essa mensagem em um preview e confirma antes de qualquer
+   coisa ser enviada de verdade pra Tripa, mas mesmo assim ela precisa refletir só o que você tem
+   certeza, nunca uma suposição disfarçada de fato.
 
 11) DICA DE COMO RESPONDER UM CLIENTE - ENSINANDO UMA RESPOSTA (ex: "o cliente do Terapia Luciano
    falou: Falta frango a passarinho no dobrado da semana toda / aí eu respondi: Isso vai ser
@@ -2761,8 +2807,13 @@ def revisar_peca(imagem_base64, pdf_base64, caption):
     PARMEGIANA"."""
     prompt_usuario = "Revise essa peça em busca de erros de escrita." + (f" Legenda enviada junto: {caption}" if caption else "")
     # Prompt de ortografia cresceu bastante (3 estados, regra mestre, etc.) - max_tokens maior
-    # que o padrao reduz a chance de precisar da tentativa extra automatica.
-    resultado = chamar_claude(SYSTEM_PROMPT_REVISAO, prompt_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64, max_tokens=4000)
+    # que o padrao reduz a chance de precisar da tentativa extra automatica. timeout maior que
+    # o padrao de chamar_claude (30s) - round 27 parte 10, erro real visto em producao:
+    # "Read timed out (read timeout=30)" ao revisar um PDF de 2 paginas (Tripa e privado), o
+    # que fez a peca nem ser revisada e a mensagem de erro aparecer pro Torres. Imagem/PDF tende
+    # a ser mais lento de processar que texto puro, entao usa o mesmo patamar (60s) ja usado em
+    # outras chamadas pesadas deste arquivo.
+    resultado = chamar_claude(SYSTEM_PROMPT_REVISAO, prompt_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64, max_tokens=4000, timeout=60)
 
     erros_brutos = resultado.get("erros") or []
     erros_validos = []
@@ -2802,6 +2853,42 @@ def revisar_peca(imagem_base64, pdf_base64, caption):
     resultado["erros"] = erros_validos
     resultado["tem_erro"] = tem_erro
     return tem_erro, texto_resp, resultado
+
+
+SYSTEM_PROMPT_DESCREVER_ARQUIVO_DM = """Você recebe uma imagem ou PDF enviado no privado pra Cintia
+(assistente da KingKong Filmes/Correria). Descreva de forma OBJETIVA e COMPLETA o que está escrito
+ou mostrado nele. Se for uma agenda, tabela, cardápio ou lista de promoções/produtos/horários,
+TRANSCREVA os itens principais (dia, item, preço, horário) em vez de resumir vagamente - essa
+descrição vai servir de base pra alguém decidir depois se isso é um pedido de trabalho pra
+encaminhar pra equipe de produção/design, então precisa ser completa o bastante pra escrever esse
+pedido sem precisar abrir o arquivo de novo.
+
+Responda SEMPRE E APENAS em JSON válido, sem bloco de código markdown (nada de ```):
+{
+  "descricao": "a transcrição/descrição completa do conteúdo, em texto corrido"
+}
+"""
+
+
+def _descrever_conteudo_arquivo_dm(imagem_base64, pdf_base64, caption):
+    """Descreve de verdade o conteúdo de uma imagem/PDF recebido no privado de Torres/Luan
+    (round 27 parte 10, bug real reportado por Torres: ele encaminhou um PDF com a programação
+    da semana de um cliente e pediu pra organizar e mandar pra Tripa, mas a Cintia nunca tinha
+    lido o PDF - só guardava um placeholder vazio "[enviou imagem/PDF pra revisão de arte]" no
+    histórico). Essa descrição substitui o placeholder, pra um comando de texto posterior (ex:
+    "organiza esse pedido e manda pra tripa") ter acesso ao conteúdo real do arquivo através do
+    histórico da conversa, em vez de só saber que "um arquivo foi enviado". Nunca derruba o
+    fluxo principal - devolve None se falhar (fica só o placeholder de sempre nesse caso)."""
+    try:
+        prompt_usuario = "Descreva o conteúdo desse arquivo." + (f" Legenda enviada junto: {caption}" if caption else "")
+        resultado = chamar_claude(
+            SYSTEM_PROMPT_DESCREVER_ARQUIVO_DM, prompt_usuario,
+            imagem_base64=imagem_base64, pdf_base64=pdf_base64, max_tokens=1500, timeout=60,
+        )
+        return (resultado.get("descricao") or "").strip() or None
+    except Exception as e:
+        print(f"[_descrever_conteudo_arquivo_dm] erro: {e}", flush=True)
+        return None
 
 
 def _formatar_pontos_ortografia(resultado_ortografia):
@@ -2880,6 +2967,37 @@ _ultima_arte_lock = threading.Lock()
 _ULTIMA_ARTE_TTL = 4 * 60 * 60  # 4h - depois disso, um "esta certo?" solto nao tenta mais
                                  # reconferir uma arte antiga sozinho (evita reconferir algo
                                  # que ja nem faz mais sentido no contexto atual da conversa)
+
+# Round 27 (parte 10): bug real reportado pelo Torres com print - ele encaminhou um PDF (a
+# programação de uma semana do Terapia) pro privado da Cintia e pediu "organize esse pedido e
+# envie para a tripa", e ela respondeu um texto genérico ("conforme o material em anexo") sem
+# ter lido NADA do que estava escrito no PDF. Causa raiz: o comando "manda pra tripa" (tipo 4 do
+# SYSTEM_PROMPT_LEMBRETE) classifica só a mensagem de TEXTO ("organize esse pedido...") - a
+# mídia em si tinha virado só um placeholder vazio no histórico ("[enviou imagem/PDF pra
+# revisão de arte]"), sem nenhum conteúdo de verdade pra usar. Guarda aqui o link do Drive do
+# ÚLTIMO arquivo salvo em cada conversa de privado, pra poder anexar esse link de verdade na
+# mensagem_tripa por CÓDIGO (nunca confiar só no texto que o modelo compôs pra não perder o
+# link) quando o comando pra Tripa vier logo em seguida.
+_ultimo_arquivo_dm_drive = {}  # pessoa ("torres"/"luan") -> {"link": ..., "criado_em": ts}
+_ultimo_arquivo_dm_drive_lock = threading.Lock()
+_ULTIMO_ARQUIVO_DM_DRIVE_TTL = 30 * 60  # 30min - depois disso, um comando pra Tripa não anexa
+
+
+def _registrar_ultimo_arquivo_dm_drive(pessoa, link):
+    if not link:
+        return
+    with _ultimo_arquivo_dm_drive_lock:
+        _ultimo_arquivo_dm_drive[pessoa] = {"link": link, "criado_em": time.time()}
+
+
+def _buscar_link_arquivo_dm_recente(pessoa):
+    with _ultimo_arquivo_dm_drive_lock:
+        info = _ultimo_arquivo_dm_drive.get(pessoa)
+    if not info:
+        return None
+    if time.time() - info["criado_em"] > _ULTIMO_ARQUIVO_DM_DRIVE_TTL:
+        return None
+    return info["link"]
 
 _FRASES_PEDIDO_CONFERENCIA = [
     "esta escrito certo", "esta tudo certo", "confere isso", "confere essa arte",
@@ -4889,8 +5007,38 @@ def processar_dm(remote_jid, key, data):
                 nome_doc_dm = message.get("documentMessage", {}).get("fileName", "arquivo.pdf")
                 extensao_dm = nome_doc_dm.rsplit(".", 1)[-1] if "." in nome_doc_dm else "pdf"
                 link_dm = salvar_midia_grupo_drive(grupo_dm_drive, pessoa, midia_b64_dm, "PDF", extensao_dm, "application/pdf")
+        if link_dm:
+            _registrar_ultimo_arquivo_dm_drive(pessoa, link_dm)
         sufixo_dm = f" (arquivo salvo: {link_dm})" if link_dm else ""
-        registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, pessoa, f"[enviou imagem/PDF pra revisão de arte]{sufixo_dm}", True)
+
+        # Round 27 parte 10 (bug real reportado por Torres: encaminhou um PDF com a
+        # programação de um cliente e pediu pra organizar e mandar pra Tripa, mas a Cintia
+        # nunca tinha "lido" o arquivo de verdade - só guardava um placeholder vazio no
+        # histórico, então um comando de texto posterior tipo "organiza e manda pra tripa"
+        # não tinha nenhum conteúdo real pra trabalhar e saía genérico, tipo "conforme o
+        # material em anexo"). Descreve o conteúdo de verdade já na hora do recebimento
+        # (independente de ter pedido explícito de revisão ou não - ver
+        # _pedido_explicito_de_revisao_dm logo abaixo, em revisar_arte_dm), pra esse
+        # conteúdo ficar disponível no histórico da conversa pra qualquer comando futuro.
+        # Nunca derruba o fluxo principal se a descrição falhar - nesse caso só fica o
+        # placeholder de sempre.
+        caption_dm_recebida = (
+            message.get("imageMessage", {}).get("caption", "")
+            if "image" in tipo_lower
+            else message.get("documentMessage", {}).get("caption", "")
+        )
+        descricao_arquivo_dm = None
+        if midia_b64_dm:
+            if "image" in tipo_lower:
+                descricao_arquivo_dm = _descrever_conteudo_arquivo_dm(midia_b64_dm, None, caption_dm_recebida)
+            else:
+                descricao_arquivo_dm = _descrever_conteudo_arquivo_dm(None, midia_b64_dm, caption_dm_recebida)
+
+        if descricao_arquivo_dm:
+            texto_historico_dm = f"[conteúdo do arquivo enviado]: {descricao_arquivo_dm}{sufixo_dm}"
+        else:
+            texto_historico_dm = f"[enviou imagem/PDF pra revisão de arte]{sufixo_dm}"
+        registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, pessoa, texto_historico_dm, True)
         return revisar_arte_dm(numero, key, data, message_type, grupo_jid_dm=grupo_jid_dm)
 
     # Audio/PTT no privado: transcreve e trata como se fosse uma mensagem de texto normal
@@ -5239,6 +5387,14 @@ def processar_dm(remote_jid, key, data):
             responder(resposta)
     elif resultado.get("eh_comando_para_tripa") and resultado.get("mensagem_tripa"):
         mensagem_tripa = resultado["mensagem_tripa"]
+        # Round 27 parte 10: anexa o link do Drive do arquivo mais recente enviado no
+        # privado (se ainda "fresco", dentro de 30min - ver _ULTIMO_ARQUIVO_DM_DRIVE_TTL)
+        # direto no texto por código, em vez de confiar que o modelo vai lembrar de
+        # incluir o link sozinho - assim o link real do arquivo sempre vai junto pra Tripa
+        # quando fizer sentido, mesmo se o texto gerado não tiver mencionado.
+        link_arquivo_recente = _buscar_link_arquivo_dm_recente(pessoa)
+        if link_arquivo_recente and link_arquivo_recente not in mensagem_tripa:
+            mensagem_tripa = f"{mensagem_tripa}\n\n📎 Arquivo: {link_arquivo_recente}"
         tem_cobranca = bool(resultado.get("tem_cobranca"))
         horario_cobranca = None
         pergunta_cobranca = resultado.get("pergunta_cobranca") or "Como está esse pedido? Já foi feito?"
@@ -5774,9 +5930,21 @@ def _normalizar_evento_zapi(body):
     elif "document" in body:
         doc = body.get("document") or {}
         message_type = "documentMessage"
+        nome_arquivo_zapi = doc.get("fileName", "arquivo.pdf")
+        caption_bruta_zapi = doc.get("caption", "")
+        # Bug real visto em producao (round 27 parte 10): a Z-API preenche "caption" com o
+        # proprio nome/titulo do arquivo quando a pessoa NAO digitou nenhuma legenda de
+        # verdade - nao e uma legenda escrita por ninguem. Sem esse tratamento, um PDF
+        # encaminhado sem legenda cujo NOME coincidentemente cita um cliente conhecido (ex:
+        # "PROGRAMAÇÃO terapia beach 07 A 13.pdf") era tratado como se fosse a convencao "Arte
+        # <cliente>" (extrair_cliente_da_legenda), disparando revisao/comparacao automatica
+        # indevida contra o pedido daquele cliente. Se a "caption" bater exatamente com o nome
+        # do arquivo ou o titulo, trata como se nao tivesse legenda nenhuma.
+        titulo_zapi = doc.get("title", "")
+        caption_zapi = "" if caption_bruta_zapi and caption_bruta_zapi in (nome_arquivo_zapi, titulo_zapi) else caption_bruta_zapi
         message["documentMessage"] = {
-            "caption": doc.get("caption", ""),
-            "fileName": doc.get("fileName", "arquivo.pdf"),
+            "caption": caption_zapi,
+            "fileName": nome_arquivo_zapi,
             "mimetype": doc.get("mimeType", ""),
         }
         key["_zapi_media_url"] = doc.get("documentUrl", "")
