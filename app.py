@@ -1136,13 +1136,24 @@ def _obter_drive_service():
 def _garantir_pasta_drive(service, nome_pasta, pasta_pai_id):
     """Encontra (ou cria, se ainda não existir) uma subpasta com esse nome dentro da pasta
     pai indicada, e devolve o ID dela. Idempotente - pode ser chamado toda vez sem
-    duplicar pastas quando ela já existe."""
+    duplicar pastas quando ela já existe.
+
+    Round 27 parte 13: Torres criou um Drive Compartilhado ("Cintia Backup") pra resolver o
+    erro real de produção "Service Accounts do not have storage quota... Leverage shared
+    drives" (uma conta de serviço não tem cota própria numa conta pessoal/Gmail, só em Drive
+    Compartilhado do Workspace ou com delegação OAuth). A API do Drive v3 NÃO enxerga nem
+    escreve em Drives Compartilhados por padrão - precisa `supportsAllDrives=True` em toda
+    chamada de escrita/leitura e `includeItemsFromAllDrives=True` nas buscas, senão a pasta
+    "não existe" mesmo estando lá."""
     nome_escapado = nome_pasta.replace("'", "\\'")
     query = (
         f"name = '{nome_escapado}' and '{pasta_pai_id}' in parents "
         "and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
     )
-    resultado = service.files().list(q=query, fields="files(id, name)", pageSize=1).execute()
+    resultado = service.files().list(
+        q=query, fields="files(id, name)", pageSize=1,
+        supportsAllDrives=True, includeItemsFromAllDrives=True,
+    ).execute()
     encontrados = resultado.get("files", [])
     if encontrados:
         return encontrados[0]["id"]
@@ -1151,7 +1162,7 @@ def _garantir_pasta_drive(service, nome_pasta, pasta_pai_id):
         "mimeType": "application/vnd.google-apps.folder",
         "parents": [pasta_pai_id],
     }
-    pasta = service.files().create(body=metadata, fields="id").execute()
+    pasta = service.files().create(body=metadata, fields="id", supportsAllDrives=True).execute()
     return pasta["id"]
 
 
@@ -1176,12 +1187,18 @@ def salvar_midia_drive(cliente_nome, categoria, conteudo_bytes, nome_arquivo, mi
 
         media = MediaIoBaseUpload(io.BytesIO(conteudo_bytes), mimetype=mimetype, resumable=False)
         metadata = {"name": nome_arquivo, "parents": [pasta_data_id]}
-        arquivo = service.files().create(body=metadata, media_body=media, fields="id, webViewLink").execute()
+        # supportsAllDrives=True (round 27 parte 13): sem isso, a chamada falha pra
+        # arquivos dentro de um Drive Compartilhado (ver comentário em _garantir_pasta_drive).
+        arquivo = service.files().create(
+            body=metadata, media_body=media, fields="id, webViewLink", supportsAllDrives=True,
+        ).execute()
         # Link acessível por qualquer um que tiver o link, sem precisar ter conta com acesso
         # à pasta compartilhada - pra poder abrir direto do WhatsApp (mesmo nível de acesso
         # que qualquer link do Drive compartilhado "com qualquer pessoa"), nada mais sensível
         # do que o que já circula no grupo do cliente.
-        service.permissions().create(fileId=arquivo["id"], body={"role": "reader", "type": "anyone"}).execute()
+        service.permissions().create(
+            fileId=arquivo["id"], body={"role": "reader", "type": "anyone"}, supportsAllDrives=True,
+        ).execute()
         return arquivo.get("webViewLink")
     except Exception as e:
         print(f"[salvar_midia_drive] erro ao salvar mídia no Drive ({cliente_nome}/{categoria}): {e}", flush=True)
