@@ -1080,6 +1080,131 @@ def baixar_midia_evolution(message_key):
     return data.get("base64") or data.get("media", {}).get("base64")
 
 
+# ============================================================================
+# Backup permanente de mídia (Google Drive) - round 27, parte 9.
+#
+# Torres percebeu (depois de perguntar se dava pra reencaminhar uma foto/card antigo pro
+# designer) que só a DESCRIÇÃO em texto de imagens/PDFs fica guardada pra sempre - o
+# ARQUIVO em si (bytes) nunca é persistido, só existe durante o ciclo de processamento
+# daquela mensagem. Ele topou usar o Google Drive dele (já tem bastante espaço) como
+# armazenamento permanente dos arquivos de verdade. Estrutura pedida por ele, literal:
+# "Cintia Backup" (pasta raiz, criada manualmente por ele e compartilhada com a conta de
+# serviço) > <nome do cliente> > Fotos|Vídeos|PDF > <uma subpasta por dia> > arquivo. Só
+# a pasta raiz precisa existir de antemão - todo o resto é criado automaticamente aqui.
+#
+# Importante sobre esse trecho: eu NÃO consegui testar essas chamadas contra a API real do
+# Google a partir do ambiente de desenvolvimento (o proxy de rede desse ambiente bloqueia
+# qualquer conexão de saída pra domínios do Google - www.googleapis.com,
+# oauth2.googleapis.com, accounts.google.com - com "connect_rejected... organization
+# policy"). O Railway (onde isso roda de verdade) tem acesso normal à internet, então a
+# validação de verdade só acontece lá - por isso todo esse trecho é construído pra NUNCA
+# derrubar o atendimento se o Drive falhar por qualquer motivo (credencial ausente/errada,
+# pasta não compartilhada com a conta de serviço, rede, etc): sempre volta None e loga o
+# erro, nunca lança exceção pra quem chamou.
+_drive_service = None
+_drive_service_erro_logado = False
+
+
+def _obter_drive_service():
+    """Constrói (uma vez, cacheado em memória) o cliente da API do Google Drive a partir
+    da conta de serviço configurada na variável de ambiente
+    GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON (o conteúdo bruto do JSON baixado do Google Cloud).
+    Devolve None se a variável não estiver configurada ou se a credencial for inválida -
+    nunca derruba o fluxo principal por causa disso."""
+    global _drive_service, _drive_service_erro_logado
+    if _drive_service is not None:
+        return _drive_service
+    credencial_json = os.environ.get("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON", "")
+    if not credencial_json:
+        return None
+    try:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+        info = json.loads(credencial_json)
+        creds = service_account.Credentials.from_service_account_info(
+            info, scopes=["https://www.googleapis.com/auth/drive"]
+        )
+        _drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
+        return _drive_service
+    except Exception as e:
+        if not _drive_service_erro_logado:
+            print(f"[_obter_drive_service] erro ao montar cliente do Google Drive (credencial ausente/inválida): {e}", flush=True)
+            _drive_service_erro_logado = True
+        return None
+
+
+def _garantir_pasta_drive(service, nome_pasta, pasta_pai_id):
+    """Encontra (ou cria, se ainda não existir) uma subpasta com esse nome dentro da pasta
+    pai indicada, e devolve o ID dela. Idempotente - pode ser chamado toda vez sem
+    duplicar pastas quando ela já existe."""
+    nome_escapado = nome_pasta.replace("'", "\\'")
+    query = (
+        f"name = '{nome_escapado}' and '{pasta_pai_id}' in parents "
+        "and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    )
+    resultado = service.files().list(q=query, fields="files(id, name)", pageSize=1).execute()
+    encontrados = resultado.get("files", [])
+    if encontrados:
+        return encontrados[0]["id"]
+    metadata = {
+        "name": nome_pasta,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [pasta_pai_id],
+    }
+    pasta = service.files().create(body=metadata, fields="id").execute()
+    return pasta["id"]
+
+
+def salvar_midia_drive(cliente_nome, categoria, conteudo_bytes, nome_arquivo, mimetype):
+    """Salva um arquivo (foto/PDF/vídeo) recebido de um cliente no Google Drive, organizado
+    em Cintia Backup/<cliente>/<categoria>/<data de hoje>/<arquivo> - cria as pastas
+    automaticamente na primeira vez que forem necessárias. Devolve o link do arquivo (pra
+    poder ser guardado no histórico da conversa e encontrado depois pela busca por
+    palavra-chave já existente), ou None se o Drive não estiver configurado ou der
+    qualquer erro - nunca derruba o fluxo principal por causa disso."""
+    service = _obter_drive_service()
+    pasta_raiz_id = os.environ.get("GOOGLE_DRIVE_BACKUP_FOLDER_ID", "")
+    if not service or not pasta_raiz_id:
+        return None
+    try:
+        from googleapiclient.http import MediaIoBaseUpload
+        import io
+        pasta_cliente_id = _garantir_pasta_drive(service, cliente_nome, pasta_raiz_id)
+        pasta_categoria_id = _garantir_pasta_drive(service, categoria, pasta_cliente_id)
+        data_hoje = horario_bahia_agora().strftime("%Y-%m-%d")
+        pasta_data_id = _garantir_pasta_drive(service, data_hoje, pasta_categoria_id)
+
+        media = MediaIoBaseUpload(io.BytesIO(conteudo_bytes), mimetype=mimetype, resumable=False)
+        metadata = {"name": nome_arquivo, "parents": [pasta_data_id]}
+        arquivo = service.files().create(body=metadata, media_body=media, fields="id, webViewLink").execute()
+        # Link acessível por qualquer um que tiver o link, sem precisar ter conta com acesso
+        # à pasta compartilhada - pra poder abrir direto do WhatsApp (mesmo nível de acesso
+        # que qualquer link do Drive compartilhado "com qualquer pessoa"), nada mais sensível
+        # do que o que já circula no grupo do cliente.
+        service.permissions().create(fileId=arquivo["id"], body={"role": "reader", "type": "anyone"}).execute()
+        return arquivo.get("webViewLink")
+    except Exception as e:
+        print(f"[salvar_midia_drive] erro ao salvar mídia no Drive ({cliente_nome}/{categoria}): {e}", flush=True)
+        return None
+
+
+def salvar_midia_grupo_drive(grupo, sender_name, midia_base64, categoria, extensao, mimetype):
+    """Ponto único que decide se um arquivo recebido num GRUPO deve ser salvo no Google
+    Drive: só pra grupos de CLIENTE (nunca interno - Tripa/Gestão, que não têm "nome de
+    cliente" fazendo sentido na estrutura de pastas pedida pelo Torres), e só se tiver
+    mídia de verdade. Devolve o link salvo, ou None silenciosamente em qualquer caso que
+    não se aplique ou falhe."""
+    if grupo.get("interno") or not midia_base64:
+        return None
+    try:
+        conteudo_bytes = base64.b64decode(midia_base64)
+    except Exception:
+        return None
+    agora = horario_bahia_agora()
+    nome_arquivo = f"{agora.strftime('%Hh%M')}_{sender_name}.{extensao}".replace("/", "-")
+    return salvar_midia_drive(grupo["nome"], categoria, conteudo_bytes, nome_arquivo, mimetype)
+
+
 _nomes_grupo_desconhecido_cache = {}
 
 
@@ -1150,7 +1275,7 @@ def processar_mensagem_grupo_desconhecido(remote_jid, key, data):
     a mensagem e registrada no historico, pra nenhum grupo ficar de fora do "sistema de
     defesa" (Torres pediu explicitamente: TODOS os grupos, sem excecao, incluindo os que
     ainda nao foram cadastrados manualmente aqui)."""
-    conteudo_texto, _imagem_base64, _pdf_base64, _nome_arquivo_doc = extrair_conteudo_mensagem_grupo(key, data)
+    conteudo_texto, _imagem_base64, _pdf_base64, _nome_arquivo_doc, _video_base64 = extrair_conteudo_mensagem_grupo(key, data)
     if not conteudo_texto:
         return {"skipped": "grupo não cadastrado, sem conteúdo tratável pra registrar"}
     _participant, eh_equipe = _detectar_participante_grupo(key, data)
@@ -1631,15 +1756,18 @@ DEBOUNCE_SEGUNDOS = 7 * 60  # espera esse tempo (7 minutos) depois da ultima men
 
 
 def extrair_conteudo_mensagem_grupo(key, data):
-    """Extrai o conteudo de UMA mensagem (texto/imagem/audio/documento) de um grupo de
-    cliente. Devolve (conteudo_texto, imagem_base64, pdf_base64, nome_arquivo_doc), ou
-    (None, None, None, None) se o tipo de mensagem nao for tratado."""
+    """Extrai o conteudo de UMA mensagem (texto/imagem/audio/documento/video) de um grupo
+    de cliente. Devolve (conteudo_texto, imagem_base64, pdf_base64, nome_arquivo_doc,
+    video_base64), ou (None, None, None, None, None) se o tipo de mensagem nao for
+    tratado. video_base64 (round 27 parte 9) so serve pra backup no Google Drive - video
+    continua sem analise de conteudo (so imagem e PDF sao analisados)."""
     message = data.get("message", {})
     message_type = data.get("messageType", "")
 
     conteudo_texto = None
     imagem_base64 = None
     pdf_base64 = None
+    video_base64 = None
     nome_arquivo_doc = "arquivo.pdf"
 
     if "conversation" in message or message_type == "conversation":
@@ -1660,6 +1788,7 @@ def extrair_conteudo_mensagem_grupo(key, data):
             conteudo_texto = "(cliente mandou um áudio que não pôde ser baixado)"
     elif "video" in message_type.lower():
         caption = message.get("videoMessage", {}).get("caption", "")
+        video_base64 = baixar_midia(key)
         # Video nao pode ser analisado (so imagem e PDF sao suportados) - so registra
         # que chegou um video e a legenda, se tiver. NUNCA inventar que o arquivo "nao
         # abriu" ou deu erro tecnico - isso e so falta de suporte pra esse tipo de midia,
@@ -1680,6 +1809,7 @@ def extrair_conteudo_mensagem_grupo(key, data):
         elif "video" in mimetype.lower() or nome_arquivo_doc.lower().endswith((".mp4", ".mov", ".avi", ".mkv")):
             # Alguns celulares mandam video como "documento" em vez de mensagem de video
             # nativa - mesmo tratamento: nunca dizer que deu erro tecnico ao abrir.
+            video_base64 = b64
             conteudo_texto = (
                 f"(cliente mandou um vídeo (arquivo {nome_arquivo_doc}) com a legenda: {caption})" if caption
                 else f"(cliente mandou um vídeo (arquivo {nome_arquivo_doc}), sem legenda nem explicação do que precisa ser feito com ele)"
@@ -1689,9 +1819,9 @@ def extrair_conteudo_mensagem_grupo(key, data):
         else:
             conteudo_texto = "(cliente mandou um arquivo que não pôde ser baixado)"
     else:
-        return None, None, None, None
+        return None, None, None, None, None
 
-    return conteudo_texto, imagem_base64, pdf_base64, nome_arquivo_doc
+    return conteudo_texto, imagem_base64, pdf_base64, nome_arquivo_doc, video_base64
 
 
 def _detectar_participante_grupo(key, data):
@@ -1722,7 +1852,7 @@ def processar_mensagem_grupo(remote_jid, grupo, key, data):
     participant, eh_equipe = _detectar_participante_grupo(key, data)
 
     sender_name = data.get("pushName", "cliente")
-    conteudo_texto, imagem_base64, pdf_base64, nome_arquivo_doc = extrair_conteudo_mensagem_grupo(key, data)
+    conteudo_texto, imagem_base64, pdf_base64, nome_arquivo_doc, video_base64 = extrair_conteudo_mensagem_grupo(key, data)
 
     # Registra a mensagem no historico do grupo (equipe ou cliente) pra Torres/Luan
     # poderem perguntar no privado depois "o que rolou no grupo tal" sem precisar abrir o
@@ -1764,6 +1894,7 @@ def processar_mensagem_grupo(remote_jid, grupo, key, data):
                 "textos": [],
                 "imagem_base64": None,
                 "pdf_base64": None,
+                "video_base64": None,
                 "midias_designer": [],
                 "timer": None,
             }
@@ -1778,6 +1909,10 @@ def processar_mensagem_grupo(remote_jid, grupo, key, data):
             if not buf["pdf_base64"]:
                 buf["pdf_base64"] = pdf_base64
             buf["midias_designer"].append(("document", pdf_base64, nome_arquivo_doc))
+        if video_base64 and not buf["video_base64"]:
+            # So guarda o primeiro video da leva pra fins de backup no Drive (round 27
+            # parte 9) - video nunca vai pro designer (midias_designer), so imagem/PDF.
+            buf["video_base64"] = video_base64
 
         if buf["timer"]:
             buf["timer"].cancel()
@@ -1801,6 +1936,7 @@ def _finalizar_processamento_grupo(chave):
     textos = buf["textos"]
     imagem_base64 = buf.get("imagem_base64")
     pdf_base64 = buf.get("pdf_base64")
+    video_base64 = buf.get("video_base64")
     midias_designer = buf.get("midias_designer", [])
 
     if len(textos) == 1:
@@ -1914,14 +2050,45 @@ def _finalizar_processamento_grupo(chave):
     # guarda essa descrição como uma entrada extra no histórico do grupo - assim uma referência
     # futura tipo "usa aquela foto"/"o mesmo do PDF que mandei" consegue ser resolvida pelo
     # histórico, em vez de só saber que "uma imagem foi enviada" sem conteúdo nenhum.
+    # Backup permanente no Google Drive (round 27 parte 9, pedido explícito do Torres): salva
+    # o ARQUIVO de verdade (não só a descrição em texto que já ficava guardada) em Cintia
+    # Backup/<cliente>/Fotos|Vídeos|PDF/<data>. Só roda se as variáveis de ambiente
+    # GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON/GOOGLE_DRIVE_BACKUP_FOLDER_ID estiverem configuradas,
+    # e nunca derruba o atendimento se o Drive falhar (rede, credencial, pasta não
+    # compartilhada, etc) - salvar_midia_grupo_drive devolve None em silêncio nesses casos.
+    link_drive_principal = None
+    if imagem_base64:
+        link_drive_principal = salvar_midia_grupo_drive(grupo, sender_name, imagem_base64, "Fotos", "jpg", "image/jpeg")
+    elif pdf_base64:
+        link_drive_principal = salvar_midia_grupo_drive(grupo, sender_name, pdf_base64, "PDF", "pdf", "application/pdf")
+    elif video_base64:
+        link_drive_principal = salvar_midia_grupo_drive(grupo, sender_name, video_base64, "Vídeos", "mp4", "video/mp4")
+
+    # Quando o cliente manda mais de uma imagem/PDF na mesma leva de mensagens, só a
+    # primeira é analisada pelo Claude (descricao_midia acima) - mas todas ainda devem ser
+    # salvas no Drive, pra nenhum arquivo se perder mesmo sem descrição de conteúdo.
+    for tipo_extra, midia_extra_b64, nome_extra in midias_designer[1:]:
+        categoria_extra = "Fotos" if tipo_extra == "image" else "PDF"
+        mimetype_extra = "image/jpeg" if tipo_extra == "image" else "application/pdf"
+        link_extra = salvar_midia_grupo_drive(grupo, sender_name, midia_extra_b64, categoria_extra, nome_extra.rsplit(".", 1)[-1] or "jpg", mimetype_extra)
+        if link_extra:
+            registrar_mensagem_grupo(remote_jid, grupo["nome"], sender_name, f"[arquivo adicional enviado nessa mesma leva]: {link_extra}", False)
+
     descricao_midia = resultado.get("descricao_midia") or ""
     if (imagem_base64 or pdf_base64) and descricao_midia:
         tipo_arquivo = "imagem" if imagem_base64 else "PDF"
+        sufixo_drive = f" (arquivo salvo: {link_drive_principal})" if link_drive_principal else ""
         registrar_mensagem_grupo(
             remote_jid, grupo["nome"], sender_name,
-            f"[conteúdo d{'a' if tipo_arquivo == 'imagem' else 'o'} {tipo_arquivo} enviad{'a' if tipo_arquivo == 'imagem' else 'o'}]: {descricao_midia}",
+            f"[conteúdo d{'a' if tipo_arquivo == 'imagem' else 'o'} {tipo_arquivo} enviad{'a' if tipo_arquivo == 'imagem' else 'o'}]: {descricao_midia}{sufixo_drive}",
             False,
         )
+    elif video_base64:
+        # Vídeo não tem análise de conteúdo (só imagem/PDF são analisados), mas ainda assim
+        # registra o link do backup no histórico, pra poder ser encontrado depois pela busca
+        # por palavra-chave já existente (ex: se o cliente mencionar esse vídeo mais tarde).
+        if link_drive_principal:
+            registrar_mensagem_grupo(remote_jid, grupo["nome"], sender_name, f"[vídeo enviado] (arquivo salvo: {link_drive_principal})", False)
 
     # Memória permanente do cliente (round 21): grava/atualiza cada fato durável identificado
     # nessa mensagem (CLIENTE -> ASSUNTO -> VALOR ATUAL), preservando a versão anterior em vez de
@@ -3773,7 +3940,7 @@ def processar_mensagem_grupo_gestao(remote_jid, key, data):
     explícito em texto."""
     message_type = data.get("messageType", "")
     tipo_lower = message_type.lower()
-    conteudo_log, _im, _pdf, _doc = extrair_conteudo_mensagem_grupo(key, data)
+    conteudo_log, _im, _pdf, _doc, _vid = extrair_conteudo_mensagem_grupo(key, data)
     grupo_nome = GRUPOS.get(remote_jid, {}).get("nome", "Gestão")
     sender_name = data.get("pushName", "equipe")
     _participant, eh_equipe = _detectar_participante_grupo(key, data)
@@ -5581,7 +5748,7 @@ def _processar_evento_webhook(data, origem="evolution"):
                 # historico continua sendo registrado igual a qualquer outro grupo - Torres
                 # pediu explicitamente que TODOS os grupos e todos os participantes (ele e o
                 # Luan incluidos) fiquem guardados, sem excecao pros grupos internos.
-                conteudo_log, _im, _pdf, _doc = extrair_conteudo_mensagem_grupo(key, data)
+                conteudo_log, _im, _pdf, _doc, _vid = extrair_conteudo_mensagem_grupo(key, data)
                 if conteudo_log:
                     _participant_interno, eh_equipe_interno = _detectar_participante_grupo(key, data)
                     sender_name_interno = data.get("pushName", "equipe")
