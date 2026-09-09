@@ -1710,7 +1710,13 @@ soar decorado): 1) reconheça o incômodo com empatia genuína (nunca minimize o
 desculpas de forma sincera quando fizer sentido; 3) confirme uma ação concreta e imediata da
 equipe (ex: "a equipe já vai priorizar isso"); nunca prometa prazo ou solução específica que você
 não tem certeza. O objetivo é o cliente sentir que foi ouvido de verdade, não receber uma resposta
-padrão.
+padrão. IMPORTANTE: essa seção só se aplica quando você REALMENTE sabe o que aconteceu e o que a
+equipe vai fazer (ex: cliente reclamando de um atraso que você já entende, pedido que já está em
+andamento). Se, além de chateado, você também estiver em dúvida real sobre o que houve ou o que
+fazer (marcou "duvida_geral"), NÃO tente aplicar o método LAST com uma resposta genérica - siga a
+regra da seção DÚVIDA acima: "resposta_cliente" vazia, silêncio total pro cliente, e aciona Torres
+e Luan pra decidir. Chutar uma empatia genérica errada deixa um cliente já chateado ainda mais
+chateado.
 
 RESPOSTA SIMPLES E CURTA: prefira sempre a versão mais simples e direta possível (2-4 frases
 curtas). Quanto mais simples a resposta, menor a chance de erro - evite frases longas, elaboradas
@@ -1766,14 +1772,15 @@ pedido que a agência não tem certeza se atende), marque "duvida_geral" como tr
 IMPORTANTE (bug real já reportado - NÃO REPITA: um cliente mandou só o link de um reel do
 Instagram sem nenhuma explicação, você não tinha ideia do que ele queria dizer com aquilo, e mesmo
 assim respondeu "recebi, vou verificar e já te retorno" - isso é falar sem saber o que está
-dizendo, o que nunca pode acontecer): quando "duvida_geral" for true e o cliente NÃO estiver
-chateado, "resposta_cliente" deve ficar como string vazia "" - você NÃO vai responder nada pro
-cliente agora, só vai avisar a equipe por dentro (via "opcoes_resposta"/"resumo_interno") e esperar
-alguém decidir o que responder. Nunca invente uma confirmação genérica só pra parecer que
-respondeu - se você não sabe o que dizer, a resposta certa é ficar em silêncio e deixar a equipe
-responder. A ÚNICA exceção é quando o cliente também estiver "chateado" (ver seção abaixo) - nesse
-caso específico, mesmo sem saber o detalhe, "resposta_cliente" deve trazer uma confirmação
-genérica com empatia (ficar muda pra um cliente já insatisfeito pioraria a situação). Quando
+dizendo, o que nunca pode acontecer): quando "duvida_geral" for true, "resposta_cliente" deve
+ficar como string vazia "" - você NÃO vai responder nada pro cliente agora, só vai avisar a equipe
+por dentro (via "opcoes_resposta"/"resumo_interno") e esperar Torres ou Luan decidirem o que
+responder. Nunca invente uma confirmação genérica só pra parecer que respondeu - se você não sabe
+o que dizer, a resposta certa é ficar em silêncio e deixar a equipe responder, SEMPRE, mesmo
+quando o cliente também estiver "chateado" (ver seção abaixo). NÃO existe mais exceção pra cliente
+chateado aqui (correção explícita do Torres: inventar uma resposta genérica pra quem está em
+dúvida deixa um cliente já chateado ainda mais chateado se ela chutar errado - nesse caso ela
+sempre pergunta a Torres e a Luan antes, nunca responde algo "da cabeça dela"). Quando
 "duvida_geral" for false, inclua o campo mesmo assim com "opcoes_resposta" como lista vazia [].
 
 DÚVIDA EM CASO URGENTE: além da checagem acima, se a mensagem também parecer urgente (ex: prazo
@@ -2465,13 +2472,22 @@ def _finalizar_processamento_grupo(chave):
     # tiver dúvida ela fica calada e pergunta". Antes disso, qualquer dúvida real sobre o
     # CONTEÚDO (duvida_geral/duvida_urgente) forçava uma resposta genérica de "recebido" pro
     # cliente por código, como rede de segurança - exatamente o comportamento que ele pediu pra
-    # nunca mais acontecer. Agora, dúvida real sobre o conteúdo vira SILÊNCIO pro cliente (nada é
-    # mandado - só aciona a equipe internamente, ver aviso_equipe/opcoes_resposta abaixo, com
-    # prioridade quando for urgente). CLIENTE CHATEADO continua sendo tratado diferente (ele já
-    # demonstrou insatisfação na própria mensagem - ficar muda pioraria a situação, mesmo que a
-    # resposta seja só uma confirmação genérica com empatia) - só esse caso continua sempre
-    # respondendo, dúvida sozinha (sem chateado) agora nunca fala nada pro cliente.
-    if duvida_geral and not chateado:
+    # nunca mais acontecer.
+    #
+    # Round 27 parte 18 (continuação 2 - correção do próprio Torres em cima da correção acima):
+    # a primeira versão desse fix ainda mantinha uma exceção pra cliente CHATEADO (mandava uma
+    # confirmação genérica com empatia mesmo sem saber o detalhe, achando que ficar muda
+    # pioraria a situação de um cliente já insatisfeito). Torres foi taxativo de novo: "quando o
+    # cliente estiver chateado ela não pode responder qualquer coisa da cabeça dela pq isso vai
+    # deixar o cliente ainda mais chateado" - "ela sempre que tiver duvida e que nao souber o que
+    # fazer ela tem que perguntar a mim e a luan sempre!". Ou seja: chateado NÃO é mais motivo
+    # pra inventar uma resposta quando ela também está em dúvida - inventar algo errado pra um
+    # cliente já chateado piora ainda mais a situação. Agora dúvida real sobre o conteúdo SEMPRE
+    # vira SILÊNCIO pro cliente (nada é mandado - só aciona a equipe internamente, com prioridade
+    # máxima quando o cliente também estiver chateado), independente de chateado. Só quando NÃO
+    # há dúvida nenhuma (ela sabe o que aconteceu e o que fazer) é que chateado sozinho continua
+    # forçando uma resposta automática de empatia, por segurança.
+    if duvida_geral:
         precisa_responder = False
     else:
         precisa_responder = resultado.get("precisa_responder", True) or chateado
@@ -2589,12 +2605,13 @@ def _finalizar_processamento_grupo(chave):
         if resultado.get("chateado"):
             motivo.append("cliente possivelmente insatisfeito")
         if duvida_geral:
+            # Round 27 parte 18 (continuação 2): chateado deixou de mudar essa mensagem - dúvida
+            # agora SEMPRE fica em silêncio pro cliente, tenha ele ficado chateado ou não.
             motivo.append(
-                "robô não teve certeza de como responder - só mandei uma confirmação genérica pro cliente"
-                if chateado else
                 "robô não teve certeza de como responder - fiquei em SILÊNCIO pro cliente, preciso que alguém responda"
             )
-        prefixo = f"🚨 Atenção ({' + '.join(motivo)})"
+        prefixo = f"🚨🚨 Atenção URGENTE ({' + '.join(motivo)})" if (resultado.get("chateado") and duvida_geral) \
+            else f"🚨 Atenção ({' + '.join(motivo)})"
     elif not precisa_responder:
         prefixo = "🤫 Fiquei em silêncio (não precisava de resposta)"
     else:
@@ -3643,6 +3660,21 @@ def revisar_arte_dm(numero, key, data, message_type, grupo_jid_dm=None, imagem_b
             enviar_texto(numero, aviso)
             return {"skipped": aviso}
 
+    # Round 27 parte 18 (continuação 3 - mesmo bug real corrigido no grupo Tripa, ver
+    # _revisar_e_conferir_peca_tripa): guarda a referência da peça como "a última enviada
+    # nessa conversa" IMEDIATAMENTE ao receber, antes de rodar a análise (revisar_peca, que
+    # demora vários segundos) - pra caso Torres/Luan perguntem "confere isso"/"está certo?" em
+    # texto solto logo em seguida (ver _conferir_ultima_arte_da_conversa, chamada lá em
+    # processar_dm), a reconferência sempre encontrar a peça mais recente, mesmo se a análise
+    # de fundo ainda não tiver terminado.
+    cliente_nome = None
+    if grupo_jid_dm:
+        cliente_nome = _identificar_cliente_para_conferencia_dm(caption, grupo_jid_dm)
+        _guardar_ultima_arte(
+            grupo_jid_dm, key, message_type, caption, cliente_nome,
+            drive_file_id=drive_file_id, drive_mimetype=imagem_media_type if drive_file_id else None,
+        )
+
     try:
         _, texto_resp, resultado = revisar_peca(imagem_base64, pdf_base64, caption, imagem_media_type=imagem_media_type)
     except Exception as e:
@@ -3652,16 +3684,7 @@ def revisar_arte_dm(numero, key, data, message_type, grupo_jid_dm=None, imagem_b
     pontos_ortografia = _formatar_pontos_ortografia(resultado)
 
     resultado_comparacao = None
-    cliente_nome = None
     if grupo_jid_dm:
-        cliente_nome = _identificar_cliente_para_conferencia_dm(caption, grupo_jid_dm)
-        # Guarda essa arte como "a ultima enviada nessa conversa", pra caso Torres/Luan
-        # perguntem depois, em texto solto, "esta certo?"/"confere isso" sem reenviar a peça
-        # - ver _conferir_ultima_arte_da_conversa, chamada la em processar_dm.
-        _guardar_ultima_arte(
-            grupo_jid_dm, key, message_type, caption, cliente_nome,
-            drive_file_id=drive_file_id, drive_mimetype=imagem_media_type if drive_file_id else None,
-        )
         if cliente_nome:
             conferencia = _rodar_conferencia_de_conteudo(cliente_nome, imagem_base64, pdf_base64, "revisar_arte_dm", imagem_media_type=imagem_media_type)
             if conferencia:
@@ -4464,6 +4487,20 @@ def _revisar_e_conferir_peca_tripa(remote_jid, key, data, message_type, imagem_b
     WhatsApp nesse caso). Quando ambos são None (anexo de verdade), faz o backup normal pro
     Drive Compartilhado "Cintia Backup", do jeito de sempre."""
     grupo_tripa = GRUPOS.get(remote_jid, {"nome": "Tripa", "interno": True})
+
+    # Round 27 parte 18 (continuação 3 - bug real, log real): antes, a "última arte" só era
+    # guardada DEPOIS da análise completa (revisar_peca, chamada de IA que demora vários
+    # segundos) - se alguém mandasse a peça e, poucos segundos depois (antes da análise
+    # terminar), perguntasse "confere essa arte" em texto solto, a reconferência não
+    # encontrava nada guardado ainda e respondia "não encontrei nenhuma arte enviada
+    # recentemente", mesmo a peça tendo acabado de chegar (aconteceu de verdade: Torres
+    # mandou a arte e, 6 segundos depois - a análise ainda rodando - perguntou "confere essa
+    # arte cintia" e levou essa resposta errada). Agora guarda a referência da peça
+    # IMEDIATAMENTE ao receber (antes de rodar qualquer análise ou backup no Drive), pra uma
+    # pergunta de reconferência feita logo em seguida sempre encontrar a peça mais recente.
+    cliente_nome = extrair_cliente_da_legenda(caption) or _identificar_cliente_por_historico_recente(remote_jid)
+    _guardar_ultima_arte(remote_jid, key, message_type, caption, cliente_nome, drive_file_id=drive_file_id, drive_mimetype=imagem_media_type if drive_file_id else None)
+
     link_drive_tripa = link_arquivo_existente
     if link_arquivo_existente is None:
         if imagem_base64:
@@ -4507,17 +4544,12 @@ def _revisar_e_conferir_peca_tripa(remote_jid, key, data, message_type, imagem_b
     pontos_ortografia = _formatar_pontos_ortografia(resultado)
 
     resultado_comparacao = None
-    # Fallback pro contexto recente do proprio grupo Tripa quando a legenda nao cita o
-    # cliente diretamente (ex: legenda "está certo?" em vez de "Arte Terapia") - mesma ideia
-    # que ja existia so no privado (_identificar_cliente_para_conferencia_dm); sem isso, uma
-    # arte sem legenda com nome de cliente nunca passava pela comparação de conteúdo, só pela
-    # ortografia - o Torres pediu explicitamente pra não presumir que está tudo certo só
-    # porque a legenda não citou o cliente.
-    cliente_nome = extrair_cliente_da_legenda(caption) or _identificar_cliente_por_historico_recente(remote_jid)
+    # cliente_nome já foi resolvido lá em cima (fallback pro contexto recente do próprio
+    # grupo Tripa quando a legenda não cita o cliente diretamente, ex: legenda "está certo?"
+    # em vez de "Arte Terapia" - mesma ideia que já existia só no privado, ver
+    # _identificar_cliente_para_conferencia_dm) e a última arte já foi guardada, antes mesmo
+    # da análise rodar (ver comentário no início da função).
     veredito_final = None
-    # Guarda essa arte como "a ultima enviada nesse grupo", pra caso alguem pergunte depois,
-    # em texto solto, "esta certo?"/"confere isso" sem reenviar a peça (ver bloco acima).
-    _guardar_ultima_arte(remote_jid, key, message_type, caption, cliente_nome, drive_file_id=drive_file_id, drive_mimetype=imagem_media_type if drive_file_id else None)
     if cliente_nome:
         conferencia = _rodar_conferencia_de_conteudo(cliente_nome, imagem_base64, pdf_base64, "processar_revisao_grupo_designer", imagem_media_type=imagem_media_type)
         if conferencia:
