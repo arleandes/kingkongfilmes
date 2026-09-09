@@ -2953,8 +2953,12 @@ def revisar_peca(imagem_base64, pdf_base64, caption, imagem_media_type="image/jp
     # "Read timed out (read timeout=30)" ao revisar um PDF de 2 paginas (Tripa e privado), o
     # que fez a peca nem ser revisada e a mensagem de erro aparecer pro Torres. Imagem/PDF tende
     # a ser mais lento de processar que texto puro, entao usa o mesmo patamar (60s) ja usado em
-    # outras chamadas pesadas deste arquivo.
-    resultado = chamar_claude(SYSTEM_PROMPT_REVISAO, prompt_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64, max_tokens=4000, timeout=60, imagem_media_type=imagem_media_type)
+    # outras chamadas pesadas deste arquivo. thinking_budget (round 27 parte 17, pedido do
+    # Torres pra deixar o "jeito de pensar" das etapas de interpretação mais parecido com o
+    # dessa conversa de desenvolvimento) - o mesmo mecanismo que já ligava só nos 2
+    # classificadores principais (round 24), agora também aqui: revisar uma peça é decidir se
+    # cada trecho é erro real ou variação aceitável, não só comparar texto igual/diferente.
+    resultado = chamar_claude(SYSTEM_PROMPT_REVISAO, prompt_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64, max_tokens=4000, timeout=60, thinking_budget=2000, imagem_media_type=imagem_media_type)
 
     erros_brutos = resultado.get("erros") or []
     erros_validos = []
@@ -4014,7 +4018,11 @@ def comparar_arte_com_pedido(pedido_texto, imagem_base64, pdf_base64, historico_
     prompt_sistema = SYSTEM_PROMPT_COMPARACAO_PEDIDO.replace("{ano_atual}", ano_atual)
     # Prompt de conferencia de conteudo tambem cresceu bastante (calendario + padrao curto) -
     # max_tokens maior que o padrao reduz a chance de precisar da tentativa extra automatica.
-    resultado = chamar_claude(prompt_sistema, prompt_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64, max_tokens=4000, imagem_media_type=imagem_media_type)
+    # thinking_budget (round 27 parte 17) - conferir a arte final contra o pedido + historico +
+    # valores oficiais e decidir bate_com_pedido vs duvida_ambigua e exatamente o tipo de
+    # julgamento que se beneficia de espaco de deliberacao antes de decidir, igual o classificador
+    # principal ja usa desde o round 24.
+    resultado = chamar_claude(prompt_sistema, prompt_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64, max_tokens=4000, thinking_budget=2000, imagem_media_type=imagem_media_type)
 
     if resultado.get("duvida_ambigua"):
         bate = False
@@ -4749,8 +4757,11 @@ def responder_pergunta_sobre_grupo(pessoa_nome, pergunta, grupo_jid, grupo_nome,
     )
     try:
         # Prompt ganhou blocos de historico com timestamp + regras do cliente - max_tokens maior
-        # que o padrao reduz a chance de precisar da tentativa extra automatica.
-        resultado = chamar_claude(prompt_sistema, pergunta, max_tokens=3200)
+        # que o padrao reduz a chance de precisar da tentativa extra automatica. thinking_budget
+        # (round 27 parte 17) - responder uma pergunta livre sobre o grupo exige resolver
+        # referencia da propria pergunta e cruzar historico recente + antigo + fatos permanentes,
+        # mesmo tipo de raciocinio que ja se beneficiava disso no classificador principal.
+        resultado = chamar_claude(prompt_sistema, pergunta, max_tokens=3200, thinking_budget=2000)
         return resultado.get("resposta") or "Não consegui montar uma resposta a partir do histórico do grupo, pode reformular a pergunta?"
     except Exception as e:
         print(f"[responder_pergunta_sobre_grupo] erro: {e}", flush=True)
@@ -5087,7 +5098,10 @@ def responder_pergunta_operacional_geral(pessoa_nome, pergunta, contexto_convers
         .replace("{contexto_conversa_dm}", bloco_contexto_dm)
     )
     try:
-        resultado = chamar_claude(prompt_sistema, pergunta, max_tokens=3200, timeout=45)
+        # thinking_budget (round 27 parte 17) - mesma razao do responder_pergunta_sobre_grupo:
+        # pergunta operacional livre tambem cruza varios grupos/contexto e se beneficia do
+        # mesmo espaco de deliberacao ja usado no classificador principal desde o round 24.
+        resultado = chamar_claude(prompt_sistema, pergunta, max_tokens=3200, timeout=45, thinking_budget=2000)
         return resultado.get("resposta") or "Não consegui montar uma resposta a partir do histórico disponível, pode reformular a pergunta?"
     except Exception as e:
         print(f"[responder_pergunta_operacional_geral] erro: {e}", flush=True)
@@ -6143,12 +6157,18 @@ def processar_dm(remote_jid, key, data):
                     f"\n{contexto_conversa}" if contexto_conversa else ""
                 )
                 try:
+                    # thinking_budget (round 27 parte 17, mesmo pedido de Torres) - agora que
+                    # essa etapa recebe o historico da conversa (fix logo acima), ela tambem
+                    # precisa de espaco pra deliberar antes de decidir se a referencia foi
+                    # resolvida com seguranca ou se e melhor preencher "duvida" - mesmo mecanismo
+                    # ja usado no classificador principal desde o round 24.
                     resultado_compor = chamar_claude(
                         SYSTEM_PROMPT_COMPOR_AVISO_CLIENTE.format(
                             pessoa_nome=pessoa_nome_compor,
                             contexto_conversa_bloco=contexto_conversa_bloco_compor,
                         ),
                         instrucao_compor,
+                        thinking_budget=2000,
                     )
                 except Exception as e:
                     print(f"[comando_para_compor_aviso_cliente] erro ao compor texto: {e}", flush=True)
