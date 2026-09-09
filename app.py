@@ -1237,6 +1237,81 @@ def salvar_midia_grupo_drive(grupo, sender_name, midia_base64, categoria, extens
     return salvar_midia_drive(nome_pasta, categoria, conteudo_bytes, nome_arquivo, mimetype)
 
 
+# Round 27 parte 14: Torres relatou um caso real - o designer compartilhou a arte final do
+# Tripa colando um LINK do Google Drive na mensagem (em vez de anexar o arquivo direto no
+# WhatsApp, prática comum quando o arquivo é grande ou já está lá por outro motivo). Isso
+# passava batido: virava só uma linha de texto no histórico, nunca era revisado nem conferido
+# contra o pedido do cliente - foi assim que um card com o VALOR errado só foi descoberto
+# depois de já pronto. As funções abaixo detectam esse link e baixam o conteúdo de verdade
+# pelo ID do arquivo, pra alimentar a MESMA revisão/conferência que já existe pra anexo direto.
+_REGEX_URL_DRIVE = re.compile(r"https?://(?:drive|docs)\.google\.com/[^\s<>\"']+")
+
+
+def _extrair_arquivo_id_drive(texto):
+    """Procura um link de ARQUIVO do Google Drive/Docs num texto solto e devolve o ID do
+    arquivo, ou None se não achar nenhum link reconhecível. Um link de PASTA
+    (.../drive/folders/<id>) não é suportado de propósito - não dá pra saber qual arquivo
+    dentro da pasta é a peça pra revisar, então esse tipo de link nem entra aqui (não bate
+    nem com "/d/" nem com "?id=", os dois formatos que identificamos como link de ARQUIVO)."""
+    if not texto:
+        return None
+    m = _REGEX_URL_DRIVE.search(texto)
+    if not m:
+        return None
+    url = m.group(0)
+    m_id_path = re.search(r"/d/([a-zA-Z0-9_-]{15,})", url)
+    if m_id_path:
+        return m_id_path.group(1)
+    from urllib.parse import urlparse, parse_qs
+    valores_id = parse_qs(urlparse(url).query).get("id")
+    if valores_id:
+        return valores_id[0]
+    return None
+
+
+def _baixar_arquivo_drive_por_id(file_id):
+    """Baixa um arquivo do Google Drive pelo ID (usado quando alguém cola um LINK do Drive em
+    vez de anexar o arquivo direto no WhatsApp). Só funciona se a conta de serviço da Cintia
+    tiver acesso de verdade a esse arquivo específico - compartilhado direto com o e-mail dela,
+    ou dentro de um Drive Compartilhado do qual ela é membro (ex: "Cintia Backup") - um link de
+    um Drive pessoal comum sem esse compartilhamento não vai funcionar (mesma limitação de
+    permissão de sempre, não é bug). Devolve (conteudo_base64, mimetype, nome_arquivo). Duas
+    situações diferentes devolvem conteudo_base64=None, e quem chama precisa distinguir pelo
+    mimetype: (1) formato nativo do Google (Docs/Sheets/Slides) - CONSEGUIU acessar o arquivo
+    (mimetype/nome_arquivo vêm preenchidos), só não tem como baixar um binário de
+    imagem/PDF dele; (2) qualquer falha de acesso de verdade (sem permissão, ID inválido,
+    removido, etc) - aí mimetype também vem None, indicando que nem chegou a abrir o arquivo.
+    Nunca lança exceção pra quem chama."""
+    service = _obter_drive_service()
+    if not service or not file_id:
+        return None, None, None
+    try:
+        from googleapiclient.http import MediaIoBaseDownload
+        import io
+        metadata = service.files().get(
+            fileId=file_id, fields="name, mimeType", supportsAllDrives=True,
+        ).execute()
+        mimetype = metadata.get("mimeType", "")
+        nome_arquivo = metadata.get("name", "arquivo")
+        if mimetype.startswith("application/vnd.google-apps"):
+            # Conseguiu acessar o arquivo de verdade (mimetype/nome vêm preenchidos) - só não
+            # é uma imagem/PDF de verdade pra baixar. Devolve o mimetype mesmo assim, pra quem
+            # chama conseguir distinguir isso de uma falha de acesso real (ver docstring).
+            print(f"[_baixar_arquivo_drive_por_id] arquivo {file_id} é um formato nativo do Google ({mimetype}), não suportado", flush=True)
+            return None, mimetype, nome_arquivo
+        pedido_download = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+        buffer = io.BytesIO()
+        downloader = MediaIoBaseDownload(buffer, pedido_download)
+        concluido = False
+        while not concluido:
+            _, concluido = downloader.next_chunk()
+        conteudo_base64 = base64.b64encode(buffer.getvalue()).decode()
+        return conteudo_base64, mimetype, nome_arquivo
+    except Exception as e:
+        print(f"[_baixar_arquivo_drive_por_id] erro ao baixar arquivo {file_id} do Drive: {e}", flush=True)
+        return None, None, None
+
+
 _nomes_grupo_desconhecido_cache = {}
 
 
@@ -1330,7 +1405,7 @@ def transcrever_audio(caminho_arquivo):
     return resp.json().get("text", "")
 
 
-def chamar_claude(system_prompt, conteudo_usuario, imagem_base64=None, pdf_base64=None, max_tokens=1500, timeout=30, thinking_budget=0, _tentativa=1, _sem_thinking_forcado=False):
+def chamar_claude(system_prompt, conteudo_usuario, imagem_base64=None, pdf_base64=None, max_tokens=1500, timeout=30, thinking_budget=0, _tentativa=1, _sem_thinking_forcado=False, imagem_media_type="image/jpeg"):
     """thinking_budget > 0 liga o raciocínio estendido de verdade (extended thinking da API) -
     o modelo recebe um espaço dedicado só pra "pensar antes de responder" (igual o que a gente vê
     aqui nessa conversa, passo a passo, antes de comprometer uma resposta final), em vez de decidir
@@ -1354,9 +1429,14 @@ def chamar_claude(system_prompt, conteudo_usuario, imagem_base64=None, pdf_base6
     essencial pra resposta em si."""
     messages_content = []
     if imagem_base64:
+        # imagem_media_type (round 27 parte 14): antes sempre fixo em "image/jpeg" - funcionava
+        # porque toda imagem vinha do WhatsApp (Z-API normaliza pra JPEG), mas uma imagem baixada
+        # de um LINK do Google Drive pode ser PNG/WEBP/etc de verdade (export direto do
+        # Photoshop/Illustrator do designer) - declarar o media_type errado pra API de visão
+        # pode fazer a leitura falhar silenciosamente. Default preserva o comportamento antigo.
         messages_content.append({
             "type": "image",
-            "source": {"type": "base64", "media_type": "image/jpeg", "data": imagem_base64},
+            "source": {"type": "base64", "media_type": imagem_media_type or "image/jpeg", "data": imagem_base64},
         })
     if pdf_base64:
         messages_content.append({
@@ -1410,7 +1490,7 @@ def chamar_claude(system_prompt, conteudo_usuario, imagem_base64=None, pdf_base6
             return chamar_claude(
                 system_prompt, conteudo_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64,
                 max_tokens=max_tokens, timeout=timeout, thinking_budget=thinking_budget,
-                _tentativa=2, _sem_thinking_forcado=True,
+                _tentativa=2, _sem_thinking_forcado=True, imagem_media_type=imagem_media_type,
             )
         raise RuntimeError(f"Claude API {resp.status_code}: {resp.text[:500]}")
     resp_json = resp.json()
@@ -1443,6 +1523,7 @@ def chamar_claude(system_prompt, conteudo_usuario, imagem_base64=None, pdf_base6
             return chamar_claude(
                 system_prompt, conteudo_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64,
                 max_tokens=novo_max_tokens, timeout=timeout, thinking_budget=thinking_budget, _tentativa=2,
+                imagem_media_type=imagem_media_type,
             )
         raise RuntimeError(f"Resposta do Claude sem bloco de texto (tipos: {tipos_encontrados})")
     texto = bloco_texto["text"].strip()
@@ -1479,6 +1560,7 @@ def chamar_claude(system_prompt, conteudo_usuario, imagem_base64=None, pdf_base6
             return chamar_claude(
                 system_prompt, conteudo_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64,
                 max_tokens=novo_max_tokens, timeout=timeout, thinking_budget=thinking_budget, _tentativa=2,
+                imagem_media_type=imagem_media_type,
             )
         raise
 
@@ -1840,6 +1922,32 @@ def extrair_conteudo_mensagem_grupo(key, data):
 
     if "conversation" in message or message_type == "conversation":
         conteudo_texto = message.get("conversation", "")
+        # Round 27 parte 15: cliente às vezes compartilha uma arte/PDF colando um link do
+        # Google Drive em vez de anexar o arquivo direto (mesmo cenário do Tripa e do
+        # privado, rounds 27 parte 14/15, pedido explícito do Torres pra cobrir "qualquer
+        # link do Drive"). Se o link for de um arquivo acessível (compartilhado com a conta
+        # de serviço da Cintia, ou dentro do Drive Compartilhado "Cintia Backup"), baixa e
+        # alimenta imagem_base64/pdf_base64 exatamente como um anexo de verdade - entra no
+        # MESMO pipeline de classificação/encaminhamento pro designer que já existe pra
+        # imagem/PDF anexado. Se não conseguir baixar (link de pasta, não compartilhado,
+        # etc), não avisa nada pro cliente nem loga como erro - pra ele um link comum que
+        # "não abre" pode só ser um link de pasta normal, não um problema de configuração.
+        arquivo_id_drive_cliente = _extrair_arquivo_id_drive(conteudo_texto)
+        if arquivo_id_drive_cliente:
+            conteudo_b64_cliente, mimetype_cliente, nome_arquivo_cliente = _baixar_arquivo_drive_por_id(arquivo_id_drive_cliente)
+            if conteudo_b64_cliente and mimetype_cliente and mimetype_cliente.startswith("image/"):
+                imagem_base64 = conteudo_b64_cliente
+                conteudo_texto = f"{conteudo_texto} (arquivo do link: {nome_arquivo_cliente or 'imagem'})"
+            elif conteudo_b64_cliente and mimetype_cliente == "application/pdf":
+                pdf_base64 = conteudo_b64_cliente
+                nome_arquivo_doc = nome_arquivo_cliente or nome_arquivo_doc
+                conteudo_texto = f"{conteudo_texto} (arquivo do link: {nome_arquivo_cliente or 'PDF'})"
+            elif mimetype_cliente:
+                # Conseguiu acessar o arquivo (baixou o conteúdo, ou é um formato nativo do
+                # Google que nem tem conteúdo binário pra baixar - ver
+                # _baixar_arquivo_drive_por_id), mas não é imagem nem PDF - não dá pra
+                # analisar o conteúdo, só anota o que é pro classificador ter esse contexto.
+                conteudo_texto = f"{conteudo_texto} (link do Drive - tipo de arquivo não suportado pra análise: {mimetype_cliente})"
     elif "image" in message_type.lower():
         caption = message.get("imageMessage", {}).get("caption", "")
         imagem_base64 = baixar_midia(key)
@@ -2829,7 +2937,7 @@ def extrair_midia_para_revisao(key, data, message_type):
     return imagem_base64, pdf_base64, caption, aviso
 
 
-def revisar_peca(imagem_base64, pdf_base64, caption):
+def revisar_peca(imagem_base64, pdf_base64, caption, imagem_media_type="image/jpeg"):
     """Chama o Claude pra revisar a peca. Devolve (tem_erro, texto_formatado, resultado_bruto).
 
     Rede de seguranca por codigo (nunca confia só no modelo pra essa contradição especifica):
@@ -2846,7 +2954,7 @@ def revisar_peca(imagem_base64, pdf_base64, caption):
     # que fez a peca nem ser revisada e a mensagem de erro aparecer pro Torres. Imagem/PDF tende
     # a ser mais lento de processar que texto puro, entao usa o mesmo patamar (60s) ja usado em
     # outras chamadas pesadas deste arquivo.
-    resultado = chamar_claude(SYSTEM_PROMPT_REVISAO, prompt_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64, max_tokens=4000, timeout=60)
+    resultado = chamar_claude(SYSTEM_PROMPT_REVISAO, prompt_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64, max_tokens=4000, timeout=60, imagem_media_type=imagem_media_type)
 
     erros_brutos = resultado.get("erros") or []
     erros_validos = []
@@ -3079,11 +3187,17 @@ def _pedido_explicito_de_revisao_dm(caption, grupo_jid_dm):
     return False
 
 
-def _guardar_ultima_arte(chave_conversa, key, message_type, caption, cliente_nome):
+def _guardar_ultima_arte(chave_conversa, key, message_type, caption, cliente_nome, drive_file_id=None, drive_mimetype=None):
+    # drive_file_id/drive_mimetype (round 27 parte 14): quando a peça guardada veio de um LINK
+    # do Google Drive colado no texto (em vez de um anexo de verdade no WhatsApp), não existe
+    # "key" de mídia pra baixar de novo depois - uma reconferência futura por texto solto
+    # ("confere isso?") precisa saber que deve baixar de novo do Drive, não do WhatsApp (ver
+    # _conferir_ultima_arte_da_conversa).
     with _ultima_arte_lock:
         _ultima_arte_por_conversa[chave_conversa] = {
             "key": key, "message_type": message_type, "caption": caption or "",
             "cliente_nome": cliente_nome, "timestamp": time.time(),
+            "drive_file_id": drive_file_id, "drive_mimetype": drive_mimetype,
         }
 
 
@@ -3107,19 +3221,29 @@ def _conferir_ultima_arte_da_conversa(chave_arte, chave_historico, enviar_respos
     if not info:
         return None
 
-    tipo_lower = info["message_type"].lower()
     imagem_base64, pdf_base64 = None, None
-    if "image" in tipo_lower:
-        imagem_base64 = baixar_midia(info["key"])
-    elif "document" in tipo_lower:
-        pdf_base64 = baixar_midia(info["key"])
+    imagem_media_type = "image/jpeg"
+    if info.get("drive_file_id"):
+        # A última arte guardada veio de um link do Drive (round 27 parte 14) - baixa de novo
+        # do Drive pelo ID, não tem "key" de mídia do WhatsApp pra usar aqui.
+        conteudo_b64, mimetype_drive, _nome = _baixar_arquivo_drive_por_id(info["drive_file_id"])
+        if conteudo_b64 and mimetype_drive and mimetype_drive.startswith("image/"):
+            imagem_base64, imagem_media_type = conteudo_b64, mimetype_drive
+        elif conteudo_b64 and mimetype_drive == "application/pdf":
+            pdf_base64 = conteudo_b64
+    else:
+        tipo_lower = info["message_type"].lower()
+        if "image" in tipo_lower:
+            imagem_base64 = baixar_midia(info["key"])
+        elif "document" in tipo_lower:
+            pdf_base64 = baixar_midia(info["key"])
     if not imagem_base64 and not pdf_base64:
         print(f"[{log_prefixo}] pedido de reconferência, mas não consegui baixar a arte de novo", flush=True)
         return None
 
     caption = info.get("caption") or ""
     try:
-        _, _, resultado_orto = revisar_peca(imagem_base64, pdf_base64, caption)
+        _, _, resultado_orto = revisar_peca(imagem_base64, pdf_base64, caption, imagem_media_type=imagem_media_type)
     except Exception as e:
         print(f"[{log_prefixo}] erro ao reconferir ortografia: {e}", flush=True)
         return None
@@ -3133,7 +3257,7 @@ def _conferir_ultima_arte_da_conversa(chave_arte, chave_historico, enviar_respos
     resultado_comparacao = None
     veredito_final = None
     if cliente_nome:
-        conferencia = _rodar_conferencia_de_conteudo(cliente_nome, imagem_base64, pdf_base64, log_prefixo)
+        conferencia = _rodar_conferencia_de_conteudo(cliente_nome, imagem_base64, pdf_base64, log_prefixo, imagem_media_type=imagem_media_type)
         if conferencia:
             pedido, bate, texto_comparacao, resultado_comparacao = (
                 conferencia["pedido"], conferencia["bate"], conferencia["texto_comparacao"], conferencia["resultado"]
@@ -3167,7 +3291,7 @@ def _conferir_ultima_arte_da_conversa(chave_arte, chave_historico, enviar_respos
     return {"cliente_identificado": cliente_nome, "comparacao": resultado_comparacao, "veredito": veredito_final}
 
 
-def revisar_arte_dm(numero, key, data, message_type, grupo_jid_dm=None):
+def revisar_arte_dm(numero, key, data, message_type, grupo_jid_dm=None, imagem_base64_link=None, pdf_base64_link=None, caption_link=None, drive_file_id=None, imagem_media_type="image/jpeg"):
     """No privado de Torres/Luan: revisa a ortografia da arte (igual ao Tripa) e, se der pra
     identificar o cliente (pela legenda "Arte <cliente>" ou pelo contexto recente da conversa,
     ex: "confere essa arte do Terapia"), TAMBEM roda a conferencia de conteudo completa contra
@@ -3181,25 +3305,41 @@ def revisar_arte_dm(numero, key, data, message_type, grupo_jid_dm=None):
     "comparada" contra um pedido pendente só por coincidência de contexto, gerando um
     comentário confuso sobre uma peça que ninguém pediu pra conferir. Sem pedido explícito, só
     guarda a mídia (pra uma conferência futura em texto solto) e confirma o recebimento, sem
-    nenhum comentário sobre o conteúdo."""
-    message = data.get("message", {})
-    caption_bruta = (
-        message.get("imageMessage", {}).get("caption", "")
-        if "image" in message_type.lower()
-        else message.get("documentMessage", {}).get("caption", "")
-    )
+    nenhum comentário sobre o conteúdo.
+
+    Round 27 parte 15: imagem_base64_link/pdf_base64_link/caption_link/drive_file_id -
+    quando a peça já veio baixada de um LINK do Google Drive colado no texto (em vez de um
+    anexo de verdade), processar_dm já baixou o arquivo antes de chamar aqui - não tem
+    imageMessage/documentMessage pra extrair legenda nem mídia de novo (drive_file_id sendo
+    passado é o que identifica esse caso)."""
+    veio_de_link_drive = drive_file_id is not None
+    if veio_de_link_drive:
+        caption_bruta = caption_link or ""
+    else:
+        message = data.get("message", {})
+        caption_bruta = (
+            message.get("imageMessage", {}).get("caption", "")
+            if "image" in message_type.lower()
+            else message.get("documentMessage", {}).get("caption", "")
+        )
     if grupo_jid_dm and not _pedido_explicito_de_revisao_dm(caption_bruta, grupo_jid_dm):
-        _guardar_ultima_arte(grupo_jid_dm, key, message_type, caption_bruta, extrair_cliente_da_legenda(caption_bruta))
+        _guardar_ultima_arte(
+            grupo_jid_dm, key, message_type, caption_bruta, extrair_cliente_da_legenda(caption_bruta),
+            drive_file_id=drive_file_id, drive_mimetype=imagem_media_type if drive_file_id else None,
+        )
         enviar_texto(numero, "Recebi! Se quiser que eu confira (ortografia ou o pedido do cliente), é só pedir 🙂")
         return {"skipped": "sem pedido explícito de revisão, só guardado"}
 
-    imagem_base64, pdf_base64, caption, aviso = extrair_midia_para_revisao(key, data, message_type)
-    if aviso:
-        enviar_texto(numero, aviso)
-        return {"skipped": aviso}
+    if veio_de_link_drive:
+        imagem_base64, pdf_base64, caption = imagem_base64_link, pdf_base64_link, caption_bruta
+    else:
+        imagem_base64, pdf_base64, caption, aviso = extrair_midia_para_revisao(key, data, message_type)
+        if aviso:
+            enviar_texto(numero, aviso)
+            return {"skipped": aviso}
 
     try:
-        _, texto_resp, resultado = revisar_peca(imagem_base64, pdf_base64, caption)
+        _, texto_resp, resultado = revisar_peca(imagem_base64, pdf_base64, caption, imagem_media_type=imagem_media_type)
     except Exception as e:
         enviar_texto(numero, "Tive um problema pra revisar esse arquivo agora, pode tentar de novo em instantes?")
         return {"erro_claude": str(e)}
@@ -3213,9 +3353,12 @@ def revisar_arte_dm(numero, key, data, message_type, grupo_jid_dm=None):
         # Guarda essa arte como "a ultima enviada nessa conversa", pra caso Torres/Luan
         # perguntem depois, em texto solto, "esta certo?"/"confere isso" sem reenviar a peça
         # - ver _conferir_ultima_arte_da_conversa, chamada la em processar_dm.
-        _guardar_ultima_arte(grupo_jid_dm, key, message_type, caption, cliente_nome)
+        _guardar_ultima_arte(
+            grupo_jid_dm, key, message_type, caption, cliente_nome,
+            drive_file_id=drive_file_id, drive_mimetype=imagem_media_type if drive_file_id else None,
+        )
         if cliente_nome:
-            conferencia = _rodar_conferencia_de_conteudo(cliente_nome, imagem_base64, pdf_base64, "revisar_arte_dm")
+            conferencia = _rodar_conferencia_de_conteudo(cliente_nome, imagem_base64, pdf_base64, "revisar_arte_dm", imagem_media_type=imagem_media_type)
             if conferencia:
                 pedido, bate, texto_comparacao, resultado_comparacao = (
                     conferencia["pedido"], conferencia["bate"], conferencia["texto_comparacao"], conferencia["resultado"]
@@ -3820,7 +3963,7 @@ Responda SEMPRE E APENAS em JSON válido, sem bloco de código markdown (nada de
 """
 
 
-def comparar_arte_com_pedido(pedido_texto, imagem_base64, pdf_base64, historico_texto=""):
+def comparar_arte_com_pedido(pedido_texto, imagem_base64, pdf_base64, historico_texto="", imagem_media_type="image/jpeg"):
     bloco_historico = (
         f"\n\nHISTÓRICO RECENTE DO CLIENTE (mais antigo primeiro - pode conter correções enviadas "
         f"DEPOIS do pedido original acima; a informação mais recente e confirmada é que vale):\n{historico_texto}"
@@ -3841,7 +3984,7 @@ def comparar_arte_com_pedido(pedido_texto, imagem_base64, pdf_base64, historico_
     prompt_sistema = SYSTEM_PROMPT_COMPARACAO_PEDIDO.replace("{ano_atual}", ano_atual)
     # Prompt de conferencia de conteudo tambem cresceu bastante (calendario + padrao curto) -
     # max_tokens maior que o padrao reduz a chance de precisar da tentativa extra automatica.
-    resultado = chamar_claude(prompt_sistema, prompt_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64, max_tokens=4000)
+    resultado = chamar_claude(prompt_sistema, prompt_usuario, imagem_base64=imagem_base64, pdf_base64=pdf_base64, max_tokens=4000, imagem_media_type=imagem_media_type)
 
     if resultado.get("duvida_ambigua"):
         bate = False
@@ -3885,7 +4028,7 @@ def _extrair_texto_log_tripa(data, message_type):
     return None
 
 
-def _rodar_conferencia_de_conteudo(cliente_nome, imagem_base64, pdf_base64, log_prefixo):
+def _rodar_conferencia_de_conteudo(cliente_nome, imagem_base64, pdf_base64, log_prefixo, imagem_media_type="image/jpeg"):
     """Busca o pedido pendente daquele cliente e roda a conferencia de conteudo
     (comparar_arte_com_pedido) contra o historico da conversa dele. So faz a ANALISE - devolve
     um dict com pedido/bate/texto_comparacao/resultado, ou None se nao havia pedido pendente
@@ -3910,7 +4053,8 @@ def _rodar_conferencia_de_conteudo(cliente_nome, imagem_base64, pdf_base64, log_
         historico_texto = "\n".join(f"- {m['autor']}: {m['conteudo']}" for m in historico_cliente)
     try:
         bate, texto_comparacao, resultado_comparacao = comparar_arte_com_pedido(
-            pedido["pedido_texto"], imagem_base64, pdf_base64, historico_texto=historico_texto
+            pedido["pedido_texto"], imagem_base64, pdf_base64, historico_texto=historico_texto,
+            imagem_media_type=imagem_media_type,
         )
     except Exception as e:
         print(f"[{log_prefixo}] erro na comparacao com pedido: {e}", flush=True)
@@ -3943,83 +4087,34 @@ def _transcrever_audio_tripa(key):
         os.unlink(caminho)
 
 
-def processar_revisao_grupo_designer(remote_jid, key, data):
-    """No grupo Tripa Designer: se alguem postar uma foto/PDF de peca com o cliente
-    identificavel (legenda "Arte <cliente>" ou pelo contexto recente), SEMPRE revisa a
-    ortografia e - se houver pedido pendente - compara com o pedido, mas fica em SILÊNCIO no
-    grupo sobre o resultado (nem "tudo certo" nem erro) a nao ser que a legenda em si já seja um
-    pedido explicito de conferencia (ex: "confere isso"/"está certo?" como legenda). A analise e
-    guardada de qualquer forma (historico real + cache da ultima arte), pra poder responder
-    corretamente depois: quando alguem perguntar no privado (Torres/Luan) OU perguntar aqui no
-    proprio grupo Tripa (texto solto tipo "confere isso"/"tá certo?"), ela reconfere e responde
-    de verdade - nunca comenta sozinha sobre a arte de um cliente pra nao gerar ruido/confusao
-    (pedido explicito do Torres, round 22, depois de ela ter se contradito no grupo dizendo "tá
-    errado" e depois "tá tudo certo" sem ninguem ter perguntado de novo)."""
-    message_type = data.get("messageType", "")
-    tipo_lower = message_type.lower()
-    eh_midia_revisavel = "image" in tipo_lower or "document" in tipo_lower
+def _revisar_e_conferir_peca_tripa(remote_jid, key, data, message_type, imagem_base64, pdf_base64, caption, link_arquivo_existente=None, drive_file_id=None, imagem_media_type="image/jpeg"):
+    """Roda a análise completa (ortografia + conferência de conteúdo contra o pedido do cliente)
+    sobre uma peça postada no grupo Tripa Designer - seja ela um ANEXO de imagem/PDF de verdade
+    recebido pelo WhatsApp, seja um LINK do Google Drive colado como texto (round 27 parte 14 -
+    ver processar_revisao_grupo_designer). Fica em SILÊNCIO no grupo por padrão (só fala se
+    `caption` já for um pedido explícito de conferência, ex: "confere isso"), exatamente como
+    sempre - mas agora, quando a conferência de CONTEÚDO encontra uma divergência CONFIRMADA
+    (não uma dúvida) e ninguém pediu revisão, avisa Torres e Luan em privado. Pedido explícito
+    do Torres depois de um caso real: o designer postou um card com o VALOR errado (colando o
+    link do Drive, sem pedir conferência), ninguém viu o erro no grupo (correto, silêncio é a
+    regra), mas ele também só descobriu depois de pronto - "quando estiver nesses casos eu
+    queria que a Cintia me sinalizasse no meu privado". Isso espelha a escalação que já existia
+    pra dúvida ambígua (sempre avisa Torres/Luan em privado); a diferença é que aqui não há
+    dúvida nenhuma pra resolver, só um erro confirmado que merece um alerta antes de aprovar.
 
-    if not eh_midia_revisavel:
-        # Texto/video/audio no Tripa: nao passam pela revisao automatica de imagem/PDF. Audio e
-        # sempre transcrito (round 22) pra virar historico de verdade, nao um placeholder vazio -
-        # o texto transcrito tambem pode ser um pedido de conferencia falado em vez de escrito.
-        if "audio" in tipo_lower or "ptt" in tipo_lower:
-            transcricao = _transcrever_audio_tripa(key)
-            conteudo_log_tripa = f"[áudio] {transcricao}" if transcricao else "[áudio enviado - não consegui transcrever]"
-        elif "video" in tipo_lower:
-            # Backup no Drive (round 27 parte 9, expandido: Torres pediu que cubra "não só
-            # clientes") - vídeo postado no Tripa também é salvo de verdade, com o link
-            # acrescentado ao log de texto já existente.
-            video_b64_tripa = baixar_midia(key)
-            link_video_tripa = salvar_midia_grupo_drive(
-                GRUPOS.get(remote_jid, {"nome": "Tripa", "interno": True}), data.get("pushName", "equipe"),
-                video_b64_tripa, "Vídeos", "mp4", "video/mp4",
-            )
-            conteudo_log_tripa = _extrair_texto_log_tripa(data, message_type)
-            if conteudo_log_tripa and link_video_tripa:
-                conteudo_log_tripa += f" (arquivo salvo: {link_video_tripa})"
-        else:
-            # Um texto solto pedindo conferencia (ex: "esta certo?"/"confere isso", sem reenviar
-            # a peça) reconfere a ULTIMA arte enviada aqui - mesmo comportamento que ja existe no
-            # privado de Torres/Luan e no grupo Gestao (pedido explicito do Torres).
-            conteudo_log_tripa = _extrair_texto_log_tripa(data, message_type)
-        if conteudo_log_tripa:
-            _registrar_log_tripa(remote_jid, data, conteudo_log_tripa)
-            if _parece_pedido_de_conferencia(conteudo_log_tripa):
-                resultado_reconf = _conferir_ultima_arte_da_conversa(
-                    remote_jid, remote_jid, lambda t: enviar_texto(remote_jid, t), "processar_revisao_grupo_designer",
-                )
-                if resultado_reconf is None:
-                    enviar_texto(remote_jid, "Não encontrei nenhuma arte enviada recentemente aqui pra conferir. Pode reenviar a peça?")
-                else:
-                    _registrar_log_tripa(remote_jid, data, f"[reconferência solicitada] {resultado_reconf['veredito']}")
-                return {"reconferencia_tripa": resultado_reconf}
-        # Sem isso, uma mensagem de texto que caia aqui (que nao e imagem/documento) nunca
-        # deveria seguir pro trecho de baixo, que so trata midia revisavel de verdade.
-        return {"logged": bool(conteudo_log_tripa)}
-
-    imagem_base64, pdf_base64, caption, aviso = extrair_midia_para_revisao(key, data, message_type)
-    if aviso:
-        # No grupo nao mandamos os avisos de "nao consegui baixar" pra nao gerar ruido - so
-        # logamos e seguimos. Mas o historico precisa registrar que uma midia chegou (com a
-        # legenda, se tiver) - bug real relatado pelo Torres: antes disso, imagem/arte que
-        # falhava ao baixar (ou qualquer imagem, na verdade - ver comentario abaixo) ficava
-        # sem NENHUM conteudo no historico, so um "[imagem enviada]" vazio - perguntada depois
-        # sobre "o que rolou no Tripa hoje", a Cintia so conseguia citar mensagens de TEXTO
-        # (ela mesma descreveu certinho esse sintoma quando o Torres perguntou).
-        prefixo_legenda = f" (legenda: {caption})" if caption else ""
-        _registrar_log_tripa(remote_jid, data, f"[imagem/arquivo enviado{prefixo_legenda} - não consegui baixar pra revisar]")
-        print(f"[processar_revisao_grupo_designer] {aviso}", flush=True)
-        return {"skipped": aviso}
-
-    # Backup no Drive (round 27 parte 9, expandido: Torres pediu que cubra "não só clientes") -
-    # toda peça postada no Tripa também é salva de verdade, não só a análise em texto.
+    link_arquivo_existente/drive_file_id: quando a peça já veio de um link do Drive, o arquivo
+    já está lá - não faz backup de novo (link_arquivo_existente vira a referência salva no
+    histórico), e drive_file_id fica guardado em _guardar_ultima_arte pra uma reconferência
+    futura por texto solto também baixar do Drive de novo (não existe "key" de mídia do
+    WhatsApp nesse caso). Quando ambos são None (anexo de verdade), faz o backup normal pro
+    Drive Compartilhado "Cintia Backup", do jeito de sempre."""
     grupo_tripa = GRUPOS.get(remote_jid, {"nome": "Tripa", "interno": True})
-    link_drive_tripa = None
-    if imagem_base64:
-        link_drive_tripa = salvar_midia_grupo_drive(grupo_tripa, data.get("pushName", "equipe"), imagem_base64, "Fotos", "jpg", "image/jpeg")
-    elif pdf_base64:
-        link_drive_tripa = salvar_midia_grupo_drive(grupo_tripa, data.get("pushName", "equipe"), pdf_base64, "PDF", "pdf", "application/pdf")
+    link_drive_tripa = link_arquivo_existente
+    if link_arquivo_existente is None:
+        if imagem_base64:
+            link_drive_tripa = salvar_midia_grupo_drive(grupo_tripa, data.get("pushName", "equipe"), imagem_base64, "Fotos", "jpg", "image/jpeg")
+        elif pdf_base64:
+            link_drive_tripa = salvar_midia_grupo_drive(grupo_tripa, data.get("pushName", "equipe"), pdf_base64, "PDF", "pdf", "application/pdf")
 
     # A legenda da PRÓPRIA imagem já pode ser um pedido explícito (ex: legenda "confere isso" ou
     # "está certo?" junto com a peça) - só nesse caso ela fala no grupo automaticamente; sem isso,
@@ -4034,7 +4129,7 @@ def processar_revisao_grupo_designer(remote_jid, key, data):
             enviar_texto(remote_jid, texto)
 
     try:
-        tem_erro, texto_resp, resultado = revisar_peca(imagem_base64, pdf_base64, caption)
+        tem_erro, texto_resp, resultado = revisar_peca(imagem_base64, pdf_base64, caption, imagem_media_type=imagem_media_type)
     except Exception as e:
         # Bug real reportado por Torres (round 27 parte 12 - "ela só pode corrigir se agente
         # pedir", "novamente Cintia querendo consertar as coisas no grupo de Tripa"): esse
@@ -4067,9 +4162,9 @@ def processar_revisao_grupo_designer(remote_jid, key, data):
     veredito_final = None
     # Guarda essa arte como "a ultima enviada nesse grupo", pra caso alguem pergunte depois,
     # em texto solto, "esta certo?"/"confere isso" sem reenviar a peça (ver bloco acima).
-    _guardar_ultima_arte(remote_jid, key, message_type, caption, cliente_nome)
+    _guardar_ultima_arte(remote_jid, key, message_type, caption, cliente_nome, drive_file_id=drive_file_id, drive_mimetype=imagem_media_type if drive_file_id else None)
     if cliente_nome:
-        conferencia = _rodar_conferencia_de_conteudo(cliente_nome, imagem_base64, pdf_base64, "processar_revisao_grupo_designer")
+        conferencia = _rodar_conferencia_de_conteudo(cliente_nome, imagem_base64, pdf_base64, "processar_revisao_grupo_designer", imagem_media_type=imagem_media_type)
         if conferencia:
             pedido, bate, texto_comparacao, resultado_comparacao = (
                 conferencia["pedido"], conferencia["bate"], conferencia["texto_comparacao"], conferencia["resultado"]
@@ -4094,6 +4189,17 @@ def processar_revisao_grupo_designer(remote_jid, key, data):
                 # só, em vez de dois avisos separados repetindo "tudo certo".
                 veredito_final = _montar_veredito_curto(pontos_ortografia, resultado_comparacao)
                 _falar_no_grupo(veredito_final)
+                if not bate and not pedido_explicito:
+                    # Round 27 parte 14: divergência CONFIRMADA (não dúvida) encontrada numa
+                    # análise que ninguém pediu - fica em silêncio no grupo (regra de sempre),
+                    # mas avisa Torres/Luan em privado antes que a peça saia errada pro cliente.
+                    for numero in TEAM_NUMBERS:
+                        enviar_texto(
+                            numero,
+                            f"⚠️ Encontrei uma divergência na conferência de conteúdo ({cliente_nome}) - "
+                            f"a peça foi postada no Tripa sem pedido de conferência, então não comentei "
+                            f"lá, mas é melhor conferir antes de aprovar:\n\n{veredito_final}",
+                        )
                 # Quando o pedido veio do banco (tem tarefa_id), atualiza o status da
                 # tarefa de acordo com o resultado da conferencia: concluida se bateu
                 # tudo certo, ou aguardando correcao se faltou/tem algo errado - assim a
@@ -4125,6 +4231,129 @@ def processar_revisao_grupo_designer(remote_jid, key, data):
     _registrar_log_tripa(remote_jid, data, f"[arte revisada{prefixo_legenda}] {veredito_final}{sufixo_drive_tripa}")
 
     return {"resultado": resultado, "cliente_identificado": cliente_nome, "comparacao": resultado_comparacao, "falou_no_grupo": pedido_explicito}
+
+
+def processar_revisao_grupo_designer(remote_jid, key, data):
+    """No grupo Tripa Designer: se alguem postar uma foto/PDF de peca com o cliente
+    identificavel (legenda "Arte <cliente>" ou pelo contexto recente), SEMPRE revisa a
+    ortografia e - se houver pedido pendente - compara com o pedido, mas fica em SILÊNCIO no
+    grupo sobre o resultado (nem "tudo certo" nem erro) a nao ser que a legenda em si já seja um
+    pedido explicito de conferencia (ex: "confere isso"/"está certo?" como legenda). A analise e
+    guardada de qualquer forma (historico real + cache da ultima arte), pra poder responder
+    corretamente depois: quando alguem perguntar no privado (Torres/Luan) OU perguntar aqui no
+    proprio grupo Tripa (texto solto tipo "confere isso"/"tá certo?"), ela reconfere e responde
+    de verdade - nunca comenta sozinha sobre a arte de um cliente pra nao gerar ruido/confusao
+    (pedido explicito do Torres, round 22, depois de ela ter se contradito no grupo dizendo "tá
+    errado" e depois "tá tudo certo" sem ninguem ter perguntado de novo).
+
+    Round 27 parte 14: o designer às vezes compartilha a peça final colando um LINK do Google
+    Drive na mensagem (em vez de anexar o arquivo direto) - isso passava batido, virava só uma
+    linha de texto no histórico, nunca era revisado/conferido (foi assim que um card com o VALOR
+    errado só foi descoberto depois de pronto). Um link de ARQUIVO do Drive detectado num texto
+    solto agora é tratado como se fosse a própria peça chegando: baixa o conteúdo de verdade pelo
+    ID do arquivo (só funciona se a conta de serviço tiver acesso - compartilhado direto ou via
+    Drive Compartilhado) e roda a MESMA análise de sempre. Link de PASTA não é suportado (não dá
+    pra saber qual arquivo dentro dela é a peça)."""
+    message_type = data.get("messageType", "")
+    tipo_lower = message_type.lower()
+    eh_midia_revisavel = "image" in tipo_lower or "document" in tipo_lower
+
+    if not eh_midia_revisavel:
+        # Texto/video/audio no Tripa: nao passam pela revisao automatica de imagem/PDF. Audio e
+        # sempre transcrito (round 22) pra virar historico de verdade, nao um placeholder vazio -
+        # o texto transcrito tambem pode ser um pedido de conferencia falado em vez de escrito.
+        if "audio" in tipo_lower or "ptt" in tipo_lower:
+            transcricao = _transcrever_audio_tripa(key)
+            conteudo_log_tripa = f"[áudio] {transcricao}" if transcricao else "[áudio enviado - não consegui transcrever]"
+        elif "video" in tipo_lower:
+            # Backup no Drive (round 27 parte 9, expandido: Torres pediu que cubra "não só
+            # clientes") - vídeo postado no Tripa também é salvo de verdade, com o link
+            # acrescentado ao log de texto já existente.
+            video_b64_tripa = baixar_midia(key)
+            link_video_tripa = salvar_midia_grupo_drive(
+                GRUPOS.get(remote_jid, {"nome": "Tripa", "interno": True}), data.get("pushName", "equipe"),
+                video_b64_tripa, "Vídeos", "mp4", "video/mp4",
+            )
+            conteudo_log_tripa = _extrair_texto_log_tripa(data, message_type)
+            if conteudo_log_tripa and link_video_tripa:
+                conteudo_log_tripa += f" (arquivo salvo: {link_video_tripa})"
+        else:
+            texto_bruto = _extrair_texto_log_tripa(data, message_type)
+            # Round 27 parte 14: um link de ARQUIVO do Drive colado no texto vira uma peça de
+            # verdade pra revisar/conferir, não só uma linha de log.
+            arquivo_id_drive = _extrair_arquivo_id_drive(texto_bruto)
+            if arquivo_id_drive:
+                conteudo_b64, mimetype_drive, nome_arquivo_drive = _baixar_arquivo_drive_por_id(arquivo_id_drive)
+                link_canonico = f"https://drive.google.com/file/d/{arquivo_id_drive}/view"
+                if conteudo_b64 and mimetype_drive and mimetype_drive.startswith("image/"):
+                    return _revisar_e_conferir_peca_tripa(
+                        remote_jid, key, data, message_type, conteudo_b64, None, texto_bruto or "",
+                        link_arquivo_existente=link_canonico, drive_file_id=arquivo_id_drive,
+                        imagem_media_type=mimetype_drive,
+                    )
+                if conteudo_b64 and mimetype_drive == "application/pdf":
+                    return _revisar_e_conferir_peca_tripa(
+                        remote_jid, key, data, message_type, None, conteudo_b64, texto_bruto or "",
+                        link_arquivo_existente=link_canonico, drive_file_id=arquivo_id_drive,
+                    )
+                if mimetype_drive:
+                    # Conseguiu acessar o arquivo (baixou o conteúdo, ou é um formato nativo do
+                    # Google que nem tem conteúdo binário pra baixar - ver
+                    # _baixar_arquivo_drive_por_id), mas não é imagem nem PDF suportado (ex: .ai,
+                    # .psd, Google Docs/Sheets/Slides) - não dá pra revisar com o pipeline atual,
+                    # só loga a chegada (sem gerar ruído no grupo).
+                    _registrar_log_tripa(remote_jid, data, f"[link do Drive recebido: {nome_arquivo_drive or 'arquivo'} - tipo não suportado pra revisão ({mimetype_drive})]")
+                    return {"logged": True, "drive_tipo_nao_suportado": mimetype_drive}
+                # Não conseguiu acessar o arquivo de jeito nenhum (mimetype tambem None) -
+                # provavelmente não foi compartilhado com a
+                # conta de serviço da Cintia (ou é um link de arquivo inválido/removido). Isso é
+                # diferente de um erro técnico transitório (que fica só no log): sem avisar
+                # alguém, essa funcionalidade inteira fica quebrada em silêncio e ninguém saberia
+                # por quê - por isso avisa Torres/Luan em privado (nunca no grupo Tripa, mesma
+                # regra de sempre), pra corrigirem o compartilhamento.
+                _registrar_log_tripa(remote_jid, data, "[link do Drive recebido - não consegui acessar o arquivo]")
+                for numero in TEAM_NUMBERS:
+                    enviar_texto(
+                        numero,
+                        "⚠️ Recebi um link do Drive no grupo Tripa mas não consegui abrir o arquivo "
+                        "(pode não estar compartilhado com a conta de serviço, ou ser um link de "
+                        "pasta em vez de arquivo). Pode conferir o compartilhamento?",
+                    )
+                return {"drive_link_inacessivel": arquivo_id_drive}
+            # Um texto solto pedindo conferencia (ex: "esta certo?"/"confere isso", sem reenviar
+            # a peça) reconfere a ULTIMA arte enviada aqui - mesmo comportamento que ja existe no
+            # privado de Torres/Luan e no grupo Gestao (pedido explicito do Torres).
+            conteudo_log_tripa = texto_bruto
+        if conteudo_log_tripa:
+            _registrar_log_tripa(remote_jid, data, conteudo_log_tripa)
+            if _parece_pedido_de_conferencia(conteudo_log_tripa):
+                resultado_reconf = _conferir_ultima_arte_da_conversa(
+                    remote_jid, remote_jid, lambda t: enviar_texto(remote_jid, t), "processar_revisao_grupo_designer",
+                )
+                if resultado_reconf is None:
+                    enviar_texto(remote_jid, "Não encontrei nenhuma arte enviada recentemente aqui pra conferir. Pode reenviar a peça?")
+                else:
+                    _registrar_log_tripa(remote_jid, data, f"[reconferência solicitada] {resultado_reconf['veredito']}")
+                return {"reconferencia_tripa": resultado_reconf}
+        # Sem isso, uma mensagem de texto que caia aqui (que nao e imagem/documento) nunca
+        # deveria seguir pro trecho de baixo, que so trata midia revisavel de verdade.
+        return {"logged": bool(conteudo_log_tripa)}
+
+    imagem_base64, pdf_base64, caption, aviso = extrair_midia_para_revisao(key, data, message_type)
+    if aviso:
+        # No grupo nao mandamos os avisos de "nao consegui baixar" pra nao gerar ruido - so
+        # logamos e seguimos. Mas o historico precisa registrar que uma midia chegou (com a
+        # legenda, se tiver) - bug real relatado pelo Torres: antes disso, imagem/arte que
+        # falhava ao baixar (ou qualquer imagem, na verdade - ver comentario abaixo) ficava
+        # sem NENHUM conteudo no historico, so um "[imagem enviada]" vazio - perguntada depois
+        # sobre "o que rolou no Tripa hoje", a Cintia so conseguia citar mensagens de TEXTO
+        # (ela mesma descreveu certinho esse sintoma quando o Torres perguntou).
+        prefixo_legenda = f" (legenda: {caption})" if caption else ""
+        _registrar_log_tripa(remote_jid, data, f"[imagem/arquivo enviado{prefixo_legenda} - não consegui baixar pra revisar]")
+        print(f"[processar_revisao_grupo_designer] {aviso}", flush=True)
+        return {"skipped": aviso}
+
+    return _revisar_e_conferir_peca_tripa(remote_jid, key, data, message_type, imagem_base64, pdf_base64, caption)
 
 
 def processar_mensagem_grupo_gestao(remote_jid, key, data):
@@ -5126,6 +5355,59 @@ def processar_dm(remote_jid, key, data):
             # chegou, em vez de sumir completamente do historico.
             registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, pessoa, f"[mandou uma mensagem do tipo '{message_type}', não suportada ainda]", True)
             return {"skipped": "DM de tipo não tratado nesta versão, mas registrado no histórico"}
+
+        # Round 27 parte 15: Torres/Luan às vezes colam um link de arquivo do Google Drive
+        # no privado em vez de anexar a imagem/PDF direto (mesmo cenário do grupo Tripa,
+        # round 27 parte 14 - e agora pedido explicitamente pelo Torres pra cobrir "qualquer
+        # link", não só o do Tripa). Trata como se a própria mídia tivesse chegado: baixa
+        # pelo ID, descreve o conteúdo de verdade (igual a um anexo) e passa pelo MESMO
+        # fluxo de revisão em revisar_arte_dm - que só roda a revisão/conferência de fato
+        # se houver um pedido explícito (senão só guarda a mídia e confirma o recebimento,
+        # regra de sempre).
+        arquivo_id_drive_dm = _extrair_arquivo_id_drive(texto)
+        if arquivo_id_drive_dm:
+            conteudo_b64_dm, mimetype_dm, nome_arquivo_dm = _baixar_arquivo_drive_por_id(arquivo_id_drive_dm)
+            link_canonico_dm = f"https://drive.google.com/file/d/{arquivo_id_drive_dm}/view"
+            if conteudo_b64_dm and mimetype_dm and mimetype_dm.startswith("image/"):
+                descricao_link_dm = _descrever_conteudo_arquivo_dm(conteudo_b64_dm, None, texto)
+                texto_historico_link_dm = (
+                    f"[conteúdo do arquivo do link do Drive]: {descricao_link_dm} (arquivo salvo: {link_canonico_dm})"
+                    if descricao_link_dm else f"[link do Drive recebido, não consegui descrever o conteúdo] (arquivo salvo: {link_canonico_dm})"
+                )
+                registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, pessoa, texto_historico_link_dm, True)
+                return revisar_arte_dm(
+                    numero, key, data, message_type, grupo_jid_dm=grupo_jid_dm,
+                    imagem_base64_link=conteudo_b64_dm, caption_link=texto,
+                    drive_file_id=arquivo_id_drive_dm, imagem_media_type=mimetype_dm,
+                )
+            if conteudo_b64_dm and mimetype_dm == "application/pdf":
+                descricao_link_dm = _descrever_conteudo_arquivo_dm(None, conteudo_b64_dm, texto)
+                texto_historico_link_dm = (
+                    f"[conteúdo do arquivo do link do Drive]: {descricao_link_dm} (arquivo salvo: {link_canonico_dm})"
+                    if descricao_link_dm else f"[link do Drive recebido, não consegui descrever o conteúdo] (arquivo salvo: {link_canonico_dm})"
+                )
+                registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, pessoa, texto_historico_link_dm, True)
+                return revisar_arte_dm(
+                    numero, key, data, message_type, grupo_jid_dm=grupo_jid_dm,
+                    pdf_base64_link=conteudo_b64_dm, caption_link=texto,
+                    drive_file_id=arquivo_id_drive_dm,
+                )
+            if mimetype_dm:
+                # Conseguiu acessar o arquivo (baixou o conteúdo, ou é um formato nativo do
+                # Google que nem tem conteúdo binário pra baixar - ver
+                # _baixar_arquivo_drive_por_id), mas não é imagem nem PDF (ex: .ai, .psd,
+                # Google Docs/Sheets/Slides) - não dá pra revisar/descrever com o pipeline atual.
+                registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, pessoa, f"[link do Drive recebido: {nome_arquivo_dm or 'arquivo'} - tipo não suportado ({mimetype_dm})]", True)
+                responder(f"Recebi o link, mas esse tipo de arquivo ({mimetype_dm}) eu ainda não consigo abrir - só imagem e PDF.")
+                return {"drive_tipo_nao_suportado": mimetype_dm}
+            # Não conseguiu acessar o arquivo de jeito nenhum (mimetype tambem None) -
+            # provavelmente não compartilhado com a conta
+            # de serviço da Cintia, link de pasta (não suportado, não dá pra saber qual
+            # arquivo revisar), ou removido.
+            registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, pessoa, "[link do Drive recebido - não consegui acessar o arquivo]", True)
+            responder("Recebi o link mas não consegui abrir o arquivo (pode não estar compartilhado com a conta de serviço da Cintia, ou ser um link de pasta em vez de arquivo). Pode conferir o compartilhamento ou mandar o arquivo direto?")
+            return {"drive_link_inacessivel": arquivo_id_drive_dm}
+
         registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, pessoa, texto, True)
 
     # "regra pro/pra/para <cliente>: <instrucao>" - mesma ideia da regra geral, mas
