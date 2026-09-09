@@ -3668,6 +3668,15 @@ _STOPWORDS_BUSCA_HISTORICO = {
     "falou", "confirma", "confirmar", "vez", "cintia", "torres", "luan", "sobre", "essa", "esse",
     "ainda", "alguma vez", "ja pediu", "vai ter", "tera", "desse", "dessa", "desses", "dessas",
     "disso", "nesse", "nessa", "nesses", "nessas", "nisso", "naquele", "naquela", "num", "numa",
+    # Round 27 parte 17 (bug real reportado por Torres): verbos de ação genéricos demais - tipo
+    # "envia esse pedido pra tripa também" - batiam (via ILIKE) com praticamente QUALQUER mensagem
+    # antiga que também falasse em mandar algo pra Tripa, inundando o contexto com conteúdo de
+    # OUTRO cliente completamente e fazendo o classificador confundir qual pedido "esse"
+    # realmente se referia. Esses termos aparecem constantemente em comandos operacionais comuns,
+    # não são palavras-chave de CONTEÚDO (ao contrário de "salmão", "moqueca", nomes de produtos) -
+    # tirá-los da busca não perde capacidade de achar assunto antigo de verdade.
+    "envia", "enviar", "enviei", "manda", "mandar", "mandei", "encaminha", "encaminhar",
+    "encaminhei", "passa", "passar", "passei", "tripa", "tambem", "novamente", "denovo",
 }
 
 
@@ -4463,16 +4472,20 @@ Responda SEMPRE E APENAS em JSON válido, sem texto fora do JSON e sem bloco de 
 # pedido pra dizer), e em soar humano de verdade, nao com cara de texto gerado por IA.
 SYSTEM_PROMPT_COMPOR_AVISO_CLIENTE = """Você escreve um aviso/comunicado curto, em português do
 Brasil, pronto pra mandar no grupo de WhatsApp de um cliente, a partir da descrição que
-{pessoa_nome} deu do que precisa ser comunicado.
-
+{pessoa_nome} deu do que precisa ser comunicado (na mensagem do usuário logo abaixo).
+{contexto_conversa_bloco}
 REGRA MAIS IMPORTANTE - NUNCA MUDE O CONTEÚDO: use SOMENTE os fatos, instruções e informações que
-{pessoa_nome} realmente descreveu (o que aconteceu, datas, horários, valores, ações, perguntas que
-devem ir no texto). Nunca invente, deduza além do que foi dito, troque um detalhe por outro, resuma
-a ponto de perder informação, nem deixe de fora algo que foi pedido pra constar. Se alguma parte do
-pedido não ficar clara o suficiente pra escrever com segurança (ex: uma pergunta que não dá pra
-saber se é pra perguntar ao cliente no texto ou é uma pergunta pra você mesma responder), preencha
-"duvida" com uma pergunta curta pra {pessoa_nome} esclarecer, em vez de supor - errar o CONTEÚDO de
-um aviso pro cliente é sempre pior do que perguntar de novo.
+{pessoa_nome} realmente descreveu - seja na instrução direta (o que aconteceu, datas, horários,
+valores, ações, perguntas que devem ir no texto), seja, quando a instrução se referir a algo já dito
+antes (frases como "essa informação", "isso que eu falei", "aquela promoção", "o que eu mandei"), no
+HISTÓRICO DA CONVERSA acima, se houver um. Nunca invente, deduza além do que foi dito em algum desses
+dois lugares, troque um detalhe por outro, resuma a ponto de perder informação, nem deixe de fora
+algo que foi pedido pra constar. Se, mesmo depois de checar o histórico da conversa, alguma parte do
+pedido não ficar clara o suficiente pra escrever com segurança (ex: uma referência a algo que não
+aparece em NENHUM lugar da conversa, ou uma pergunta que não dá pra saber se é pra perguntar ao
+cliente no texto ou é uma pergunta pra você mesma responder), preencha "duvida" com uma pergunta
+curta pra {pessoa_nome} esclarecer, em vez de supor - errar o CONTEÚDO de um aviso pro cliente é
+sempre pior do que perguntar de novo.
 
 TOM - SOAR COMO UMA PESSOA DE VERDADE, NUNCA COM CARA DE TEXTO GERADO POR IA: escreva do jeito que
 alguém da equipe escreveria de verdade num grupo de WhatsApp com um cliente - cordial, direto,
@@ -6117,9 +6130,24 @@ def processar_dm(remote_jid, key, data):
             else:
                 grupo_jid_compor = candidatos_compor[0]
                 grupo_nome_compor = GRUPOS[grupo_jid_compor]["nome"]
+                # Bug real reportado por Torres (round 27 parte 17): essa etapa compunha o aviso
+                # olhando SÓ pra "instrucao_compor" (o que o classificador principal conseguiu
+                # extrair da mensagem atual), sem NENHUM acesso ao histórico da conversa - quando
+                # a instrução se referia a algo dito antes ("essa informação", "isso que eu
+                # falei"), essa etapa não tinha como resolver a referência (ela nunca via o
+                # histórico) e ficava em loop pedindo o mesmo esclarecimento, mesmo depois de
+                # Torres repetir/colar a mensagem original de novo. Agora recebe o MESMO
+                # contexto_conversa (últimas mensagens + busca antiga) que o classificador
+                # principal já usa, pra poder resolver essas referências sozinha.
+                contexto_conversa_bloco_compor = (
+                    f"\n{contexto_conversa}" if contexto_conversa else ""
+                )
                 try:
                     resultado_compor = chamar_claude(
-                        SYSTEM_PROMPT_COMPOR_AVISO_CLIENTE.format(pessoa_nome=pessoa_nome_compor),
+                        SYSTEM_PROMPT_COMPOR_AVISO_CLIENTE.format(
+                            pessoa_nome=pessoa_nome_compor,
+                            contexto_conversa_bloco=contexto_conversa_bloco_compor,
+                        ),
                         instrucao_compor,
                     )
                 except Exception as e:
