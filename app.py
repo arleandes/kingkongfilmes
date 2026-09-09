@@ -254,6 +254,13 @@ def init_db():
                     criado_em TIMESTAMPTZ NOT NULL DEFAULT now()
                 )
             """)
+            # Round 27 parte 18: essa lista era injetada INTEIRA e pra sempre em toda mensagem
+            # do privado, sem data visível pro modelo e sem nenhum jeito de tirar um item depois
+            # de resolvido/superado - um pedido pontual de meses atrás ficava parecendo tão
+            # "atual" quanto algo dito agora há pouco (causa raiz real de um bug de referência
+            # confundida em produção). "resolvido" permite tirar um fato da lista ativa sem
+            # apagar o histórico (fica no banco, só para de ser injetado no prompt).
+            cur.execute("ALTER TABLE fatos_memoria ADD COLUMN IF NOT EXISTS resolvido BOOLEAN NOT NULL DEFAULT false")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS mensagens_grupo (
                     id SERIAL PRIMARY KEY,
@@ -393,20 +400,67 @@ def salvar_fato(autor, texto):
         except Exception as e:
             print(f"[salvar_fato] banco de dados falhou, usando fallback em memoria: {e}", flush=True)
     with _fatos_lock:
-        _fatos_memoria.append({"autor": autor, "texto": texto})
+        _fatos_memoria.append({
+            "autor": autor, "texto": texto, "criado_em": horario_bahia_agora(), "resolvido": False,
+        })
 
 
 def listar_fatos():
+    """Devolve só os fatos ATIVOS (não marcados como resolvidos), cada um como
+    {"texto": ..., "criado_em": ...} - quem monta o prompt (processar_dm) usa "criado_em" pra
+    mostrar a data de cada fato, essencial pro modelo diferenciar algo dito agora de algo dito
+    há meses (round 27 parte 18: sem isso, um pedido pontual antigo e já superado parecia tão
+    "atual" quanto a conversa de agora, e acabou sendo confundido com ela numa situação real)."""
     if DATABASE_URL:
         try:
             with db_cursor() as cur:
-                cur.execute("SELECT texto FROM fatos_memoria ORDER BY criado_em ASC")
-                return [r["texto"] for r in cur.fetchall()]
+                cur.execute(
+                    "SELECT texto, criado_em FROM fatos_memoria WHERE NOT resolvido ORDER BY criado_em ASC"
+                )
+                return [{"texto": r["texto"], "criado_em": r["criado_em"]} for r in cur.fetchall()]
         except Exception as e:
             print(f"[listar_fatos] erro: {e}", flush=True)
             return []
     with _fatos_lock:
-        return [r["texto"] for r in _fatos_memoria]
+        return [
+            {"texto": r["texto"], "criado_em": r.get("criado_em")}
+            for r in _fatos_memoria if not r.get("resolvido")
+        ]
+
+
+def marcar_fato_resolvido(termo_busca):
+    """Marca como resolvido o fato ATIVO mais recente cujo texto contém termo_busca (comparação
+    sem diferenciar maiúscula/minúscula) - usado quando Torres/Luan avisam que um fato antigo já
+    foi resolvido/não vale mais, pra ele parar de ser injetado (e de competir por atenção com o
+    que é realmente atual) em toda mensagem futura. Não apaga do banco, só some da lista ativa.
+    Devolve o texto do fato marcado, ou None se não achou nenhum fato ativo que bata."""
+    termo = (termo_busca or "").strip()
+    if not termo:
+        return None
+    if DATABASE_URL:
+        try:
+            with db_cursor(commit=True) as cur:
+                cur.execute(
+                    "SELECT id, texto FROM fatos_memoria WHERE NOT resolvido AND texto ILIKE %s "
+                    "ORDER BY criado_em DESC LIMIT 1",
+                    (f"%{termo}%",),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return None
+                cur.execute("UPDATE fatos_memoria SET resolvido = true WHERE id = %s", (row["id"],))
+            return row["texto"]
+        except Exception as e:
+            print(f"[marcar_fato_resolvido] erro: {e}", flush=True)
+            return None
+    with _fatos_lock:
+        termo_lower = termo.lower()
+        candidatos = [r for r in _fatos_memoria if not r.get("resolvido") and termo_lower in r["texto"].lower()]
+        if not candidatos:
+            return None
+        alvo = candidatos[-1]
+        alvo["resolvido"] = True
+        return alvo["texto"]
 
 
 # Fila do painel de pedidos de mudanca (round 26) - ver comentario junto de
@@ -1709,10 +1763,18 @@ DÚVIDA (qualquer caso, urgente ou não): se em algum momento você não tiver c
 responder (falta informação, é um caso muito específico, foge do que costuma ser pedido, ou é um
 pedido que a agência não tem certeza se atende), marque "duvida_geral" como true e preencha
 "opcoes_resposta" com 1-2 sugestões curtas de como responder, pra equipe escolher ou ajustar.
-Nesses casos, "resposta_cliente" deve ser só uma confirmação simples e genérica de que a mensagem
-foi recebida e a equipe já vai te dar um retorno - NUNCA arrisque enviar ao cliente uma resposta
-específica que você não tem certeza se está certa. Quando "duvida_geral" for false, inclua o campo
-mesmo assim com "opcoes_resposta" como lista vazia [].
+IMPORTANTE (bug real já reportado - NÃO REPITA: um cliente mandou só o link de um reel do
+Instagram sem nenhuma explicação, você não tinha ideia do que ele queria dizer com aquilo, e mesmo
+assim respondeu "recebi, vou verificar e já te retorno" - isso é falar sem saber o que está
+dizendo, o que nunca pode acontecer): quando "duvida_geral" for true e o cliente NÃO estiver
+chateado, "resposta_cliente" deve ficar como string vazia "" - você NÃO vai responder nada pro
+cliente agora, só vai avisar a equipe por dentro (via "opcoes_resposta"/"resumo_interno") e esperar
+alguém decidir o que responder. Nunca invente uma confirmação genérica só pra parecer que
+respondeu - se você não sabe o que dizer, a resposta certa é ficar em silêncio e deixar a equipe
+responder. A ÚNICA exceção é quando o cliente também estiver "chateado" (ver seção abaixo) - nesse
+caso específico, mesmo sem saber o detalhe, "resposta_cliente" deve trazer uma confirmação
+genérica com empatia (ficar muda pra um cliente já insatisfeito pioraria a situação). Quando
+"duvida_geral" for false, inclua o campo mesmo assim com "opcoes_resposta" como lista vazia [].
 
 DÚVIDA EM CASO URGENTE: além da checagem acima, se a mensagem também parecer urgente (ex: prazo
 pra hoje/já, evento acontecendo agora, algo com risco de dar errado), marque adicionalmente
@@ -1757,8 +1819,13 @@ irritação na resposta.
 EVITE RESPOSTAS ROBÓTICAS: nunca use frases genéricas e repetitivas como "Solicitação registrada.",
 "Informação recebida.", "Entendido.", "Comando recebido.", "Por favor, forneça mais informações."
 Prefira algo natural e variado, como faria uma pessoa de verdade da equipe (ex: "Perfeito, já vi por
-aqui! 🙌", "Pode deixar, vou conferir.", "Fechado!", "Vou olhar isso e te retorno."). Varie a forma
-de responder em vez de repetir sempre a mesma construção.
+aqui! 🙌", "Pode deixar, vou conferir.", "Anotado, já vou encaminhar!", "Vou olhar isso e te
+retorno."). Varie a forma de responder em vez de repetir sempre a mesma construção. Evite palavras
+que soem como o trabalho já ter sido ENTREGUE/CONCLUÍDO (ex: "Fechado!", "Pronto!", "Feito!") pra
+confirmar só o RECEBIMENTO de um pedido que ainda vai ser produzido - isso pode passar a falsa
+impressão de que a peça já está pronta quando na real só foi anotada/encaminhada agora (bug real já
+reportado: cliente recebeu "Fechado, Augusto!" só de confirmação de recebimento, e entendeu que a
+arte já tinha sido feita).
 
 PRAZO DE ENTREGA (pedidos de arte e gravação): o prazo padrão informado a todo cliente é de até
 48 horas - pode mencionar que às vezes a equipe entrega antes, mas o prazo garantido/oficial que
@@ -1895,6 +1962,168 @@ Responda SEMPRE E APENAS em JSON válido, neste formato exato, sem nenhum texto 
   "resumo_interno": "1-2 frases naturais e humanizadas contando pra equipe o que o cliente queria e o que foi respondido"
 }
 """
+
+
+# Round 27 parte 18, bug real reportado por Torres (prints do WhatsApp, grupo House and Co):
+# cliente Augusto pediu uma arte; Luan marcou a Cintia NO PRÓPRIO GRUPO DO CLIENTE pra anotar o
+# pedido e encaminhar pra Tripa - mas mensagem da equipe dentro de grupo de cliente sempre foi
+# 100% ignorada por design (só registrada no histórico, nunca processada - ver "if eh_equipe"
+# em processar_mensagem_grupo), pra ela nunca falar por cima de quem já está cuidando da
+# conversa. Isso fazia uma instrução de verdade, direcionada a ELA, ser completamente perdida -
+# "nada do que pedi foi feito", nas palavras dele - e a resposta "Fechado, Augusto!" que ele viu
+# saiu só do atendimento automático normal ao pedido do próprio Augusto, sem nenhuma noção de
+# que o Luan tinha acabado de dar uma instrução sobre aquilo.
+#
+# Decisão explícita do Torres (AskUserQuestion, round 27 parte 18): só tratar uma mensagem da
+# equipe dentro do grupo de cliente como instrução pra Cintia quando ela citar o nome dela
+# ("Cintia") OU tiver um comando claro sobre o pedido - gatilho conservador (função abaixo, por
+# código, mais barato que chamar o Claude em toda mensagem da equipe) que decide SE vale a pena
+# perguntar pro modelo; quem decide de verdade se é instrução real (vs. equipe só conversando
+# entre si, que deve continuar em silêncio) é o classificador abaixo, com raciocínio de verdade
+# (thinking_budget), igual a todo outro ponto de decisão importante desse sistema.
+_VERBOS_INSTRUCAO_EQUIPE_GRUPO_CLIENTE = (
+    "anota", "anote", "anotar", "manda", "mande", "mandar", "encaminha", "encaminhe",
+    "encaminhar", "passa", "passe", "passar", "repassa", "repasse", "repassar",
+)
+_ALVOS_INSTRUCAO_EQUIPE_GRUPO_CLIENTE = (
+    "tripa", "designer", "design", "criacao", "arte", "pedido",
+)
+
+
+def _mensagem_equipe_parece_instrucao_cintia(texto):
+    """Gatilho barato (sem chamar o Claude) pra decidir se uma mensagem da equipe dentro de um
+    grupo de cliente MERECE ser analisada com mais cuidado (ver comentário acima) - nunca decide
+    sozinho que é uma instrução de verdade, só que vale a pena perguntar."""
+    texto_norm = normalizar_texto(texto)
+    if "cintia" in texto_norm:
+        return True
+    tem_verbo = any(v in texto_norm for v in _VERBOS_INSTRUCAO_EQUIPE_GRUPO_CLIENTE)
+    tem_alvo = any(a in texto_norm for a in _ALVOS_INSTRUCAO_EQUIPE_GRUPO_CLIENTE)
+    return tem_verbo and tem_alvo
+
+
+SYSTEM_PROMPT_INSTRUCAO_EQUIPE_GRUPO_CLIENTE = """Você é a Cintia, assistente virtual da Correria, atendendo o grupo de WhatsApp do
+cliente {grupo_nome}. {pessoa_nome_equipe}, da própria equipe, acabou de falar DENTRO desse grupo (não em
+privado com você) - e essa mensagem parece conter uma instrução direcionada a VOCÊ mesma, não só a
+equipe conversando entre si (foi por isso que você está sendo chamada a decidir agora, em vez de
+ficar em silêncio como faz por padrão quando a equipe fala num grupo de cliente).
+
+MENSAGEM MAIS RECENTE DO CLIENTE NESSE GRUPO (o que a instrução da equipe provavelmente está se
+referindo, se for o caso):
+{bloco_pedido_cliente}
+HISTÓRICO RECENTE DO GRUPO:
+{bloco_historico}
+Mensagem de {pessoa_nome_equipe} agora: "{texto_instrucao}"
+
+DECIDA: essa mensagem é mesmo uma instrução real direcionada a você (cita seu nome "Cintia", OU dá
+um comando direto e específico sobre o que fazer com um pedido do cliente, tipo "anota isso e manda
+pra Tripa/designer/equipe de criação")? Ou é só a equipe comentando/decidindo algo entre eles mesmos
+(ex: Luan perguntando pro Torres o que ele acha), que não é direcionado a você e deve continuar em
+silêncio, como sempre? Na dúvida genuína, prefira "eh_instrucao_para_cintia": false - mais vale
+ficar em silêncio de novo (comportamento seguro e já conhecido) do que interromper uma conversa que
+não era com você.
+
+Se for uma instrução real: identifique a ação pedida. O caso mais comum é a equipe pedindo pra
+anotar/registrar e encaminhar um pedido de arte do cliente pra equipe de criação (Tripa) - nesse
+caso "acao" é "encaminhar_pedido_designer", preencha "pedido_organizado_designer" com o pedido do
+cliente reorganizado de forma clara pro designer (baseado na mensagem mais recente do cliente
+acima) e "tipo_peca_designer" com uma classificação curta (Card, Story, Carrossel, Banner, Flyer,
+Selo...). Preencha também "resposta_grupo" com uma mensagem curta e natural pro GRUPO (visível pro
+cliente e pra equipe) que: (1) confirma pra {pessoa_nome_equipe} que anotou/vai encaminhar - pode
+citar o nome dela(e); (2) avisa o cliente que a equipe de criação já foi acionada, SEM dizer que já
+está pronto/fechado e SEM prometer um prazo específico (ex: "Anota o pedido, Luan! Vou enviar agora
+mesmo pra equipe de criação. Assim que ficar pronto, te enviamos por aqui, Sr. Augusto."). NUNCA use
+palavras que soem como "já está pronto"/"fechado"/"concluído" - o trabalho ainda nem começou, só foi
+encaminhado agora.
+
+Se a ação pedida for outra coisa (não encaminhar arte) e você não tiver certeza de como executá-la
+sozinha, "acao" é "nenhuma", e "resposta_grupo" deve só confirmar que anotou o pedido de
+{pessoa_nome_equipe}, sem inventar uma ação que você não tem certeza de estar fazendo de verdade.
+
+Se NÃO for uma instrução pra você (equipe só conversando entre si), marque "eh_instrucao_para_cintia"
+como false e deixe os demais campos vazios/"nenhuma" - você vai continuar em silêncio, como sempre.
+
+Responda SEMPRE E APENAS em JSON válido, neste formato exato, sem nenhum texto fora do JSON e SEM usar bloco de código markdown (nada de ```):
+{
+  "eh_instrucao_para_cintia": true ou false,
+  "acao": "encaminhar_pedido_designer" | "nenhuma",
+  "pedido_organizado_designer": "pedido organizado pro designer, só quando acao for encaminhar_pedido_designer, senão string vazia",
+  "tipo_peca_designer": "classificação curta da peça, só quando acao for encaminhar_pedido_designer, senão string vazia",
+  "resposta_grupo": "mensagem curta pro grupo, ou string vazia se eh_instrucao_para_cintia for false"
+}
+"""
+
+
+def processar_instrucao_equipe_grupo_cliente(remote_jid, grupo, participant, sender_name, conteudo_texto):
+    """Round 27 parte 18: chamado quando uma mensagem da equipe (Torres/Luan) dentro de um grupo
+    de cliente passa pelo gatilho conservador acima. Processa na hora (sem debounce - instrução
+    da equipe normalmente vem numa mensagem só, diferente do cliente fatiando o pedido em várias).
+    Nunca deixa um erro técnico vazar pro grupo do cliente - mesma rede de segurança de
+    _finalizar_processamento_grupo."""
+    pessoa_nome_equipe = (
+        "Torres" if numero_bate(participant, TORRES_NUMBER)
+        else "Luan" if numero_bate(participant, LUAN_NUMBER)
+        else sender_name
+    )
+    historico_recente = buscar_mensagens_recentes_grupo(remote_jid, limite=30)
+    bloco_historico = (
+        "\n".join(f"- {m['autor']}: {m['conteudo']}" for m in historico_recente) + "\n\n"
+    ) if historico_recente else "(sem histórico registrado ainda)\n\n"
+    mensagens_cliente_recentes = [m for m in historico_recente if not m.get("eh_equipe")]
+    bloco_pedido_cliente = (
+        f"- {mensagens_cliente_recentes[-1]['autor']}: {mensagens_cliente_recentes[-1]['conteudo']}\n\n"
+        if mensagens_cliente_recentes
+        else "(não achei nenhuma mensagem recente do cliente nesse grupo)\n\n"
+    )
+    prompt_sistema = (
+        SYSTEM_PROMPT_INSTRUCAO_EQUIPE_GRUPO_CLIENTE
+        .replace("{grupo_nome}", grupo["nome"])
+        .replace("{pessoa_nome_equipe}", pessoa_nome_equipe)
+        .replace("{bloco_pedido_cliente}", bloco_pedido_cliente)
+        .replace("{bloco_historico}", bloco_historico)
+        .replace("{texto_instrucao}", conteudo_texto)
+    )
+    try:
+        resultado = chamar_claude(prompt_sistema, conteudo_texto, max_tokens=1500, thinking_budget=2000)
+    except Exception as e:
+        print(f"[processar_instrucao_equipe_grupo_cliente] erro claude: {e}", flush=True)
+        aviso_erro = (
+            f"🚨 Atenção (erro técnico ao processar uma instrução sua no grupo {grupo['nome']} - "
+            f"NADA foi feito/respondido)\n\"{conteudo_texto}\"\n\nPrecisa agir manualmente."
+        )
+        for numero in TEAM_NUMBERS:
+            enviar_texto(numero, aviso_erro)
+        return
+
+    if not resultado.get("eh_instrucao_para_cintia"):
+        print(f"[processar_instrucao_equipe_grupo_cliente] classificador decidiu que não era instrução pra Cintia, ficando em silêncio: {conteudo_texto!r}", flush=True)
+        return
+
+    resposta_grupo = (resultado.get("resposta_grupo") or "").strip()
+    acao = resultado.get("acao") or "nenhuma"
+    encaminhado = False
+    if acao == "encaminhar_pedido_designer" and resultado.get("pedido_organizado_designer"):
+        tipo_peca = resultado.get("tipo_peca_designer") or "Arte"
+        mensagem_tripa = (
+            f"*CLIENTE:* {grupo['nome']}\n"
+            f"*SOLICITAÇÃO:* {tipo_peca} (via instrução de {pessoa_nome_equipe} no grupo)\n"
+            f"*DESCRIÇÃO:* {resultado['pedido_organizado_designer']}"
+        )
+        enviar_texto(TRIPA_DESIGNER_JID, mensagem_tripa)
+        registrar_pedido_pendente(grupo["nome"], resultado["pedido_organizado_designer"], grupo_jid=remote_jid, tipo_peca=tipo_peca)
+        encaminhado = True
+
+    if resposta_grupo:
+        enviar_texto(remote_jid, resposta_grupo)
+        registrar_mensagem_grupo(remote_jid, grupo["nome"], "Cintia", resposta_grupo, True)
+
+    aviso_equipe = (
+        f"📐 Instrução de {pessoa_nome_equipe} no grupo *{grupo['nome']}*: \"{conteudo_texto}\"\n\n"
+        + ("Encaminhei o pedido pra Tripa." if encaminhado else "Anotei, mas não identifiquei uma ação clara pra executar sozinha.")
+    )
+    for numero in TEAM_NUMBERS:
+        enviar_texto(numero, aviso_equipe)
+    print(f"[processar_instrucao_equipe_grupo_cliente] concluido pra {remote_jid}: {resultado}", flush=True)
 
 
 _buffer_grupo = {}
@@ -2050,6 +2279,18 @@ def processar_mensagem_grupo(remote_jid, grupo, key, data):
                     buf_pendente["timer"].cancel()
         if chaves_do_grupo:
             print(f"[processar_mensagem_grupo] equipe respondeu no grupo {remote_jid}, cancelando {len(chaves_do_grupo)} resposta(s) pendente(s) do bot", flush=True)
+        # Round 27 parte 18, bug real reportado por Torres: antes disso, mensagem da equipe
+        # dentro do grupo de cliente era SEMPRE ignorada, mesmo quando era uma instrução de
+        # verdade direcionada a Cintia ("anota o pedido e manda pra Tripa") - nada acontecia.
+        # Só reage quando é de fato Torres ou Luan (nunca o outro agente de IA) E o texto passa
+        # pelo gatilho conservador (cita o nome dela OU comando claro) - ver comentário acima da
+        # função. Continua em silêncio em qualquer outro caso, exatamente como antes.
+        eh_torres_ou_luan = numero_bate(participant, TORRES_NUMBER) or numero_bate(participant, LUAN_NUMBER)
+        if eh_torres_ou_luan and conteudo_texto and _mensagem_equipe_parece_instrucao_cintia(conteudo_texto):
+            try:
+                processar_instrucao_equipe_grupo_cliente(remote_jid, grupo, participant, sender_name, conteudo_texto)
+            except Exception as e:
+                print(f"[processar_mensagem_grupo] erro ao processar possível instrução da equipe: {e}", flush=True)
         return {"skipped": "mensagem da equipe (Torres/Luan) ou de outro agente de IA do time, sem auto-resposta"}
 
     if not conteudo_texto:
@@ -2212,11 +2453,28 @@ def _finalizar_processamento_grupo(chave):
 
     # "Inteligência contextual nos grupos de clientes": nem toda mensagem exige resposta - um
     # agradecimento dirigido a Torres/Luan, uma conversa entre outras pessoas, ou algo que a
-    # equipe já resolveu não precisam de uma nova mensagem sua no grupo. Mas nunca fica em
-    # silêncio quando há sinal real de cliente insatisfeito ou dúvida (rede de segurança por
-    # código, nunca confia só na decisão do modelo nesses dois casos).
+    # equipe já resolveu não precisam de uma nova mensagem sua no grupo.
     duvida_geral = resultado.get("duvida_geral") or resultado.get("duvida_urgente")
-    precisa_responder = resultado.get("precisa_responder", True) or resultado.get("chateado") or duvida_geral
+    chateado = bool(resultado.get("chateado"))
+    # Round 27 parte 18 (continuação - bug real, print real): cliente mandou só o link de um reel
+    # do Instagram, sem explicação nenhuma - Cintia não tinha a menor ideia do que aquilo
+    # significava (elogio? pedido de arte parecida? outra coisa?), marcou "duvida_geral", mas
+    # mesmo assim respondeu no grupo "Recebi o link por aqui. Vou verificar direitinho e já te
+    # retorno." Torres foi taxativo (reforçando algo que já tinha dito antes, em várias rodadas):
+    # "Você não poderia falar nada se você não sabia a resposta, você tinha que perguntar" - "se
+    # tiver dúvida ela fica calada e pergunta". Antes disso, qualquer dúvida real sobre o
+    # CONTEÚDO (duvida_geral/duvida_urgente) forçava uma resposta genérica de "recebido" pro
+    # cliente por código, como rede de segurança - exatamente o comportamento que ele pediu pra
+    # nunca mais acontecer. Agora, dúvida real sobre o conteúdo vira SILÊNCIO pro cliente (nada é
+    # mandado - só aciona a equipe internamente, ver aviso_equipe/opcoes_resposta abaixo, com
+    # prioridade quando for urgente). CLIENTE CHATEADO continua sendo tratado diferente (ele já
+    # demonstrou insatisfação na própria mensagem - ficar muda pioraria a situação, mesmo que a
+    # resposta seja só uma confirmação genérica com empatia) - só esse caso continua sempre
+    # respondendo, dúvida sozinha (sem chateado) agora nunca fala nada pro cliente.
+    if duvida_geral and not chateado:
+        precisa_responder = False
+    else:
+        precisa_responder = resultado.get("precisa_responder", True) or chateado
     resposta_cliente = resultado.get("resposta_cliente", "")
     if precisa_responder and resposta_cliente:
         enviar_texto(remote_jid, resposta_cliente)
@@ -2331,7 +2589,11 @@ def _finalizar_processamento_grupo(chave):
         if resultado.get("chateado"):
             motivo.append("cliente possivelmente insatisfeito")
         if duvida_geral:
-            motivo.append("robô não teve certeza de como responder - só mandei uma confirmação genérica pro cliente")
+            motivo.append(
+                "robô não teve certeza de como responder - só mandei uma confirmação genérica pro cliente"
+                if chateado else
+                "robô não teve certeza de como responder - fiquei em SILÊNCIO pro cliente, preciso que alguém responda"
+            )
         prefixo = f"🚨 Atenção ({' + '.join(motivo)})"
     elif not precisa_responder:
         prefixo = "🤫 Fiquei em silêncio (não precisava de resposta)"
@@ -2423,6 +2685,17 @@ um pedido de lembrete não é um comando pro Tripa, um fato pra guardar não é 
    registrado). NUNCA prometa ou dê a entender que a mudança já está em vigor (nunca diga "vou
    fazer isso a partir de agora", "não vou mais comentar sozinha") - seja honesta que anotou o
    pedido, mas que só passa a valer de verdade depois de alguém implementar isso no código.
+
+   ATENÇÃO - NÃO CONFUNDA COM UMA SITUAÇÃO PONTUAL, DE AGORA (round 27 parte 18, bug real: isso
+   já foi confundido, virou "mudança de sistema" quando era só uma ação pontual, e por causa
+   disso NADA foi feito de verdade): se {pessoa_nome} está falando de UMA mensagem/situação
+   ESPECÍFICA que acabou de acontecer agora (ex: "tem uma msg do Augusto no grupo House e Co,
+   repassa pro Luan e pergunta o que ele quer fazer"), isso NÃO é pedido de mudança de sistema -
+   é o tipo 16 mais abaixo, uma ação de agora, só dessa vez. O sinal decisivo: "sempre que X
+   acontecer, faça Y" ou "não faça mais Z" = mudança de sistema (regra permanente, tipo 2); "isso
+   aqui agora, manda pro Fulano perguntar o que fazer" = tipo 16 (pontual, só dessa vez). Na
+   dúvida genuína entre os dois, pergunte em "resposta_conversa" se é pra virar regra permanente
+   ou só essa situação específica - nunca escolha sozinha quando não estiver claro.
 
 3) PERGUNTA SOBRE O QUE ACONTECEU EM ALGUM GRUPO ESPECÍFICO, DE CLIENTE OU INTERNO (ex: "o que
    rolou no grupo do Terapia hoje?", "tem pedido pendente lá na Chicafé?", "o cliente Zurca já
@@ -2627,13 +2900,41 @@ um pedido de lembrete não é um comando pro Tripa, um fato pra guardar não é 
    WhatsApp pessoal do Luan, não é pra um grupo); "tripa" se é pro grupo da Tripa; ou o nome do
    cliente/grupo, se for uma resposta em áudio pro grupo de um cliente específico.
 
+16) COMANDO PONTUAL PRA REPASSAR UMA SITUAÇÃO/MENSAGEM DE UM GRUPO DE CLIENTE PRO LUAN OU PRO
+   TORRES DECIDIREM, UMA ÚNICA VEZ (ex: "tem uma msg do Augusto no grupo House e Co, repassa pro
+   Luan e pergunta o que ele quer fazer", "manda pro Torres o que o cliente perguntou, ele que
+   decida", "avisa o Luan sobre isso aí") - {pessoa_nome} quer que você pegue a mensagem mais
+   recente de um grupo de CLIENTE nomeado e mande pro privado do Luan ou do Torres perguntando o
+   que fazer, SÓ DESSA VEZ (round 27 parte 18, bug real: isso já foi confundido com pedido de
+   mudança de sistema/regra permanente, tipo 2 acima, e por causa disso NADA foi feito de
+   verdade - a diferença é que aqui {pessoa_nome} está falando de UMA situação específica de
+   agora, não pedindo pra você passar a fazer isso sozinha toda vez que acontecer algo parecido;
+   se a mensagem disser algo tipo "sempre que X, faça Y" ou "não responda mais sozinha nesse
+   grupo", aí sim é tipo 2, não esse). Marque "eh_comando_repassar_para_pessoa" como true,
+   "pessoa_destino_repasse" com "luan" ou "torres", "grupo_cliente_repasse_nome" com o nome do
+   cliente/grupo mencionado (a mensagem de verdade mais recente desse grupo é buscada
+   automaticamente depois, você não precisa reescrevê-la nem inventar o conteúdo), e
+   "instrucao_repasse" com o que deve ser perguntado a quem for receber - se {pessoa_nome} não
+   disser explicitamente o que perguntar, use algo natural tipo "o que você acha que a gente
+   deveria fazer?".
+
+17) AVISO DE QUE UM FATO ANTIGO (dos que aparecem em "FATOS QUE VOCÊ JÁ SABE" no topo deste
+   prompt, se houver) JÁ FOI RESOLVIDO OU NÃO VALE MAIS (ex: "pode esquecer aquilo que eu te
+   falei sobre o feriado do Terapia, já resolvi isso", "aquele pedido antigo já era, esquece") -
+   isso é diferente de marcar um PEDIDO/TAREFA da Tripa como concluído (tipo 12, mecanismo
+   separado) e diferente de uma regra de atendimento de cliente. Marque
+   "eh_marcar_fato_resolvido" como true e "fato_resolvido_referencia" com um trecho que ajude a
+   identificar QUAL fato entre os listados (nome do cliente/assunto, palavras-chave do fato
+   original) - nunca invente ou reescreva o fato inteiro, só o suficiente pra encontrar o
+   registro certo.
+
 5) QUALQUER OUTRA COISA (comentário, resposta a um lembrete anterior, pedido/comando que não se
    encaixa nos tipos acima) - preencha "resposta_conversa" com uma resposta natural e útil, como
    uma colega de equipe responderia no privado. Se os FATOS QUE VOCÊ JÁ SABE (se houver, no topo
    deste prompt) tiverem a resposta pra uma pergunta, use-os pra responder direto. Se for um
    pedido/comando que você ainda não tem como executar automaticamente, confirme que entendeu e que
    vai anotar/repassar, sem inventar que já fez algo que não fez. Nunca deixe esse campo vazio
-   quando nenhum dos tipos 1/2/3/4/6/8/9/10/11/12/13/14/15 acima se aplicar - toda mensagem privada
+   quando nenhum dos tipos 1/2/3/4/6/8/9/10/11/12/13/14/15/16/17 acima se aplicar - toda mensagem privada
    precisa de resposta. IMPORTANTE: se {pessoa_nome} estiver claramente selecionando/pedindo de volta algo
    que VOCÊ (Cintia) apresentou nas ÚLTIMAS MENSAGENS acima (ex: "gostei da segunda", "manda só a
    número 2", "essa aí mesmo", "manda de novo"), REUTILIZE o conteúdo exato que você já mandou -
@@ -2677,7 +2978,7 @@ pergunta de ambiguidade anterior sua.
 Responda SEMPRE E APENAS em JSON válido, numa única linha por valor, neste formato exato,
 sem usar bloco de código markdown (nada de ```) e sem quebras de linha dentro dos valores. Inclua
 TODAS as chaves sempre, mesmo vazias/false quando não se aplicarem:
-{"eh_pedido_de_lembrete": true ou false, "destinatario_lembrete": "torres, luan ou tripa - quem deve receber o lembrete", "eh_recorrente": true ou false, "recorrencia_dia_mes": "dia do mes (1-31) se for recorrente mensal, ou string vazia", "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_pedido_mudanca_sistema": true ou false, "eh_pergunta_sobre_grupo": true ou false, "grupo_perguntado": "nome do grupo mencionado, ou string vazia", "eh_pergunta_atividade_geral": true ou false, "eh_pergunta_operacional_geral": true ou false, "eh_comando_para_tripa": true ou false, "mensagem_tripa": "texto pronto pra encaminhar pro grupo Tripa, ou string vazia", "tem_cobranca": true ou false, "horario_cobranca_iso": "horario ISO da cobranca, ou string vazia", "pergunta_cobranca": "pergunta curta pra mandar na cobranca, ou string vazia", "eh_comando_briefing_cliente": true ou false, "briefing_cliente_nome": "nome do cliente/grupo mencionado (ou inferido do contexto), ou string vazia", "briefing_assunto": "pista curta do assunto a analisar, ou string vazia", "eh_pergunta_metricool_metricas": true ou false, "metricool_metrica_cliente": "nome do cliente/marca, ou string vazia", "metricool_metrica_rede": "instagram ou facebook", "metricool_metrica_tipo": "seguidores, reels ou posts", "metricool_metrica_dias": 30, "eh_dica_resposta_cliente": true ou false, "dica_cliente_nome": "nome do cliente mencionado, ou string vazia", "dica_pergunta_cliente": "o que o cliente perguntou/falou, ou string vazia", "dica_resposta_sugerida": "o texto da resposta escrito pela pessoa, ou string vazia", "eh_marcar_pedido_concluido": true ou false, "eh_marcar_todos_pedidos_pendentes": true ou false, "pedido_cliente_referencia": "nome(s) do(s) cliente(s) do(s) pedido(s) a marcar como resolvido, resolvido pelo contexto quando vier como referência tipo esse/isso, varios nomes separados por \" e \" se mais de um for citado, ou string vazia se genuinamente ambíguo ou se eh_marcar_todos_pedidos_pendentes for true","eh_pedido_de_audio": true ou false, "destino_audio": "privado, tripa, ou nome do cliente/grupo mencionado, ou string vazia", "texto_audio": "texto exato que deve virar fala, ou string vazia", "eh_comando_para_grupo_cliente": true ou false, "grupo_cliente_comando_nome": "nome do cliente/grupo mencionado, ou string vazia se ainda nao foi dito", "texto_comando_grupo_cliente": "texto exato (pronto, ja finalizado) pra mandar pro grupo do cliente, reaproveitado de uma mensagem anterior se for o caso, ou string vazia", "eh_comando_para_compor_aviso_cliente": true ou false, "grupo_cliente_compor_nome": "nome do cliente/grupo mencionado, ou string vazia se ainda nao foi dito", "instrucao_aviso_cliente": "a descricao/instrucao completa do que precisa ser comunicado, preservando todos os detalhes dados, ou string vazia", "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/3/4/6/8/9/10/11/12/13/14/15 acima for verdadeiro"}
+{"eh_pedido_de_lembrete": true ou false, "destinatario_lembrete": "torres, luan ou tripa - quem deve receber o lembrete", "eh_recorrente": true ou false, "recorrencia_dia_mes": "dia do mes (1-31) se for recorrente mensal, ou string vazia", "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_pedido_mudanca_sistema": true ou false, "eh_pergunta_sobre_grupo": true ou false, "grupo_perguntado": "nome do grupo mencionado, ou string vazia", "eh_pergunta_atividade_geral": true ou false, "eh_pergunta_operacional_geral": true ou false, "eh_comando_para_tripa": true ou false, "mensagem_tripa": "texto pronto pra encaminhar pro grupo Tripa, ou string vazia", "tem_cobranca": true ou false, "horario_cobranca_iso": "horario ISO da cobranca, ou string vazia", "pergunta_cobranca": "pergunta curta pra mandar na cobranca, ou string vazia", "eh_comando_briefing_cliente": true ou false, "briefing_cliente_nome": "nome do cliente/grupo mencionado (ou inferido do contexto), ou string vazia", "briefing_assunto": "pista curta do assunto a analisar, ou string vazia", "eh_pergunta_metricool_metricas": true ou false, "metricool_metrica_cliente": "nome do cliente/marca, ou string vazia", "metricool_metrica_rede": "instagram ou facebook", "metricool_metrica_tipo": "seguidores, reels ou posts", "metricool_metrica_dias": 30, "eh_dica_resposta_cliente": true ou false, "dica_cliente_nome": "nome do cliente mencionado, ou string vazia", "dica_pergunta_cliente": "o que o cliente perguntou/falou, ou string vazia", "dica_resposta_sugerida": "o texto da resposta escrito pela pessoa, ou string vazia", "eh_marcar_pedido_concluido": true ou false, "eh_marcar_todos_pedidos_pendentes": true ou false, "pedido_cliente_referencia": "nome(s) do(s) cliente(s) do(s) pedido(s) a marcar como resolvido, resolvido pelo contexto quando vier como referência tipo esse/isso, varios nomes separados por \" e \" se mais de um for citado, ou string vazia se genuinamente ambíguo ou se eh_marcar_todos_pedidos_pendentes for true","eh_pedido_de_audio": true ou false, "destino_audio": "privado, tripa, ou nome do cliente/grupo mencionado, ou string vazia", "texto_audio": "texto exato que deve virar fala, ou string vazia", "eh_comando_para_grupo_cliente": true ou false, "grupo_cliente_comando_nome": "nome do cliente/grupo mencionado, ou string vazia se ainda nao foi dito", "texto_comando_grupo_cliente": "texto exato (pronto, ja finalizado) pra mandar pro grupo do cliente, reaproveitado de uma mensagem anterior se for o caso, ou string vazia", "eh_comando_para_compor_aviso_cliente": true ou false, "grupo_cliente_compor_nome": "nome do cliente/grupo mencionado, ou string vazia se ainda nao foi dito", "instrucao_aviso_cliente": "a descricao/instrucao completa do que precisa ser comunicado, preservando todos os detalhes dados, ou string vazia", "eh_comando_repassar_para_pessoa": true ou false, "pessoa_destino_repasse": "luan ou torres, ou string vazia", "grupo_cliente_repasse_nome": "nome do cliente/grupo mencionado, ou string vazia", "instrucao_repasse": "o que deve ser perguntado a quem vai receber, ou string vazia", "eh_marcar_fato_resolvido": true ou false, "fato_resolvido_referencia": "trecho que identifica qual fato antigo nao vale mais, ou string vazia", "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/3/4/6/8/9/10/11/12/13/14/15/16/17 acima for verdadeiro"}
 """
 
 
@@ -3681,6 +3982,15 @@ _STOPWORDS_BUSCA_HISTORICO = {
     # tirá-los da busca não perde capacidade de achar assunto antigo de verdade.
     "envia", "enviar", "enviei", "manda", "mandar", "mandei", "encaminha", "encaminhar",
     "encaminhei", "passa", "passar", "passei", "tripa", "tambem", "novamente", "denovo",
+    # Round 27 parte 18 (bug real reportado por Torres, mesma familia da parte 17): mensagem de
+    # CORRECAO/ESCLARECIMENTO ("nao, eu falei apenas dessa ultima mensagem") tambem gerava termo
+    # de busca generico demais - "falei" bate (via ILIKE) com QUALQUER mensagem antiga em que
+    # alguem tenha dito "eu falei" sobre QUALQUER assunto, "apenas"/"ultima" sao igualmente comuns
+    # e nao identificam conteudo nenhum. Isso inundava o contexto com um assunto antigo e
+    # completamente diferente (de outro cliente), e o classificador tratou aquele conteudo puxado
+    # por engano como se fosse "a ultima mensagem" de verdade sendo referenciada. Generico de
+    # REFERENCIA/CORRECAO, nao palavra-chave de conteudo - mesma logica da lista acima.
+    "falei", "falo", "falamos", "apenas", "ultima", "ultimo", "ultimas", "ultimos",
 }
 
 
@@ -5675,6 +5985,23 @@ def processar_dm(remote_jid, key, data):
             registrar_mensagem_grupo(jid_destino_audio, nome_destino_audio, "Cintia (equipe)", f"[áudio] {texto_audio_confirmado}", True)
             responder(f"Prontinho, mandei o áudio pro {nome_destino_audio}! 🎙️")
             return {"audio_confirmado": True, "destino": nome_destino_audio}
+        elif confirma is True and pendente.get("eh_repasse_pessoa"):
+            # Round 27 parte 18: ação PONTUAL de repassar uma situação de um grupo de cliente pro
+            # privado do Luan/Torres, perguntando o que fazer - bug real reportado por Torres:
+            # antes disso não existia NENHUM comando pra isso (só existia "regra:"/pedido de
+            # mudança de sistema, pra comportamento PERMANENTE), então um pedido pontual de
+            # verdade acabava sendo classificado como mudança de sistema e nunca era executado -
+            # "nada do que pedi foi feito", nas palavras dele.
+            pessoa_nome_solicitante_repasse = "Torres" if pessoa == "torres" else "Luan"
+            mensagem_final_repasse = (
+                f"{pessoa_nome_solicitante_repasse} pediu pra te passar isso do grupo "
+                f"{pendente['grupo_nome_repasse']}:\n\n\"{pendente['texto_mensagem_repasse']}\"\n\n"
+                f"{pendente['instrucao_repasse']}"
+            )
+            enviar_texto(pendente["numero_destino_repasse"], mensagem_final_repasse)
+            _comandos_pendentes.pop(pessoa, None)
+            responder(f"Show, repassei pro {pendente['nome_destino_repasse']}! ✅")
+            return {"repasse_pessoa_confirmado": True, "destino": pendente["nome_destino_repasse"]}
         elif confirma is True:
             enviar_texto(TRIPA_DESIGNER_JID, pendente["mensagem_tripa"])
             aviso_cobranca = ""
@@ -5738,9 +6065,17 @@ def processar_dm(remote_jid, key, data):
 
     agora = horario_bahia_agora()
     fatos = listar_fatos()
+    # Round 27 parte 18: cada fato agora mostra a DATA em que foi dito - antes disso a lista
+    # inteira (sem nenhuma marcação de tempo) era injetada pra sempre, e um pedido pontual de
+    # meses atrás parecia tão "atual" quanto a conversa de agora (causa raiz real de um bug de
+    # referência confundida em produção: "essa última mensagem" acabou sendo resolvida pra um
+    # fato antigo e já superado em vez da mensagem de verdade recém-trocada). A data por si só
+    # não resolve tudo (o modelo ainda precisa usar bom senso), mas dá o sinal que faltava.
     contexto_fatos = (
-        "FATOS QUE VOCÊ JÁ SABE (use quando fizer sentido pra responder):\n"
-        + "\n".join(f"- {f}" for f in fatos) + "\n\n"
+        "FATOS QUE VOCÊ JÁ SABE (cada um com a data em que foi dito - use pra diferenciar algo "
+        "atual de algo antigo e possivelmente já superado; use quando fizer sentido pra "
+        "responder):\n"
+        + "\n".join(f"- [{_formatar_timestamp_mensagem(f['criado_em'])}] {f['texto']}" for f in fatos) + "\n\n"
     ) if fatos else ""
     # Ultimas mensagens trocadas nesse DM (dos dois lados, ja que agora a Cintia
     # tambem registra o que ela mesma responde) - sem isso, cada mensagem era
@@ -6196,6 +6531,91 @@ def processar_dm(remote_jid, key, data):
                         f"Ficou assim pra mandar pro {grupo_nome_compor}:\n\n\"{texto_final_compor}\"\n\n"
                         "Confirma que posso mandar? (responde \"sim\" ou \"não\")"
                     )
+    elif resultado.get("eh_comando_repassar_para_pessoa") and resultado.get("pessoa_destino_repasse"):
+        # Round 27 parte 18, bug real reportado por Torres (prints do WhatsApp): ele pediu pra
+        # repassar pro Luan uma mensagem PONTUAL de um cliente (Augusto, grupo House e Co),
+        # perguntando o que fazer - o classificador tratou isso como pedido de MUDANCA DE
+        # SISTEMA (regra permanente) porque nao existia NENHUM comando pra "repasse pontual" -
+        # "nada do que pedi foi feito", nas palavras dele. Esse tipo (16) e exatamente essa
+        # acao: pegar a ultima mensagem relevante de um grupo de cliente e mandar pro
+        # Luan/Torres perguntando o que fazer, SEM virar regra nenhuma. Sempre passa por
+        # confirmacao antes de mandar pra pessoa (mesmo padrao de sempre) - ver o branch
+        # "eh_repasse_pessoa" no bloco de confirmacao (_comandos_pendentes) mais acima.
+        pessoa_destino_repasse = (resultado.get("pessoa_destino_repasse") or "").strip().lower()
+        numero_destino_repasse, nome_destino_repasse = {
+            "torres": (TORRES_NUMBER, "Torres"),
+            "luan": (LUAN_NUMBER, "Luan"),
+        }.get(pessoa_destino_repasse, (None, None))
+        nome_grupo_repasse_mencionado = (resultado.get("grupo_cliente_repasse_nome") or "").strip()
+        if not numero_destino_repasse:
+            responder(
+                "Entendi que é pra repassar isso pra alguém, mas não identifiquei se é pro "
+                "Torres ou pro Luan. Pode confirmar?"
+            )
+        elif numero_destino_repasse == numero:
+            # Pediu pra repassar pra si mesmo - nao faz sentido, evita mandar a mensagem de volta
+            # pra quem acabou de pedir.
+            responder("Você já está vendo essa mensagem aqui - quer que eu repasse pra outra pessoa?")
+        elif not nome_grupo_repasse_mencionado:
+            responder(
+                "Entendi que é pra repassar uma mensagem, mas não identifiquei de qual grupo/cliente. "
+                "Pode confirmar o nome?"
+            )
+        else:
+            candidatos_repasse = identificar_grupos_candidatos(nome_grupo_repasse_mencionado)
+            if not candidatos_repasse:
+                responder(
+                    f"Entendi que é pra repassar algo do grupo \"{nome_grupo_repasse_mencionado}\", mas não "
+                    "achei esse cliente cadastrado. Pode confirmar o nome certinho?"
+                )
+            elif len(candidatos_repasse) > 1:
+                nomes_candidatos_repasse = ", ".join(GRUPOS[jid]["nome"] for jid in candidatos_repasse)
+                responder(
+                    f"Encontrei mais de um cliente relacionado a \"{nome_grupo_repasse_mencionado}\": "
+                    f"{nomes_candidatos_repasse}. De qual deles é a mensagem?"
+                )
+            else:
+                grupo_jid_repasse = candidatos_repasse[0]
+                grupo_nome_repasse = GRUPOS[grupo_jid_repasse]["nome"]
+                mensagens_recentes_repasse = buscar_mensagens_recentes_grupo(grupo_jid_repasse, limite=15)
+                mensagens_cliente_repasse = [m for m in mensagens_recentes_repasse if not m.get("eh_equipe")]
+                if not mensagens_cliente_repasse:
+                    responder(
+                        f"Não achei nenhuma mensagem recente do cliente no {grupo_nome_repasse} pra repassar. "
+                        "Pode colar o texto exato que você quer que eu mande?"
+                    )
+                else:
+                    texto_mensagem_repasse = mensagens_cliente_repasse[-1]["conteudo"]
+                    instrucao_repasse = (resultado.get("instrucao_repasse") or "").strip() or "O que você acha, como seguimos?"
+                    _comandos_pendentes[pessoa] = {
+                        "mensagem_tripa": "", "tem_cobranca": False, "horario_cobranca": None, "pergunta_cobranca": "",
+                        "criado_em": time.time(),
+                        "eh_repasse_pessoa": True,
+                        "numero_destino_repasse": numero_destino_repasse,
+                        "nome_destino_repasse": nome_destino_repasse,
+                        "grupo_nome_repasse": grupo_nome_repasse,
+                        "texto_mensagem_repasse": texto_mensagem_repasse,
+                        "instrucao_repasse": instrucao_repasse,
+                    }
+                    responder(
+                        f"Vou mandar pro {nome_destino_repasse} isso do {grupo_nome_repasse}:\n\n"
+                        f"\"{texto_mensagem_repasse}\"\n\ncom a pergunta: \"{instrucao_repasse}\"\n\n"
+                        "Confirma? (responde \"sim\" ou \"não\")"
+                    )
+    elif resultado.get("eh_marcar_fato_resolvido") and resultado.get("fato_resolvido_referencia"):
+        # Round 27 parte 18: complementa o tipo "eh_fato_para_lembrar" - agora Torres/Luan
+        # tambem conseguem avisar que um fato antigo ja NAO vale mais (ex: uma decisao pontual
+        # que foi superada), pra ele parar de ser injetado como "FATOS QUE VOCE JA SABE" em toda
+        # mensagem futura e competir por atencao com o que e realmente atual. Sempre responde a
+        # verdade sobre o que foi encontrado (ou nao), nunca finge sucesso.
+        fato_marcado = marcar_fato_resolvido(resultado["fato_resolvido_referencia"])
+        if fato_marcado:
+            responder(f"Beleza, marquei esse fato como resolvido/superado: \"{fato_marcado}\" ✅")
+        else:
+            responder(
+                "Não achei nenhum fato ativo guardado que bata com isso pra marcar como "
+                "resolvido. Pode me lembrar melhor qual era o fato?"
+            )
     elif resultado.get("eh_marcar_pedido_concluido"):
         # Torres/Luan avisando que um pedido de arte pendente ja foi resolvido/feito - o caso
         # mais comum e uma referencia curta ("esse ja foi resolvido") logo depois da propria
