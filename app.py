@@ -3858,6 +3858,18 @@ que contradiz o pedido original organizado (ex: pedido dizia "R$ 37,90" mas depo
 mentalmente esse "briefing final" antes de comparar com a arte. Nunca use só a primeira mensagem
 nem ignore uma correção posterior.
 
+Você também pode receber um bloco "VALORES/REGRAS OFICIAIS PERMANENTES DESSE CLIENTE" - informação
+de referência de longo prazo (ex: tabela de valores de promoções, regras de funcionamento) guardada
+independente desse pedido específico, que pode ter sido confirmada há semanas ou meses. Trate isso
+como a base "oficial atual" pra qualquer assunto que o pedido/histórico dessa entrega específica NÃO
+mencionar diretamente - ou seja, ela também é uma fonte válida pra apontar ERRO CONFIRMADO (ex: a
+arte mostra um valor diferente do que está oficialmente registrado pra aquela promoção, mesmo que o
+pedido específico não tenha repetido esse valor). Mas se o PEDIDO ou o HISTÓRICO RECENTE dessa
+entrega mencionarem explicitamente uma condição diferente pra esse caso específico (uma exceção
+combinada só pra essa peça), o mais recente/específico vale sobre o valor oficial permanente - nunca
+o contrário. Na dúvida sobre qual das duas fontes vale pra um caso específico, trate como dúvida real
+(duvida_ambigua), nunca escolha sozinho.
+
 O QUE CONFERIR (compare a arte, item por item, com o briefing final reconstruído): nome do
 cliente/empresa/produto/pessoa, valores (preço original e promocional), datas, dias da semana,
 horários, condições, exceções/restrições (ex: "exceto tal item"), endereço, telefone, e qualquer
@@ -3963,11 +3975,20 @@ Responda SEMPRE E APENAS em JSON válido, sem bloco de código markdown (nada de
 """
 
 
-def comparar_arte_com_pedido(pedido_texto, imagem_base64, pdf_base64, historico_texto="", imagem_media_type="image/jpeg"):
+def comparar_arte_com_pedido(pedido_texto, imagem_base64, pdf_base64, historico_texto="", fatos_oficiais_texto="", imagem_media_type="image/jpeg"):
     bloco_historico = (
         f"\n\nHISTÓRICO RECENTE DO CLIENTE (mais antigo primeiro - pode conter correções enviadas "
         f"DEPOIS do pedido original acima; a informação mais recente e confirmada é que vale):\n{historico_texto}"
     ) if historico_texto else ""
+    # Round 27 parte 16: valores/regras OFICIAIS e PERMANENTES do cliente (ex: tabela de
+    # promoções cadastrada por Torres/Luan, ou extraída automaticamente de mensagens do
+    # próprio cliente - ver registrar_fato_cliente/listar_fatos_cliente) - diferente do
+    # historico_texto acima (que é só a janela recente da conversa), isso sobrevive
+    # indefinidamente e serve de base mesmo quando o pedido específico não repete o valor.
+    bloco_fatos_oficiais = (
+        f"\n\nVALORES/REGRAS OFICIAIS PERMANENTES DESSE CLIENTE (referência de longo prazo, "
+        f"guardada independente desse pedido específico):\n{fatos_oficiais_texto}"
+    ) if fatos_oficiais_texto else ""
     # Validacao de calendario calculada por CODIGO (nunca pelo modelo) pra qualquer data
     # mencionada no pedido/historico - evita o modelo "calcular de cabeca" o dia da semana e
     # assumir um ano por conta propria (causa real de um erro em producao).
@@ -3975,7 +3996,7 @@ def comparar_arte_com_pedido(pedido_texto, imagem_base64, pdf_base64, historico_
     bloco_calendario = f"\n\n{bloco_calendario}" if bloco_calendario else ""
     prompt_usuario = (
         f"Pedido original organizado (no momento em que foi encaminhado pro designer):\n{pedido_texto}"
-        f"{bloco_historico}{bloco_calendario}"
+        f"{bloco_historico}{bloco_fatos_oficiais}{bloco_calendario}"
         f"\n\nFaça a conferência de conteúdo dessa arte anexada contra o briefing final."
     )
     # Ano operacional atual calculado por CODIGO (nunca hardcoded) - reforca a regra fixa do
@@ -4051,10 +4072,17 @@ def _rodar_conferencia_de_conteudo(cliente_nome, imagem_base64, pdf_base64, log_
     if grupo_jid_cliente:
         historico_cliente = buscar_mensagens_recentes_grupo(grupo_jid_cliente, limite=20)
         historico_texto = "\n".join(f"- {m['autor']}: {m['conteudo']}" for m in historico_cliente)
+    # Round 27 parte 16: valores/regras OFICIAIS e PERMANENTES desse cliente (ex: tabela de
+    # promoções), guardados via registrar_fato_cliente - diferente do historico_texto acima
+    # (só a janela recente), isso sobrevive indefinidamente. Fecha a lacuna que Torres apontou:
+    # antes, um valor oficial guardado há semanas não entrava nessa comparação se já tivesse
+    # saído do histórico recente da conversa.
+    fatos_permanentes_cliente = listar_fatos_cliente(cliente_nome)
+    fatos_oficiais_texto = "\n".join(f"- {f['assunto']}: {f['valor_atual']}" for f in fatos_permanentes_cliente)
     try:
         bate, texto_comparacao, resultado_comparacao = comparar_arte_com_pedido(
             pedido["pedido_texto"], imagem_base64, pdf_base64, historico_texto=historico_texto,
-            imagem_media_type=imagem_media_type,
+            fatos_oficiais_texto=fatos_oficiais_texto, imagem_media_type=imagem_media_type,
         )
     except Exception as e:
         print(f"[{log_prefixo}] erro na comparacao com pedido: {e}", flush=True)
@@ -5233,6 +5261,88 @@ def metricool_responder_metricas(marca, rede, tipo, dias):
 
 _REGEX_REGRA_CLIENTE = re.compile(r"^\s*regra\s+(?:para|pro|pra)\s+(.+?)\s*:\s*(.+)$", re.IGNORECASE | re.DOTALL)
 
+# Round 27 parte 16: Torres pediu um jeito de mandar os VALORES OFICIAIS de um cliente (ex:
+# tabela de promoções) pra Cintia guardar de forma permanente e usar depois pra sinalizar
+# divergência quando a arte final for conferida - mesma convenção de "regra pro/pra <cliente>:",
+# mas pra informação de REFERÊNCIA (valores/condições), não pra uma instrução de atendimento.
+# Funciona tanto como legenda de um PDF/imagem anexado (a tabela em si) quanto como texto solto
+# digitado direto (a lista de valores por extenso).
+_REGEX_VALORES_CLIENTE = re.compile(r"^\s*valores?\s+(?:para|pro|pra|do|da|de)\s+(.+?)\s*:\s*(.*)$", re.IGNORECASE | re.DOTALL)
+
+SYSTEM_PROMPT_EXTRAIR_FATOS_CLIENTE = """Você é a Cintia, assistente da Correria. Torres ou Luan
+mandaram, no privado, uma informação OFICIAL e DURÁVEL sobre um cliente específico pra você guardar
+de referência (ex: uma tabela de valores de promoções, regras de funcionamento, condições/exceções)
+- isso NÃO é uma tarefa nem um pedido de revisão de arte, é conteúdo de REFERÊNCIA que precisa ficar
+guardado, organizado por assunto, pra você poder comparar contra peças finalizadas depois e responder
+perguntas no futuro.
+
+Extraia cada informação durável (valor/preço, promoção e suas condições/exceções, horário, endereço,
+regra de funcionamento, etc) como um ITEM SEPARADO - uma tabela com 5 promoções vira 5 itens, nunca
+um bloco de texto só. Pra cada item:
+- "assunto": um rótulo curto e estável (ex: "Promoção de quinta-feira", "Funcionamento aos domingos").
+- "valor": a informação completa e autocontida (ex: "Prato executivo, R$ 39,90, vale de segunda a
+  quinta, não vale pra salmão nem moqueca") - nunca guarde só o número solto, sem contexto.
+- "status": livre e curto (ex: "vigente", "atualizado"), ou string vazia se não fizer sentido.
+Nunca invente informação que não está claramente no conteúdo recebido. Se não conseguir identificar
+nenhuma informação durável de verdade, devolva a lista vazia.
+
+Responda SEMPRE E APENAS em JSON válido, sem bloco de código markdown (nada de ```):
+{"fatos": [{"assunto": "...", "valor": "...", "status": "..."}]}
+"""
+
+
+def _extrair_fatos_de_conteudo_dm(texto, imagem_base64=None, pdf_base64=None):
+    """Chama o Claude pra extrair fatos permanentes (assunto/valor/status) de um texto e/ou
+    arquivo (imagem/PDF) que Torres/Luan mandaram no privado como informação oficial de
+    referência de um cliente (ex: "valores pro Terapia: ..."). Devolve a lista de fatos
+    encontrados (pode ser vazia) - nunca lança exceção pra quem chama."""
+    prompt_usuario = f"Conteúdo recebido:\n{texto}" if texto else "Extraia os fatos do arquivo anexado."
+    try:
+        resultado = chamar_claude(
+            SYSTEM_PROMPT_EXTRAIR_FATOS_CLIENTE, prompt_usuario,
+            imagem_base64=imagem_base64, pdf_base64=pdf_base64, max_tokens=2000,
+        )
+    except Exception as e:
+        print(f"[_extrair_fatos_de_conteudo_dm] erro: {e}", flush=True)
+        return []
+    fatos_brutos = resultado.get("fatos") or []
+    return [
+        f for f in fatos_brutos
+        if isinstance(f, dict) and (f.get("assunto") or "").strip() and (f.get("valor") or "").strip()
+    ]
+
+
+def _processar_valores_oficiais_cliente_dm(nome_cliente_bruto, texto_extra, pessoa, grupo_jid_dm, grupo_nome_dm, responder, imagem_base64=None, pdf_base64=None, sufixo_arquivo=""):
+    """Processa um comando "valores pro/pra <cliente>: ..." recebido no privado de Torres/Luan
+    (round 27 parte 16) - identifica o cliente cadastrado, extrai cada informação durável do
+    texto e/ou arquivo anexado, e guarda cada uma via registrar_fato_cliente (mesmo sistema já
+    usado pelos fatos extraídos automaticamente no grupo de cliente, desde o round 21). Devolve
+    o dict de resultado (pra processar_dm devolver direto)."""
+    grupo_jid_valores = identificar_grupo_mencionado(nome_cliente_bruto)
+    grupo_valores = GRUPOS.get(grupo_jid_valores) if grupo_jid_valores else None
+    if not grupo_valores or grupo_valores.get("interno"):
+        responder(f'Entendi que são valores/informações oficiais, mas não achei o cliente "{nome_cliente_bruto}" cadastrado. Pode confirmar o nome certinho?')
+        return {"skipped": "cliente nao encontrado pra valores oficiais"}
+
+    nome_canonico_valores = grupo_valores["nome"]
+    fatos_extraidos = _extrair_fatos_de_conteudo_dm(texto_extra, imagem_base64=imagem_base64, pdf_base64=pdf_base64)
+    for fato in fatos_extraidos:
+        registrar_fato_cliente(
+            nome_canonico_valores, fato["assunto"], fato["valor"],
+            status=fato.get("status"), solicitado_por=pessoa,
+        )
+    registrar_mensagem_grupo(
+        grupo_jid_dm, grupo_nome_dm, pessoa,
+        f"[valores/informações oficiais do cliente {nome_canonico_valores} atualizados: {len(fatos_extraidos)} item(ns)]{sufixo_arquivo}",
+        True,
+    )
+    if fatos_extraidos:
+        resumo_fatos = "\n".join(f"- {f['assunto']}: {f['valor']}" for f in fatos_extraidos)
+        responder(f"Anotado! ✅ Guardei {len(fatos_extraidos)} informação(ões) oficial(is) do {nome_canonico_valores}, pra usar depois na conferência de peças:\n{resumo_fatos}")
+    else:
+        responder(f"Recebi, mas não consegui identificar nenhuma informação clara pra guardar do {nome_canonico_valores}. Pode confirmar o conteúdo ou reenviar de outro jeito?")
+    return {"fatos_cliente_registrados": len(fatos_extraidos), "cliente": nome_canonico_valores}
+
 
 def processar_dm(remote_jid, key, data):
     if numero_bate(remote_jid, TORRES_NUMBER):
@@ -5299,6 +5409,20 @@ def processar_dm(remote_jid, key, data):
             if "image" in tipo_lower
             else message.get("documentMessage", {}).get("caption", "")
         )
+
+        # Round 27 parte 16: legenda "valores pro/pra <cliente>: ..." no anexo (a tabela de
+        # valores em si costuma estar NO ARQUIVO, não na legenda) - trata como informação
+        # oficial de referência pra guardar, não como pedido de revisão de arte.
+        m_valores_anexo = _REGEX_VALORES_CLIENTE.match(caption_dm_recebida or "")
+        if m_valores_anexo:
+            return _processar_valores_oficiais_cliente_dm(
+                m_valores_anexo.group(1).strip(), m_valores_anexo.group(2).strip(),
+                pessoa, grupo_jid_dm, grupo_nome_dm, responder,
+                imagem_base64=midia_b64_dm if "image" in tipo_lower else None,
+                pdf_base64=midia_b64_dm if "document" in tipo_lower else None,
+                sufixo_arquivo=sufixo_dm,
+            )
+
         descricao_arquivo_dm = None
         if midia_b64_dm:
             if "image" in tipo_lower:
@@ -5355,6 +5479,27 @@ def processar_dm(remote_jid, key, data):
             # chegou, em vez de sumir completamente do historico.
             registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, pessoa, f"[mandou uma mensagem do tipo '{message_type}', não suportada ainda]", True)
             return {"skipped": "DM de tipo não tratado nesta versão, mas registrado no histórico"}
+
+        # Round 27 parte 16: "valores pro/pra <cliente>: <lista digitada ou link do Drive>" -
+        # checado ANTES do link do Drive genérico logo abaixo, senão um link colado junto com
+        # esse comando (ex: "valores pro Terapia: <link do PDF>") cairia no fluxo de revisão de
+        # arte em vez de virar informação de referência guardada.
+        m_valores_texto = _REGEX_VALORES_CLIENTE.match(texto)
+        if m_valores_texto:
+            nome_cliente_valores_texto = m_valores_texto.group(1).strip()
+            texto_extra_valores = m_valores_texto.group(2).strip()
+            imagem_valores_texto, pdf_valores_texto = None, None
+            arquivo_id_drive_valores = _extrair_arquivo_id_drive(texto_extra_valores)
+            if arquivo_id_drive_valores:
+                conteudo_b64_valores, mimetype_valores, _nome_valores = _baixar_arquivo_drive_por_id(arquivo_id_drive_valores)
+                if conteudo_b64_valores and mimetype_valores and mimetype_valores.startswith("image/"):
+                    imagem_valores_texto = conteudo_b64_valores
+                elif conteudo_b64_valores and mimetype_valores == "application/pdf":
+                    pdf_valores_texto = conteudo_b64_valores
+            return _processar_valores_oficiais_cliente_dm(
+                nome_cliente_valores_texto, texto_extra_valores, pessoa, grupo_jid_dm, grupo_nome_dm, responder,
+                imagem_base64=imagem_valores_texto, pdf_base64=pdf_valores_texto,
+            )
 
         # Round 27 parte 15: Torres/Luan às vezes colam um link de arquivo do Google Drive
         # no privado em vez de anexar a imagem/PDF direto (mesmo cenário do grupo Tripa,
