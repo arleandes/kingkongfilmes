@@ -325,7 +325,34 @@ def init_db():
                 )
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_pedidos_mudanca_status ON pedidos_mudanca (status, criado_em)")
-        print(f"[init_db] banco de dados pronto (schema '{DB_SCHEMA}', tabelas tarefas/tarefas_eventos/regras_atendimento/fatos_memoria/mensagens_grupo/fatos_cliente/fatos_cliente_historico/pedidos_mudanca)", flush=True)
+            # Round 27 parte 21, bug grave real reportado pelo Torres: os lembretes (pontuais e
+            # recorrentes) só existiam no scheduler em memória (APScheduler sem jobstore
+            # persistente) - TODO lembrete agendado e ainda não disparado desaparecia em
+            # silêncio a cada reinício/deploy do serviço, sem nenhum aviso pra ninguém. Torres
+            # já tinha pedido "todas as informações guardadas sempre, a qualquer custo" em
+            # rodadas anteriores, mas esse pedido nunca chegou a cobrir lembretes agendados -
+            # essa tabela guarda o suficiente pra recriar o agendamento (re-armar no scheduler)
+            # assim que o serviço sobe de novo, veja `_restaurar_lembretes_agendados`.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS lembretes_agendados (
+                    id SERIAL PRIMARY KEY,
+                    destinatario TEXT NOT NULL,
+                    numero_ou_jid TEXT NOT NULL,
+                    texto TEXT NOT NULL,
+                    eh_recorrente BOOLEAN NOT NULL DEFAULT false,
+                    data_hora_alvo TIMESTAMPTZ,
+                    dia_mes INTEGER,
+                    hora_utc INTEGER,
+                    minuto INTEGER,
+                    repetir_ate_confirmar BOOLEAN NOT NULL DEFAULT true,
+                    resolvido BOOLEAN NOT NULL DEFAULT false,
+                    criado_em TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_lembretes_agendados_pendentes ON lembretes_agendados (resolvido, criado_em)"
+            )
+        print(f"[init_db] banco de dados pronto (schema '{DB_SCHEMA}', tabelas tarefas/tarefas_eventos/regras_atendimento/fatos_memoria/mensagens_grupo/fatos_cliente/fatos_cliente_historico/pedidos_mudanca/lembretes_agendados)", flush=True)
     except Exception as e:
         print(f"[init_db] erro ao inicializar banco de dados: {e}", flush=True)
 
@@ -3073,8 +3100,42 @@ TODAS as chaves sempre, mesmo vazias/false quando não se aplicarem:
 
 # guarda no máximo 1 lembrete ativo por destinatario: {"torres": {...}, "luan": {...}, "tripa": {...}}
 # - destinatario e quem deve RECEBER o lembrete, que pode ser diferente de quem pediu (ex:
-# Torres pede pra lembrar o Luan de algo).
+# Torres pede pra lembrar o Luan de algo). Isso é só o estado do "nag" (cobrança repetida a
+# cada 30 min até confirmar) da rodada ATUAL - só vive em memória mesmo (ver comentário em
+# agendar_lembrete sobre o que de fato precisa sobreviver a um restart).
 lembretes_ativos = {}
+
+
+def _salvar_lembrete_agendado_db(destinatario, numero_ou_jid, texto, eh_recorrente, data_hora_alvo=None,
+                                  dia_mes=None, hora_utc=None, minuto=None, repetir_ate_confirmar=True):
+    """Guarda o suficiente pra recriar o agendamento (re-armar no scheduler) depois de um
+    restart/deploy - ver `_restaurar_lembretes_agendados`. Sem DATABASE_URL, devolve None (o
+    lembrete funciona normalmente na sessão atual, só não sobrevive a um reinício - mesma
+    limitação já documentada pra tarefas/fatos sem banco configurado)."""
+    if not DATABASE_URL or not psycopg2:
+        return None
+    try:
+        with db_cursor(commit=True) as cur:
+            cur.execute(
+                "INSERT INTO lembretes_agendados (destinatario, numero_ou_jid, texto, eh_recorrente, "
+                "data_hora_alvo, dia_mes, hora_utc, minuto, repetir_ate_confirmar) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                (destinatario, numero_ou_jid, texto, eh_recorrente, data_hora_alvo, dia_mes, hora_utc, minuto, repetir_ate_confirmar),
+            )
+            return cur.fetchone()["id"]
+    except Exception as e:
+        print(f"[_salvar_lembrete_agendado_db] erro: {e}", flush=True)
+        return None
+
+
+def _marcar_lembrete_agendado_resolvido_db(lembrete_id):
+    if not lembrete_id or not DATABASE_URL or not psycopg2:
+        return
+    try:
+        with db_cursor(commit=True) as cur:
+            cur.execute("UPDATE lembretes_agendados SET resolvido = true WHERE id = %s", (lembrete_id,))
+    except Exception as e:
+        print(f"[_marcar_lembrete_agendado_resolvido_db] erro: {e}", flush=True)
 
 
 def enviar_lembrete(destinatario, numero_ou_jid, texto_lembrete, primeira_vez):
@@ -3093,12 +3154,32 @@ def agendar_nag(destinatario, numero_ou_jid, texto_lembrete):
     return job
 
 
-def agendar_lembrete(destinatario, numero_ou_jid, data_hora_alvo: datetime, texto_lembrete: str, repetir_ate_confirmar=True):
+def agendar_lembrete(destinatario, numero_ou_jid, data_hora_alvo: datetime, texto_lembrete: str,
+                      repetir_ate_confirmar=True, _lembrete_id=None):
     """Agenda um lembrete pontual (uma unica data/hora). Pra Torres/Luan avisa 10 min antes e
     fica cobrando (nag a cada 30 min) ate a pessoa responder alguma coisa no privado. Pro
     grupo Tripa nao da pra saber quem "resolveu" a cobranca, entao manda so uma vez, na hora
-    certa, sem ficar repetindo (igual a cobranca de comando pro Tripa que ja existia)."""
+    certa, sem ficar repetindo (igual a cobranca de comando pro Tripa que ja existia).
+
+    Round 27 parte 21, bug grave real reportado pelo Torres: o scheduler (APScheduler) só
+    guarda os jobs agendados em memória, sem jobstore persistente nenhum - todo lembrete
+    (inclusive recorrente) desaparecia em silêncio a cada reinício/deploy do serviço, mesmo
+    Torres tendo pedido repetidamente, em praticamente toda rodada, que as informações fossem
+    guardadas "sempre, a qualquer custo". Agora, salva o suficiente no banco (tabela
+    lembretes_agendados) pra re-armar esse mesmo agendamento se o serviço reiniciar antes de
+    disparar - ver `_restaurar_lembretes_agendados`, chamada uma vez quando o serviço sobe.
+    `_lembrete_id`, quando informado, é usado só internamente por essa restauração (pra
+    re-agendar sem criar uma linha nova duplicada no banco). O "nag" (cobrança repetida após o
+    primeiro aviso) continua só em memória - perder ele no meio de um reinício é uma
+    degradação bem menor (só para de cobrar de novo) do que perder o lembrete inteiro (nunca
+    disparar nem uma vez), que era o bug real."""
     agora_utc = datetime.now(timezone.utc)
+    lembrete_id = _lembrete_id
+    if lembrete_id is None:
+        lembrete_id = _salvar_lembrete_agendado_db(
+            destinatario, numero_ou_jid, texto_lembrete, False,
+            data_hora_alvo=data_hora_alvo, repetir_ate_confirmar=repetir_ate_confirmar,
+        )
     if repetir_ate_confirmar:
         aviso_em = data_hora_alvo - timedelta(minutes=10)
         if aviso_em <= agora_utc:
@@ -3112,6 +3193,10 @@ def agendar_lembrete(destinatario, numero_ou_jid, data_hora_alvo: datetime, text
         aviso_em = data_hora_alvo if data_hora_alvo > agora_utc else agora_utc + timedelta(seconds=5)
 
     def disparar_primeiro_aviso():
+        # Marca resolvido no banco assim que o primeiro aviso dispara de verdade (a garantia
+        # central - "isso vai avisar pelo menos uma vez" - já foi cumprida aqui), pra um
+        # reinício logo depois não re-agendar/duplicar esse mesmo lembrete pontual de novo.
+        _marcar_lembrete_agendado_resolvido_db(lembrete_id)
         if repetir_ate_confirmar:
             info = lembretes_ativos.get(destinatario)
             if not info or info.get("resolvido"):
@@ -3124,10 +3209,19 @@ def agendar_lembrete(destinatario, numero_ou_jid, data_hora_alvo: datetime, text
     scheduler.add_job(disparar_primeiro_aviso, "date", run_date=aviso_em, id=f"lembrete-{destinatario}-{int(time.time())}")
 
 
-def agendar_lembrete_recorrente(destinatario, numero_ou_jid, dia_mes: int, hora: int, minuto: int, texto_lembrete: str, repetir_ate_confirmar=True):
+def agendar_lembrete_recorrente(destinatario, numero_ou_jid, dia_mes: int, hora: int, minuto: int, texto_lembrete: str,
+                                 repetir_ate_confirmar=True, _lembrete_id=None):
     """Agenda um lembrete que se repete todo mes, num dia fixo (ex: dia 20), no horario
-    informado (horario de Bahia - convertido pra UTC, que e o fuso do scheduler)."""
+    informado (horario de Bahia - convertido pra UTC, que e o fuso do scheduler). Persistido
+    no banco (mesmo motivo do `agendar_lembrete` - ver o comentário lá) - um recorrente NUNCA
+    é marcado como resolvido sozinho (ele deve continuar disparando todo mês indefinidamente),
+    só fica registrado uma vez pra sempre ser re-armado a cada restart."""
     hora_utc = (hora + 3) % 24  # Bahia = UTC-3 (sem horario de verao) -> UTC = Bahia + 3h
+    if _lembrete_id is None:
+        _salvar_lembrete_agendado_db(
+            destinatario, numero_ou_jid, texto_lembrete, True,
+            dia_mes=dia_mes, hora_utc=hora_utc, minuto=minuto, repetir_ate_confirmar=repetir_ate_confirmar,
+        )
 
     def disparar():
         if repetir_ate_confirmar:
@@ -3144,6 +3238,43 @@ def agendar_lembrete_recorrente(destinatario, numero_ou_jid, dia_mes: int, hora:
         id=f"lembrete-recorrente-{destinatario}-{dia_mes}-{hora_utc}{minuto}",
         replace_existing=True,
     )
+
+
+def _restaurar_lembretes_agendados():
+    """Chamada uma vez quando o serviço sobe (depois do scheduler e de todas as funções de
+    agendamento estarem definidas): lê do banco todo lembrete ainda não disparado
+    (resolvido=false) e re-arma no scheduler - sem isso, um reinício/deploy no meio do caminho
+    perdia o lembrete pra sempre, em silêncio (round 27 parte 21, bug real). Um lembrete
+    pontual cujo horário já passou enquanto o serviço estava fora do ar dispara quase
+    imediatamente (mesma regra de sempre em `agendar_lembrete` pra horário no passado) -
+    atrasado é sempre melhor que nunca disparar."""
+    if not DATABASE_URL or not psycopg2:
+        return
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                "SELECT id, destinatario, numero_ou_jid, texto, eh_recorrente, data_hora_alvo, "
+                "dia_mes, hora_utc, minuto, repetir_ate_confirmar FROM lembretes_agendados "
+                "WHERE resolvido = false ORDER BY criado_em"
+            )
+            linhas = cur.fetchall()
+        for linha in linhas:
+            if linha["eh_recorrente"]:
+                agendar_lembrete_recorrente(
+                    linha["destinatario"], linha["numero_ou_jid"], linha["dia_mes"],
+                    (linha["hora_utc"] - 3) % 24, linha["minuto"], linha["texto"],
+                    repetir_ate_confirmar=linha["repetir_ate_confirmar"], _lembrete_id=linha["id"],
+                )
+            else:
+                agendar_lembrete(
+                    linha["destinatario"], linha["numero_ou_jid"], linha["data_hora_alvo"],
+                    linha["texto"], repetir_ate_confirmar=linha["repetir_ate_confirmar"],
+                    _lembrete_id=linha["id"],
+                )
+        if linhas:
+            print(f"[_restaurar_lembretes_agendados] {len(linhas)} lembrete(s) re-agendado(s) apos reinicio", flush=True)
+    except Exception as e:
+        print(f"[_restaurar_lembretes_agendados] erro: {e}", flush=True)
 
 
 def resolver_destinatario_lembrete(destinatario_lembrete):
@@ -7506,6 +7637,8 @@ def status_memoria():
             total_tarefas = cur.fetchone()["total"]
             cur.execute("SELECT COUNT(*) AS total FROM regras_atendimento")
             total_regras = cur.fetchone()["total"]
+            cur.execute("SELECT COUNT(*) AS total FROM lembretes_agendados WHERE resolvido = false")
+            total_lembretes_pendentes = cur.fetchone()["total"]
         return jsonify({
             "banco_de_dados_configurado": True,
             "conexao": "ok - as tabelas existem e responderam normalmente",
@@ -7522,6 +7655,7 @@ def status_memoria():
             },
             "tarefas_de_designer_no_banco": total_tarefas,
             "regras_de_atendimento_salvas": total_regras,
+            "lembretes_agendados_ainda_pendentes": total_lembretes_pendentes,
         })
     except Exception as e:
         return jsonify({
@@ -7531,6 +7665,14 @@ def status_memoria():
             "aviso": "DATABASE_URL está configurada mas a consulta falhou - pode ser banco fora do ar, credencial errada, ou tabela ainda não criada (o init_db roda uma vez quando o serviço sobe).",
         }), 500
 
+
+# Round 27 parte 21: re-arma no scheduler todo lembrete que ainda não disparou, salvo antes de
+# um reinício/deploy anterior (ver `_restaurar_lembretes_agendados` e o comentário em
+# `init_db`, no bloco da tabela lembretes_agendados). Precisa ficar aqui, depois de
+# agendar_lembrete/agendar_lembrete_recorrente já estarem definidas (init_db roda muito antes,
+# lá em cima, antes dessas funções existirem) - e roda tanto sob "python app.py" quanto sob
+# gunicorn, já que esse trecho executa no import do módulo, não dentro do "if __main__".
+_restaurar_lembretes_agendados()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
