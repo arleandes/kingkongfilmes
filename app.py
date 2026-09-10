@@ -2742,6 +2742,23 @@ um pedido de lembrete não é um comando pro Tripa, um fato pra guardar não é 
    fica também disponível automaticamente nas respostas automáticas daquele grupo, e nunca vaza pra
    outro cliente.
 
+   ATENÇÃO - NUNCA MONTE UM FATO JUNTANDO A MENSAGEM ATUAL COM UM ASSUNTO ANTIGO SÓ POR
+   COINCIDÊNCIA DE PALAVRA (round 27 parte 20, bug real: {pessoa_nome} respondeu só "sim. Terça
+   feira as 17h e na quarta feira às 9h" - sem citar cliente nenhum - confirmando um compromisso
+   de OUTRO assunto que estava pendente (ver mensagem recente da própria Cintia perguntando sobre
+   isso, se houver uma); o bloco de "mensagens mais antigas" (achado por busca de palavra-chave)
+   trouxe uma mensagem antiga e sem relação nenhuma, sobre um cliente diferente, que também citava
+   horários parecidos - e a resposta foi erroneamente salva como fato desse cliente errado,
+   inventando um assunto ("fechamento de quarta-feira", "stories") que {pessoa_nome} nem mencionou
+   agora). Antes de preencher "fato_texto": se a mensagem atual não deixa claro sozinha a que
+   cliente/assunto ela se refere, primeiro veja se ela é resposta a uma pergunta que A PRÓPRIA
+   CINTIA acabou de fazer (nas mensagens RECENTES, não nas antigas) - se for, o assunto é esse,
+   nunca um outro achado só por palavra-chave batendo. Só recorra ao bloco de mensagens antigas
+   quando a mensagem atual citar o cliente/assunto de forma explícita (cita o nome do cliente, ou
+   repete claramente o mesmo tema). Se mesmo assim não estiver claro a qual assunto/cliente a
+   mensagem se refere, NUNCA invente a ligação - pergunte em "resposta_conversa" antes de salvar
+   qualquer fato.
+
    ATENÇÃO - PEDIDO DE MUDANÇA NO PRÓPRIO SISTEMA (não é um fato simples nem uma regra de
    atendimento de cliente): às vezes o que {pessoa_nome} está pedindo não é uma informação pra
    guardar, é uma mudança em COMO VOCÊ MESMA FUNCIONA/SE COMPORTA de forma automática - ex: "não
@@ -3178,6 +3195,20 @@ def notificar_promessa_detectada(texto_promessa):
     )
     for numero in TEAM_NUMBERS:
         enviar_texto(numero, aviso)
+    # Round 27 parte 20, bug real reportado pelo Torres: essa pergunta nunca era guardada no
+    # histórico do DM (só mandada por enviar_texto direto, sem passar pelo registrar_mensagem_
+    # grupo que o `responder()` normal sempre faz) - se a resposta de confirmação não fosse
+    # reconhecida na hora por `parece_confirmacao` (ver bug corrigido logo abaixo) e caísse no
+    # classificador geral, ele não tinha NENHUM jeito de saber que compromisso estava sendo
+    # perguntado, mesmo esse contexto existindo no código (_promessas_pendentes) - só via o
+    # texto da mensagem da pessoa, sem a pergunta da Cintia por trás. Registra pros dois (Torres
+    # e Luan podem ser quem responde) pra aparecer na janela recente de qualquer um dos dois.
+    for pessoa_registro in ("torres", "luan"):
+        registrar_mensagem_grupo(
+            f"dm_{pessoa_registro}",
+            "Privado - Torres" if pessoa_registro == "torres" else "Privado - Luan",
+            "Cintia", aviso, False,
+        )
 
 
 def parece_confirmacao(texto: str):
@@ -3193,6 +3224,32 @@ def parece_confirmacao(texto: str):
         return True
     if t in negativos:
         return False
+    # Round 27 parte 20, bug real reportado pelo Torres: ele respondeu "quero sim e me lembre"
+    # pra confirmar um compromisso pendente (gravação combinada com o Dr. Fellipe) - como a
+    # frase inteira não batia EXATAMENTE com nenhum item dos sets acima (só igualdade exata era
+    # aceita), a confirmação não foi reconhecida. O compromisso ficou preso na fila (nunca
+    # marcado como confirmado nem descartado) e a mensagem caiu inteira no classificador geral,
+    # que não tinha contexto nenhum sobre o que estava sendo confirmado - respondeu pedindo
+    # "que horário/data", e a resposta seguinte do Torres (só horários, sem nome de cliente)
+    # acabou sendo resolvida por busca de histórico contra um assunto antigo e completamente
+    # diferente (Olegario), salvando um fato errado. Agora, pra frases CURTAS (poucas palavras -
+    # textos mais longos têm mais chance de ser um pedido novo que só cita "sim" de passagem,
+    # não uma confirmação pura), também aceita quando uma palavra afirmativa/negativa aparece
+    # isolada no meio da frase - usando os MESMOS sets acima (só a parte de uma palavra só, pra
+    # não tentar casar as frases de múltiplas palavras como substring). Ambíguo (as duas
+    # aparecem, ou nenhuma) continua devolvendo None, mesmo critério de sempre.
+    # re.findall (nao so t.split()) pra pontuacao colada na palavra ("nao," "sim!") nao
+    # atrapalhar o casamento - mesma abordagem ja usada em _extrair_palavras_chave.
+    palavras = re.findall(r"[a-z0-9]+", t)
+    if 1 < len(palavras) <= 6:
+        palavras_unicas = {p for p in (afirmativos | negativos) if " " not in p}
+        achados = palavras_unicas & set(palavras)
+        achados_afirmativos = achados & afirmativos
+        achados_negativos = achados & negativos
+        if achados_afirmativos and not achados_negativos:
+            return True
+        if achados_negativos and not achados_afirmativos:
+            return False
     return None
 
 
