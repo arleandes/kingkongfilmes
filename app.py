@@ -951,14 +951,32 @@ def _zapi_headers() -> dict:
     return headers
 
 
-def enviar_texto(numero_ou_jid: str, texto: str):
+def enviar_texto(numero_ou_jid: str, texto: str) -> bool:
+    """Retorna True só quando a mensagem foi REALMENTE aceita/enviada, False em qualquer
+    outro caso (erro HTTP, exceção, ou resposta 200 sem confirmação de envio - ver comentário
+    em _enviar_texto_zapi). Quem chama e depois CONFIRMA envio pra uma pessoa (ex: "Show,
+    mandei pro Fulano!") precisa checar esse retorno antes de confirmar - ver bug real abaixo.
+
+    Round 27 parte 19, bug real reportado pelo Torres: ele mandou "sim" confirmando o envio de
+    um aviso pro grupo do Dr. Fellipe Barbosa (e, no dia anterior, pro grupo do Olegario), e a
+    Cintia respondeu confirmando "Show, mandei!" nos dois casos - mas a mensagem nunca chegou
+    nesses grupos. Causa raiz: `enviar_texto`/`_enviar_texto_zapi` nunca verificavam de verdade
+    se o envio deu certo - só checavam `status_code >= 400`, e a Z-API pode responder 200 OK
+    com um corpo de erro (ex: instância desconectada, número/grupo não encontrado) sem usar um
+    status HTTP de erro (mesmo padrão documentado no endpoint de status da instância: 200 +
+    {"connected": false, "error": "..."}). Como a função nunca retornava nada (sempre None) e
+    também nunca logava nada em caso de sucesso, o código que confirma o envio pro Torres
+    (_finalizar comando pendente) não tinha como saber se realmente funcionou - só sabia que a
+    função tinha sido CHAMADA, e confirmava sempre, incondicionalmente. Agora toda chamada loga
+    o resultado (sucesso com o messageId, ou falha com o motivo) e devolve um bool de verdade,
+    que os pontos de confirmação (ver "sim" + eh_resposta_cliente) passam a checar antes de
+    dizer que enviou."""
     if WHATSAPP_PROVIDER == "zapi":
-        _enviar_texto_zapi(numero_ou_jid, texto)
-    else:
-        _enviar_texto_evolution(numero_ou_jid, texto)
+        return _enviar_texto_zapi(numero_ou_jid, texto)
+    return _enviar_texto_evolution(numero_ou_jid, texto)
 
 
-def _enviar_texto_evolution(numero_ou_jid: str, texto: str):
+def _enviar_texto_evolution(numero_ou_jid: str, texto: str) -> bool:
     try:
         resp = requests.post(
             f"{EVOLUTION_BASE_URL}/message/sendText/{EVOLUTION_INSTANCE}",
@@ -968,11 +986,15 @@ def _enviar_texto_evolution(numero_ou_jid: str, texto: str):
         )
         if resp.status_code >= 400:
             print(f"[enviar_texto] ERRO {resp.status_code}: {resp.text[:500]}", flush=True)
+            return False
+        print(f"[enviar_texto] ok pra {numero_ou_jid}: {resp.text[:300]}", flush=True)
+        return True
     except Exception as e:
         print(f"[enviar_texto] falhou: {e}", flush=True)
+        return False
 
 
-def _enviar_texto_zapi(numero_ou_jid: str, texto: str):
+def _enviar_texto_zapi(numero_ou_jid: str, texto: str) -> bool:
     try:
         resp = requests.post(
             _zapi_url("send-text"),
@@ -981,21 +1003,38 @@ def _enviar_texto_zapi(numero_ou_jid: str, texto: str):
             timeout=20,
         )
         if resp.status_code >= 400:
-            print(f"[enviar_texto_zapi] ERRO {resp.status_code}: {resp.text[:500]}", flush=True)
+            print(f"[enviar_texto_zapi] ERRO {resp.status_code} pra {numero_ou_jid}: {resp.text[:500]}", flush=True)
+            return False
+        # Round 27 parte 19: a Z-API pode responder 200 OK mesmo sem enviar de verdade (ex:
+        # instância desconectada, "phone"/grupo inválido) - o corpo, nesses casos, vem sem os
+        # campos de confirmação normais (zaapId/messageId) e/ou com um campo "error". Sucesso de
+        # verdade sempre traz messageId/zaapId - nunca confiar só no status HTTP.
+        try:
+            corpo = resp.json()
+        except Exception:
+            corpo = {}
+        deu_certo = bool(corpo.get("messageId") or corpo.get("zaapId")) and not corpo.get("error")
+        if not deu_certo:
+            print(f"[enviar_texto_zapi] ERRO (200 mas sem confirmação de envio) pra {numero_ou_jid}: {resp.text[:500]}", flush=True)
+            return False
+        print(f"[enviar_texto_zapi] ok pra {numero_ou_jid}: messageId={corpo.get('messageId')}", flush=True)
+        return True
     except Exception as e:
-        print(f"[enviar_texto_zapi] falhou: {e}", flush=True)
+        print(f"[enviar_texto_zapi] falhou pra {numero_ou_jid}: {e}", flush=True)
+        return False
 
 
-def enviar_midia(numero_ou_jid: str, media_base64: str, mediatype: str, caption: str = "", nome_arquivo: str = "arquivo"):
+def enviar_midia(numero_ou_jid: str, media_base64: str, mediatype: str, caption: str = "", nome_arquivo: str = "arquivo") -> bool:
     """Encaminha uma imagem ou documento (base64) pra um numero/grupo.
-    mediatype: "image" ou "document"."""
+    mediatype: "image" ou "document". Retorna True só quando o envio foi realmente confirmado -
+    mesmo motivo/mesmo bug real do enviar_texto (ver comentário lá): checar só o status HTTP
+    nunca foi suficiente, a Z-API pode responder 200 OK sem ter enviado de verdade."""
     if WHATSAPP_PROVIDER == "zapi":
-        _enviar_midia_zapi(numero_ou_jid, media_base64, mediatype, caption=caption, nome_arquivo=nome_arquivo)
-    else:
-        _enviar_midia_evolution(numero_ou_jid, media_base64, mediatype, caption=caption, nome_arquivo=nome_arquivo)
+        return _enviar_midia_zapi(numero_ou_jid, media_base64, mediatype, caption=caption, nome_arquivo=nome_arquivo)
+    return _enviar_midia_evolution(numero_ou_jid, media_base64, mediatype, caption=caption, nome_arquivo=nome_arquivo)
 
 
-def _enviar_midia_evolution(numero_ou_jid: str, media_base64: str, mediatype: str, caption: str = "", nome_arquivo: str = "arquivo"):
+def _enviar_midia_evolution(numero_ou_jid: str, media_base64: str, mediatype: str, caption: str = "", nome_arquivo: str = "arquivo") -> bool:
     try:
         resp = requests.post(
             f"{EVOLUTION_BASE_URL}/message/sendMedia/{EVOLUTION_INSTANCE}",
@@ -1011,11 +1050,15 @@ def _enviar_midia_evolution(numero_ou_jid: str, media_base64: str, mediatype: st
         )
         if resp.status_code >= 400:
             print(f"[enviar_midia] ERRO {resp.status_code}: {resp.text[:500]}", flush=True)
+            return False
+        print(f"[enviar_midia] ok pra {numero_ou_jid}: {resp.text[:300]}", flush=True)
+        return True
     except Exception as e:
         print(f"[enviar_midia] falhou: {e}", flush=True)
+        return False
 
 
-def _enviar_midia_zapi(numero_ou_jid: str, media_base64: str, mediatype: str, caption: str = "", nome_arquivo: str = "arquivo"):
+def _enviar_midia_zapi(numero_ou_jid: str, media_base64: str, mediatype: str, caption: str = "", nome_arquivo: str = "arquivo") -> bool:
     phone = _jid_para_zapi_phone(numero_ou_jid)
     try:
         if mediatype == "image":
@@ -1032,9 +1075,21 @@ def _enviar_midia_zapi(numero_ou_jid: str, media_base64: str, mediatype: str, ca
             }
         resp = requests.post(_zapi_url(endpoint), headers=_zapi_headers(), json=body, timeout=40)
         if resp.status_code >= 400:
-            print(f"[enviar_midia_zapi] ERRO {resp.status_code}: {resp.text[:500]}", flush=True)
+            print(f"[enviar_midia_zapi] ERRO {resp.status_code} pra {numero_ou_jid}: {resp.text[:500]}", flush=True)
+            return False
+        try:
+            corpo = resp.json()
+        except Exception:
+            corpo = {}
+        deu_certo = bool(corpo.get("messageId") or corpo.get("zaapId")) and not corpo.get("error")
+        if not deu_certo:
+            print(f"[enviar_midia_zapi] ERRO (200 mas sem confirmação de envio) pra {numero_ou_jid}: {resp.text[:500]}", flush=True)
+            return False
+        print(f"[enviar_midia_zapi] ok pra {numero_ou_jid}: messageId={corpo.get('messageId')}", flush=True)
+        return True
     except Exception as e:
-        print(f"[enviar_midia_zapi] falhou: {e}", flush=True)
+        print(f"[enviar_midia_zapi] falhou pra {numero_ou_jid}: {e}", flush=True)
+        return False
 
 
 def gerar_audio_elevenlabs(texto):
@@ -5988,7 +6043,23 @@ def processar_dm(remote_jid, key, data):
             jid_destino_resposta = pendente["jid_destino"]
             texto_resposta_final = pendente["mensagem_tripa"]
             nome_cliente_resposta = pendente.get("cliente_nome_resposta", "cliente")
-            enviar_texto(jid_destino_resposta, texto_resposta_final)
+            _comandos_pendentes.pop(pessoa, None)
+            # Round 27 parte 19, bug real reportado pelo Torres (dois casos: grupo do Dr.
+            # Fellipe Barbosa e, no dia anterior, grupo do Olegario) - ele confirmou o envio,
+            # a Cintia respondeu "Show, mandei!", mas a mensagem nunca chegou no grupo do
+            # cliente. Causa raiz: essa confirmação era incondicional, nunca checava se
+            # `enviar_texto` de fato conseguiu enviar (ver comentário em enviar_texto/
+            # _enviar_texto_zapi - a Z-API pode responder 200 OK sem confirmar o envio de
+            # verdade, ex: instância desconectada ou grupo não encontrado). Agora só confirma
+            # like "mandei" quando o envio for realmente confirmado - senão avisa que NÃO
+            # conseguiu, sem inventar sucesso, mesmo padrão que o envio de áudio já seguia.
+            if not enviar_texto(jid_destino_resposta, texto_resposta_final):
+                responder(
+                    f"Não consegui confirmar o envio pro grupo do {nome_cliente_resposta} agora (o WhatsApp "
+                    "não confirmou o recebimento) - pode ser a instância desconectada ou algo com esse grupo. "
+                    "Não vou marcar como enviado - pode conferir e tentar de novo?"
+                )
+                return {"resposta_cliente_falhou_envio": True, "cliente": nome_cliente_resposta}
             # Guarda no historico do proprio grupo (fica pesquisavel depois, igual qualquer
             # mensagem da equipe) e como fato estruturado permanente daquele cliente (round 21) -
             # assim uma pergunta futura tipo "o Terapia ja perguntou sobre isso?" acha essa
@@ -5999,7 +6070,6 @@ def processar_dm(remote_jid, key, data):
                 nome_cliente_resposta, assunto_fato_resposta, texto_resposta_final,
                 grupo_jid=jid_destino_resposta, solicitado_por=pessoa,
             )
-            _comandos_pendentes.pop(pessoa, None)
             responder(f"Show, mandei pro {nome_cliente_resposta}! ✅ Já guardei esse atendimento pra lembrar depois.")
             return {"resposta_cliente_confirmada": True, "cliente": nome_cliente_resposta}
         elif confirma is True and pendente.get("eh_pedido_audio"):
