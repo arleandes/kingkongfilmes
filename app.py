@@ -376,7 +376,31 @@ def init_db():
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_tarefas_pessoais_status ON tarefas_pessoais (status, criado_em)"
             )
-        print(f"[init_db] banco de dados pronto (schema '{DB_SCHEMA}', tabelas tarefas/tarefas_eventos/regras_atendimento/fatos_memoria/mensagens_grupo/fatos_cliente/fatos_cliente_historico/pedidos_mudanca/lembretes_agendados/tarefas_pessoais)", flush=True)
+            # Pedido explicito do Torres (mesmo round): agenda de verdade, com compromissos
+            # DATADOS que ele consegue consultar por dia ou pelo mes ("me manda minha agenda do
+            # mes", "o que eu tenho domingo") - diferente do lembrete (so um aviso avulso, sem
+            # ficar guardado pra consulta) e da tarefa pessoal (sem data nenhuma). "tem_horario"
+            # existe porque nem todo compromisso tem hora marcada (ex: "dia 24 e 25 tenho
+            # trabalho com o Tony") - quando false, "data_hora" guarda so a data (meio-dia como
+            # placeholder tecnico), sem mostrar hora nenhuma pra pessoa depois. As duas colunas
+            # de aviso guardam se o aviso automatico (dia anterior 19h / no dia 7h, tambem pedido
+            # explicito do Torres) ja foi mandado, pra nunca reenviar de novo depois de um
+            # restart - ver `_restaurar_avisos_agenda`.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS compromissos_agenda (
+                    id SERIAL PRIMARY KEY,
+                    descricao TEXT NOT NULL,
+                    data_hora TIMESTAMPTZ NOT NULL,
+                    tem_horario BOOLEAN NOT NULL DEFAULT true,
+                    avisado_dia_anterior BOOLEAN NOT NULL DEFAULT false,
+                    avisado_no_dia BOOLEAN NOT NULL DEFAULT false,
+                    criado_em TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_compromissos_agenda_data ON compromissos_agenda (data_hora)"
+            )
+        print(f"[init_db] banco de dados pronto (schema '{DB_SCHEMA}', tabelas tarefas/tarefas_eventos/regras_atendimento/fatos_memoria/mensagens_grupo/fatos_cliente/fatos_cliente_historico/pedidos_mudanca/lembretes_agendados/tarefas_pessoais/compromissos_agenda)", flush=True)
     except Exception as e:
         print(f"[init_db] erro ao inicializar banco de dados: {e}", flush=True)
 
@@ -916,6 +940,186 @@ def marcar_tarefa_pessoal_concluida(termo_busca):
     except Exception as e:
         print(f"[marcar_tarefa_pessoal_concluida] erro: {e}", flush=True)
         return None
+
+
+# Nomes dos meses só pra EXIBIR na resposta da agenda (ex: "setembro de 2026") - não confundir
+# com `_MESES_PT` (dict nome->número, definido mais abaixo, usado pra INTERPRETAR datas escritas
+# por extenso em texto livre). Reaproveita `_DIAS_SEMANA_PT`/`_dia_semana_pt` (também definidos
+# mais abaixo) pro nome do dia da semana - resolução de nome global acontece só quando a função é
+# CHAMADA, não quando é definida, então a ordem no arquivo não importa aqui.
+_MESES_PT_NOMES = ["janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho", "agosto",
+                   "setembro", "outubro", "novembro", "dezembro"]
+
+
+def _marcar_aviso_agenda_dia_anterior_enviado_db(compromisso_id):
+    try:
+        with db_cursor(commit=True) as cur:
+            cur.execute("UPDATE compromissos_agenda SET avisado_dia_anterior = true WHERE id = %s", (compromisso_id,))
+    except Exception as e:
+        print(f"[_marcar_aviso_agenda_dia_anterior_enviado_db] erro: {e}", flush=True)
+
+
+def _marcar_aviso_agenda_no_dia_enviado_db(compromisso_id):
+    try:
+        with db_cursor(commit=True) as cur:
+            cur.execute("UPDATE compromissos_agenda SET avisado_no_dia = true WHERE id = %s", (compromisso_id,))
+    except Exception as e:
+        print(f"[_marcar_aviso_agenda_no_dia_enviado_db] erro: {e}", flush=True)
+
+
+def _enviar_aviso_agenda(compromisso_id, prefixo_texto, marcar_func):
+    """Busca o compromisso pelo id (pode ter sido chamado bem depois de agendado, inclusive
+    apos um restart) e manda o aviso pro Torres, marcando a flag correspondente pra nunca
+    reenviar de novo. Se o compromisso nao existir mais por algum motivo, so nao faz nada -
+    nunca manda aviso quebrado/vazio."""
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                "SELECT descricao, data_hora, tem_horario FROM compromissos_agenda WHERE id = %s",
+                (compromisso_id,),
+            )
+            linha = cur.fetchone()
+    except Exception as e:
+        print(f"[_enviar_aviso_agenda] erro ao buscar compromisso {compromisso_id}: {e}", flush=True)
+        return
+    if not linha:
+        return
+    hora_texto = f" às {linha['data_hora'].astimezone(BAHIA_TZ).strftime('%H:%M')}" if linha["tem_horario"] else ""
+    enviar_texto(TORRES_NUMBER, f"📅 {prefixo_texto}: {linha['descricao']}{hora_texto}")
+    marcar_func(compromisso_id)
+
+
+def _agendar_avisos_compromisso(compromisso_id, data_hora, ja_avisado_dia_anterior=False, ja_avisado_no_dia=False):
+    """Agenda os dois avisos automaticos de cada compromisso da agenda - pedido explicito do
+    Torres: as 19h do dia ANTERIOR ('amanhã você tem...') e as 7h da manhã do PRÓPRIO DIA
+    ('hoje você tem...'). Um compromisso que já passou não recebe nenhum aviso; um horário de
+    aviso que já passou mas o compromisso em si ainda está no futuro dispara em poucos
+    segundos (mesma lógica 'atrasado é sempre melhor que nunca' já usada pelos lembretes) -
+    cobre o caso de um restart/deploy acontecer bem no meio da janela do aviso. Cada aviso já
+    disparado fica marcado na própria linha do compromisso, pra `_restaurar_avisos_agenda`
+    nunca reenviar de novo depois de um restart."""
+    agora_utc = datetime.now(timezone.utc)
+    if data_hora <= agora_utc:
+        return  # compromisso já passou, não faz sentido avisar de nada
+
+    dia_compromisso_bahia = data_hora.astimezone(BAHIA_TZ).date()
+
+    if not ja_avisado_dia_anterior:
+        dia_antes = dia_compromisso_bahia - timedelta(days=1)
+        aviso_em = datetime(dia_antes.year, dia_antes.month, dia_antes.day, 19, 0, tzinfo=BAHIA_TZ)
+        if aviso_em <= agora_utc:
+            aviso_em = agora_utc + timedelta(seconds=5)
+        scheduler.add_job(
+            lambda: _enviar_aviso_agenda(compromisso_id, "Amanhã você tem", _marcar_aviso_agenda_dia_anterior_enviado_db),
+            "date", run_date=aviso_em, id=f"agenda-aviso-antes-{compromisso_id}", replace_existing=True,
+        )
+
+    if not ja_avisado_no_dia:
+        aviso_em = datetime(dia_compromisso_bahia.year, dia_compromisso_bahia.month, dia_compromisso_bahia.day, 7, 0, tzinfo=BAHIA_TZ)
+        if aviso_em <= agora_utc:
+            aviso_em = agora_utc + timedelta(seconds=5)
+        scheduler.add_job(
+            lambda: _enviar_aviso_agenda(compromisso_id, "Hoje você tem", _marcar_aviso_agenda_no_dia_enviado_db),
+            "date", run_date=aviso_em, id=f"agenda-aviso-dia-{compromisso_id}", replace_existing=True,
+        )
+
+
+def criar_compromisso_agenda(descricao, data_hora, tem_horario=True):
+    """Cria um compromisso novo na agenda e já agenda os dois avisos automáticos (dia
+    anterior às 19h, no próprio dia às 7h). Devolve o id criado, ou None se o banco não
+    estiver disponível ou der erro (mesmo fallback silencioso das outras tabelas - sem
+    DATABASE_URL a agenda simplesmente não persiste, mas não quebra o resto do sistema)."""
+    try:
+        with db_cursor(commit=True) as cur:
+            cur.execute(
+                "INSERT INTO compromissos_agenda (descricao, data_hora, tem_horario) VALUES (%s, %s, %s) RETURNING id",
+                (descricao, data_hora, tem_horario),
+            )
+            compromisso_id = cur.fetchone()["id"]
+    except Exception as e:
+        print(f"[criar_compromisso_agenda] erro: {e}", flush=True)
+        return None
+    _agendar_avisos_compromisso(compromisso_id, data_hora)
+    return compromisso_id
+
+
+def listar_compromissos_periodo(inicio, fim):
+    """Lista os compromissos da agenda com data_hora dentro de [inicio, fim), ordenados por
+    data/hora - usado tanto pra 'agenda de um dia' quanto 'agenda do mês' (quem calcula o
+    intervalo certo é sempre CÓDIGO, nunca o classificador - mesma regra já seguida por
+    qualquer validação de data/calendário nesse sistema)."""
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                "SELECT descricao, data_hora, tem_horario FROM compromissos_agenda "
+                "WHERE data_hora >= %s AND data_hora < %s ORDER BY data_hora ASC",
+                (inicio, fim),
+            )
+            return cur.fetchall()
+    except Exception as e:
+        print(f"[listar_compromissos_periodo] erro: {e}", flush=True)
+        return []
+
+
+def _calcular_periodo_agenda(escopo, data_referencia: datetime):
+    """Calcula [início, fim) em UTC a partir do escopo ('dia' ou 'mes') e de uma data de
+    referência dentro do período pedido - sempre por CÓDIGO. Devolve (inicio_utc, fim_utc,
+    rótulo) onde rótulo é um texto pronto tipo 'domingo, 14/09' ou 'setembro de 2026'."""
+    ref_bahia = data_referencia.astimezone(BAHIA_TZ)
+    if escopo == "mes":
+        inicio_bahia = datetime(ref_bahia.year, ref_bahia.month, 1, 0, 0, tzinfo=BAHIA_TZ)
+        if ref_bahia.month == 12:
+            fim_bahia = datetime(ref_bahia.year + 1, 1, 1, 0, 0, tzinfo=BAHIA_TZ)
+        else:
+            fim_bahia = datetime(ref_bahia.year, ref_bahia.month + 1, 1, 0, 0, tzinfo=BAHIA_TZ)
+        rotulo = f"{_MESES_PT_NOMES[ref_bahia.month - 1]} de {ref_bahia.year}"
+    else:
+        inicio_bahia = datetime(ref_bahia.year, ref_bahia.month, ref_bahia.day, 0, 0, tzinfo=BAHIA_TZ)
+        fim_bahia = inicio_bahia + timedelta(days=1)
+        rotulo = f"{_dia_semana_pt(inicio_bahia)}, {inicio_bahia.strftime('%d/%m')}"
+    return inicio_bahia.astimezone(timezone.utc), fim_bahia.astimezone(timezone.utc), rotulo
+
+
+def _formatar_lista_compromissos(compromissos, escopo):
+    """Monta o texto com os compromissos encontrados - com a data na frente de cada linha
+    quando o pedido foi pelo MÊS (lista mistura vários dias), ou só a hora quando foi um dia
+    só (já dá pra saber o dia pelo cabeçalho da resposta)."""
+    linhas = []
+    for c in compromissos:
+        c_bahia = c["data_hora"].astimezone(BAHIA_TZ)
+        hora_texto = f" às {c_bahia.strftime('%H:%M')}" if c["tem_horario"] else ""
+        if escopo == "mes":
+            linhas.append(f"- {c_bahia.strftime('%d/%m')}{hora_texto}: {c['descricao']}")
+        else:
+            linhas.append(f"-{hora_texto} {c['descricao']}" if hora_texto else f"- {c['descricao']}")
+    return "\n".join(linhas)
+
+
+def _restaurar_avisos_agenda():
+    """Chamada uma vez quando o serviço sobe (depois do scheduler e das funções de
+    agendamento acima já definidas): re-arma os avisos automáticos de todo compromisso da
+    agenda que ainda não passou e ainda não teve os dois avisos mandados - mesmo motivo e
+    mesmo padrão de `_restaurar_lembretes_agendados` (round 27 parte 21): sem isso, um
+    reinício/deploy no meio do caminho faria a agenda perder o aviso pra sempre, em silêncio."""
+    if not DATABASE_URL or not psycopg2:
+        return
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                "SELECT id, data_hora, avisado_dia_anterior, avisado_no_dia FROM compromissos_agenda "
+                "WHERE data_hora >= now() AND (avisado_dia_anterior = false OR avisado_no_dia = false)"
+            )
+            linhas = cur.fetchall()
+        for linha in linhas:
+            _agendar_avisos_compromisso(
+                linha["id"], linha["data_hora"],
+                ja_avisado_dia_anterior=linha["avisado_dia_anterior"],
+                ja_avisado_no_dia=linha["avisado_no_dia"],
+            )
+        if linhas:
+            print(f"[_restaurar_avisos_agenda] {len(linhas)} compromisso(s) com aviso re-agendado apos reinicio", flush=True)
+    except Exception as e:
+        print(f"[_restaurar_avisos_agenda] erro: {e}", flush=True)
 
 
 _STATUS_LEGIVEL = {
@@ -2902,8 +3106,9 @@ OUTRA COISA), que agora é o seu modo padrão de assistente livre, não um catch
 18) PEDIDO PRA ADICIONAR UMA TAREFA NA SUA LISTA PESSOAL (ex: "anota aí: renovar o CNH", "bota na
    minha lista comprar presente pro aniversário", "preciso resolver a questão do carro, anota como
    tarefa") - {pessoa_nome} quer guardar algo numa lista de tarefas/pendências pessoais, separada de
-   qualquer coisa do negócio, sem data/hora fixa (se tiver data/hora específica pra ser lembrado, é
-   tipo 1, lembrete, não tarefa). Marque "eh_pedido_tarefa_pessoal" como true e preencha
+   qualquer coisa do negócio, sem data/hora fixa (se tiver data/hora específica, veja antes se é
+   tipo 1 - lembrete de algo que ele precisa FAZER - ou tipo 21 - compromisso/evento com data,
+   descritos mais abaixo). Marque "eh_pedido_tarefa_pessoal" como true e preencha
    "tarefa_pessoal_texto" com a tarefa, resumida de forma clara e objetiva.
 
 19) PEDIDO PRA VER A LISTA DE TAREFAS PESSOAIS (ex: "quais são minhas tarefas pendentes?", "o que
@@ -2916,6 +3121,35 @@ OUTRA COISA), que agora é o seu modo padrão de assistente livre, não um catch
    trecho que ajude a identificar qual tarefa da lista (nunca invente, só o suficiente pra achar a
    tarefa certa) - se genuinamente não der pra saber qual é (mais de uma tarefa parecida, ou
    nenhuma pista), deixe vazio e pergunte em "resposta_conversa" qual delas é.
+
+21) PEDIDO PRA ANOTAR UM COMPROMISSO NA AGENDA (ex: "anota na minha agenda: domingo tenho um
+   trabalho com o Deivid às 10h", "dia 24 e 25 tenho trabalho com o Tony no Cimantec", "compromisso
+   terça às 14h com o cliente X"). DIFERENTE de LEMBRETE (tipo 1: um aviso avulso pra ele não
+   esquecer de FAZER algo, sem ficar guardado numa lista consultável) e de TAREFA (tipo 18: sem
+   data nenhuma) - agenda é pra COMPROMISSOS/EVENTOS com data marcada (algo que vai acontecer, um
+   encontro/trabalho/consulta com alguém ou em algum lugar) que {pessoa_nome} quer ter registrado
+   e poder consultar depois (ex: "o que eu tenho essa semana", "minha agenda do mês"). Se a
+   mensagem disser explicitamente "agenda"/"compromisso", ou descrever um evento/encontro datado
+   (não uma ação pessoal avulsa dele mesmo fazer), prefira este tipo; se disser "me lembra"/"lembra
+   de" sobre algo que ELE precisa fazer, é lembrete (tipo 1).
+   Marque "eh_pedido_agenda" como true e preencha "compromissos_agenda" como uma LISTA de objetos,
+   um pra CADA data mencionada (se a pessoa citar mais de uma data pro mesmo compromisso, ex: "dia
+   24 e 25", crie um item pra CADA data, repetindo a mesma descrição) - cada item no formato
+   {"descricao": "resumo curto do compromisso", "data_hora_iso": "data (e hora, se tiver
+   horário) em ISO 8601 com fuso -03:00", "tem_horario": true se um horário específico foi
+   mencionado, false se só a data (sem hora)}. Quando NÃO tiver horário, use meio-dia (12:00) só
+   como placeholder técnico em "data_hora_iso" - é o campo "tem_horario" que decide se algum
+   horário aparece pra pessoa depois, nunca o valor cru desse campo. Não precisa perguntar nem
+   avisar sobre os avisos automáticos - todo compromisso já gera sozinho um aviso às 19h do dia
+   anterior e outro às 7h da manhã do próprio dia, isso é automático.
+
+22) PEDIDO PRA VER A AGENDA (ex: "me manda minha agenda do mês", "o que eu tenho pra essa
+   semana", "o que eu tenho amanhã", "agenda de domingo", "o que tá marcado pro dia 20"). Marque
+   "eh_pedido_listar_agenda" como true, "agenda_escopo" como "dia" (um dia específico) ou "mes" (o
+   mês inteiro), e "agenda_data_referencia_iso" com QUALQUER data dentro do dia/mês perguntado (não
+   precisa ser o primeiro dia do mês nem calcular início/fim - isso é sempre feito por código) em
+   ISO 8601 com fuso -03:00. Ainda não existe um escopo de "semana" - se a pessoa pedir "essa
+   semana" ou não deixar claro um dia/mês específico, use "mes" com o mês atual como aproximação.
 
 13) PEDIDO PRA VOCÊ MANDAR UM ÁUDIO (nota de voz de verdade, com onda sonora, como se alguém
    tivesse gravado ali na hora) EM VEZ DE TEXTO (ex: "manda isso em áudio", "responde por voz", "me
@@ -2941,7 +3175,7 @@ OUTRA COISA), que agora é o seu modo padrão de assistente livre, não um catch
    resposta pra uma pergunta, use-os pra responder direto. Se for um pedido/comando que você ainda
    não tem como executar de verdade (uma ação fora do que os tipos acima cobrem), seja honesta
    sobre isso em vez de inventar que já fez. Nunca deixe esse campo vazio quando nenhum dos tipos
-   1/2/13/17/18/19/20 acima se aplicar - toda mensagem precisa de resposta. IMPORTANTE: se
+   1/2/13/17/18/19/20/21/22 acima se aplicar - toda mensagem precisa de resposta. IMPORTANTE: se
    {pessoa_nome} estiver claramente selecionando/pedindo de volta algo que VOCÊ (Cintia) apresentou
    nas ÚLTIMAS MENSAGENS acima (ex: "gostei da segunda", "manda só a número 2", "essa aí mesmo",
    "manda de novo"), REUTILIZE o conteúdo exato que você já mandou - não regenere nem invente uma
@@ -2968,7 +3202,7 @@ ambiguidade anterior sua.
 Responda SEMPRE E APENAS em JSON válido, numa única linha por valor, neste formato exato,
 sem usar bloco de código markdown (nada de ```) e sem quebras de linha dentro dos valores. Inclua
 TODAS as chaves sempre, mesmo vazias/false quando não se aplicarem:
-{"eh_pedido_de_lembrete": true ou false, "eh_recorrente": true ou false, "recorrencia_dia_mes": "dia do mes (1-31) se for recorrente mensal, ou string vazia", "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_pedido_mudanca_sistema": true ou false, "eh_pedido_tarefa_pessoal": true ou false, "tarefa_pessoal_texto": "a tarefa resumida de forma clara, ou string vazia", "eh_pedido_listar_tarefas_pessoais": true ou false, "eh_marcar_tarefa_pessoal_concluida": true ou false, "tarefa_pessoal_referencia": "trecho que identifica qual tarefa da lista, ou string vazia", "eh_pedido_de_audio": true ou false, "texto_audio": "texto exato que deve virar fala, ou string vazia", "eh_marcar_fato_resolvido": true ou false, "fato_resolvido_referencia": "trecho que identifica qual fato antigo nao vale mais, ou string vazia", "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/13/17/18/19/20 acima for verdadeiro"}
+{"eh_pedido_de_lembrete": true ou false, "eh_recorrente": true ou false, "recorrencia_dia_mes": "dia do mes (1-31) se for recorrente mensal, ou string vazia", "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_pedido_mudanca_sistema": true ou false, "eh_pedido_tarefa_pessoal": true ou false, "tarefa_pessoal_texto": "a tarefa resumida de forma clara, ou string vazia", "eh_pedido_listar_tarefas_pessoais": true ou false, "eh_marcar_tarefa_pessoal_concluida": true ou false, "tarefa_pessoal_referencia": "trecho que identifica qual tarefa da lista, ou string vazia", "eh_pedido_de_audio": true ou false, "texto_audio": "texto exato que deve virar fala, ou string vazia", "eh_marcar_fato_resolvido": true ou false, "fato_resolvido_referencia": "trecho que identifica qual fato antigo nao vale mais, ou string vazia", "eh_pedido_agenda": true ou false, "compromissos_agenda": [{"descricao": "resumo curto", "data_hora_iso": "2026-08-29T10:00:00-03:00", "tem_horario": true ou false}], "eh_pedido_listar_agenda": true ou false, "agenda_escopo": "dia ou mes", "agenda_data_referencia_iso": "2026-08-29T00:00:00-03:00 (qualquer data dentro do dia/mes perguntado)", "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/13/17/18/19/20/21/22 acima for verdadeiro"}
 """
 
 
@@ -6379,6 +6613,65 @@ def processar_dm(remote_jid, key, data):
                     "Não achei nenhuma tarefa pendente que bata com isso pra marcar como feita. "
                     "Pode me lembrar melhor qual era?"
                 )
+    elif resultado.get("eh_pedido_agenda") and resultado.get("compromissos_agenda"):
+        # Round 27 parte 22 (continuação): agenda de verdade, pedido explícito do Torres -
+        # aceita VÁRIOS compromissos numa mensagem só (ex: "dia 24 e 25 tenho trabalho com o
+        # Tony"), um item por data. Cada item vira uma linha na agenda, e cada um já agenda
+        # sozinho os dois avisos automáticos (dia anterior 19h, no dia 7h - ver
+        # `criar_compromisso_agenda`/`_agendar_avisos_compromisso`), sem precisar confirmar
+        # nada - baixo risco, é só uma anotação.
+        compromissos_criados = []
+        for item_agenda in resultado["compromissos_agenda"]:
+            descricao_compromisso = (item_agenda.get("descricao") or "").strip()
+            data_hora_str = (item_agenda.get("data_hora_iso") or "").strip()
+            if not descricao_compromisso or not data_hora_str:
+                continue
+            try:
+                data_hora_compromisso = datetime.fromisoformat(data_hora_str)
+            except Exception:
+                continue
+            tem_horario_compromisso = bool(item_agenda.get("tem_horario", True))
+            criar_compromisso_agenda(descricao_compromisso, data_hora_compromisso, tem_horario_compromisso)
+            compromissos_criados.append((descricao_compromisso, data_hora_compromisso, tem_horario_compromisso))
+        if not compromissos_criados:
+            responder(
+                "Não consegui identificar a data certinha do compromisso, pode me falar de novo "
+                "com o dia (e o horário, se tiver)?"
+            )
+        else:
+            linhas_confirmacao = []
+            algum_compromisso_futuro = False
+            agora_utc_agenda = datetime.now(timezone.utc)
+            for descricao_c, data_hora_c, tem_horario_c in compromissos_criados:
+                data_bahia_c = data_hora_c.astimezone(BAHIA_TZ)
+                hora_texto_c = f" às {data_bahia_c.strftime('%H:%M')}" if tem_horario_c else ""
+                linhas_confirmacao.append(f"- {data_bahia_c.strftime('%d/%m')}{hora_texto_c}: {descricao_c}")
+                if data_hora_c > agora_utc_agenda:
+                    algum_compromisso_futuro = True
+            plural_c = "s" if len(compromissos_criados) > 1 else ""
+            # Só promete o aviso automático quando pelo menos um compromisso está de fato no
+            # futuro - pra uma data já passada (ex: anotação retroativa) não fica dizendo que
+            # vai avisar de algo que não vai (nunca prometer o que não vai fazer de verdade).
+            aviso_extra = "\n\nVou te avisar um dia antes às 19h e no dia às 7h da manhã." if algum_compromisso_futuro else ""
+            responder(
+                f"Anotado na agenda! 📅 Compromisso{plural_c}:\n\n" + "\n".join(linhas_confirmacao) + aviso_extra
+            )
+    elif resultado.get("eh_pedido_listar_agenda"):
+        escopo_agenda = (resultado.get("agenda_escopo") or "dia").strip().lower()
+        if escopo_agenda not in ("dia", "mes"):
+            escopo_agenda = "dia"
+        data_ref_str = (resultado.get("agenda_data_referencia_iso") or "").strip()
+        try:
+            data_referencia_agenda = datetime.fromisoformat(data_ref_str) if data_ref_str else agora
+        except Exception:
+            data_referencia_agenda = agora
+        inicio_periodo, fim_periodo, rotulo_periodo = _calcular_periodo_agenda(escopo_agenda, data_referencia_agenda)
+        compromissos_periodo = listar_compromissos_periodo(inicio_periodo, fim_periodo)
+        if not compromissos_periodo:
+            responder(f"Sua agenda de {rotulo_periodo} está livre, nada anotado! 📅")
+        else:
+            texto_lista_agenda = _formatar_lista_compromissos(compromissos_periodo, escopo_agenda)
+            responder(f"📅 Sua agenda de {rotulo_periodo}:\n\n{texto_lista_agenda}")
     elif resultado.get("eh_marcar_fato_resolvido") and resultado.get("fato_resolvido_referencia"):
         # Round 27 parte 18: complementa o tipo "eh_fato_para_lembrar" - Torres tambem consegue
         # avisar que um fato antigo ja NAO vale mais (ex: uma decisao pontual que foi superada),
@@ -7014,6 +7307,12 @@ def status_memoria():
 # lá em cima, antes dessas funções existirem) - e roda tanto sob "python app.py" quanto sob
 # gunicorn, já que esse trecho executa no import do módulo, não dentro do "if __main__".
 _restaurar_lembretes_agendados()
+
+# Mesmo motivo/padrao do restauro de lembretes acima (round 27 parte 22, agenda nova): re-arma
+# os avisos automaticos (dia anterior 19h / no dia 7h) de todo compromisso que ainda nao passou
+# e ainda nao foi avisado - sem isso, um reinicio no meio da janela do aviso perderia ele pra
+# sempre em silencio, o mesmo bug real que ja tinha acontecido com lembrete (round 27 parte 21).
+_restaurar_avisos_agenda()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
