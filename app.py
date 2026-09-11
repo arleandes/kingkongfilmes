@@ -84,6 +84,14 @@ TORRES_NUMBER = os.environ.get("TORRES_NUMBER", "5571999394216")
 LUAN_NUMBER = os.environ.get("LUAN_NUMBER", "5571992200583")
 TEAM_NUMBERS = [TORRES_NUMBER, LUAN_NUMBER]
 
+# Pedido explícito do Torres (projeto novo): a Cintia deixa de ser assistente de
+# atendimento do negócio (clientes, Tripa, Gestão) e do Luan, e vira assistente PESSOAL
+# só dele - nunca mais responde em grupo nenhum, nunca mais manda mensagem pro Luan. O
+# gate de verdade fica em `_processar_evento_webhook` (ignora qualquer grupo e qualquer
+# DM que não seja do TORRES_NUMBER antes mesmo de chamar qualquer função de negócio) -
+# essa flag existe só como documentação/chave única caso precise reverter no futuro.
+MODO_ASSISTENTE_PESSOAL = True
+
 # Outro agente de IA (do próprio time) que também atende nos grupos de cliente -
 # quando ele falar num grupo, o robô nunca deve responder/entrar na conversa,
 # igual já acontece com mensagens do Torres e do Luan.
@@ -352,7 +360,23 @@ def init_db():
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_lembretes_agendados_pendentes ON lembretes_agendados (resolvido, criado_em)"
             )
-        print(f"[init_db] banco de dados pronto (schema '{DB_SCHEMA}', tabelas tarefas/tarefas_eventos/regras_atendimento/fatos_memoria/mensagens_grupo/fatos_cliente/fatos_cliente_historico/pedidos_mudanca/lembretes_agendados)", flush=True)
+            # Round 27 parte 22: lista de tarefas PESSOAIS do Torres (projeto novo - Cintia virou
+            # assistente pessoal, não mais do negócio) - separada de proposito da tabela `tarefas`
+            # (que era sobre pedidos de arte de cliente pro Tripa, conceito que não existe mais
+            # aqui). Sem cliente/grupo nenhum associado, só a descrição e o status.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS tarefas_pessoais (
+                    id SERIAL PRIMARY KEY,
+                    descricao TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'PENDENTE',
+                    criado_em TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    concluido_em TIMESTAMPTZ
+                )
+            """)
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tarefas_pessoais_status ON tarefas_pessoais (status, criado_em)"
+            )
+        print(f"[init_db] banco de dados pronto (schema '{DB_SCHEMA}', tabelas tarefas/tarefas_eventos/regras_atendimento/fatos_memoria/mensagens_grupo/fatos_cliente/fatos_cliente_historico/pedidos_mudanca/lembretes_agendados/tarefas_pessoais)", flush=True)
     except Exception as e:
         print(f"[init_db] erro ao inicializar banco de dados: {e}", flush=True)
 
@@ -835,6 +859,65 @@ def listar_tarefas_pendentes(cliente_nome=None):
         return []
 
 
+# Round 27 parte 22: lista de tarefas PESSOAIS do Torres (projeto novo - Cintia virou
+# assistente pessoal). Mesmo padrão de criar/listar/concluir da tabela `tarefas` acima, mas
+# de propósito numa tabela separada (`tarefas_pessoais`) - sem cliente/grupo, sem histórico de
+# eventos, só descrição e status, já que é uma lista pessoal simples, não um pipeline de
+# produção de arte com aprovação/correção.
+def criar_tarefa_pessoal(descricao):
+    """Cria uma tarefa pessoal nova no banco. Devolve o id criado, ou None se o banco não
+    estiver disponível ou der erro (nesse caso a tarefa simplesmente não fica guardada -
+    mesmo fallback silencioso já usado pelas outras tabelas quando DATABASE_URL não está
+    configurada)."""
+    try:
+        with db_cursor(commit=True) as cur:
+            cur.execute(
+                "INSERT INTO tarefas_pessoais (descricao) VALUES (%s) RETURNING id",
+                (descricao,),
+            )
+            return cur.fetchone()["id"]
+    except Exception as e:
+        print(f"[criar_tarefa_pessoal] erro: {e}", flush=True)
+        return None
+
+
+def listar_tarefas_pessoais_pendentes():
+    """Lista as tarefas pessoais ainda não concluídas, da mais antiga pra mais nova."""
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                "SELECT * FROM tarefas_pessoais WHERE status != 'CONCLUIDA' ORDER BY criado_em ASC"
+            )
+            return cur.fetchall()
+    except Exception as e:
+        print(f"[listar_tarefas_pessoais_pendentes] erro: {e}", flush=True)
+        return []
+
+
+def marcar_tarefa_pessoal_concluida(termo_busca):
+    """Marca como concluída a tarefa pessoal pendente mais recente cuja descrição bate
+    (ILIKE, case-insensitive) com termo_busca. Devolve a descrição da tarefa marcada, ou
+    None se não achou nenhuma pendente que bata - nunca inventa/escolhe uma tarefa ao acaso."""
+    try:
+        with db_cursor(commit=True) as cur:
+            cur.execute(
+                "SELECT id, descricao FROM tarefas_pessoais WHERE status != 'CONCLUIDA' "
+                "AND descricao ILIKE %s ORDER BY criado_em DESC LIMIT 1",
+                (f"%{termo_busca}%",),
+            )
+            linha = cur.fetchone()
+            if not linha:
+                return None
+            cur.execute(
+                "UPDATE tarefas_pessoais SET status = 'CONCLUIDA', concluido_em = now() WHERE id = %s",
+                (linha["id"],),
+            )
+            return linha["descricao"]
+    except Exception as e:
+        print(f"[marcar_tarefa_pessoal_concluida] erro: {e}", flush=True)
+        return None
+
+
 _STATUS_LEGIVEL = {
     STATUS_PENDENTE: "ainda não iniciado",
     STATUS_EM_EXECUCAO: "em execução",
@@ -877,15 +960,43 @@ def verificar_pendencias_fim_expediente():
     enviar_texto(LUAN_NUMBER, aviso_privado)
 
 
+def cobrar_tarefas_pessoais_pendentes():
+    """Roda uma vez por dia (18h horario de Bahia) e manda pro Torres a lista do que ainda
+    está pendente na lista de tarefas PESSOAIS dele - pedido explicito do projeto novo
+    (round 27 parte 22, virada pra assistente pessoal): cobrança automática de pendências,
+    reaproveitando o mesmo horário que já era usado pro resumo de fim de expediente do
+    negócio (agora desativado, ver MODO_ASSISTENTE_PESSOAL)."""
+    try:
+        pendentes_pessoais = listar_tarefas_pessoais_pendentes()
+    except Exception as e:
+        print(f"[cobrar_tarefas_pessoais_pendentes] erro ao buscar pendencias: {e}", flush=True)
+        return
+    if not pendentes_pessoais:
+        print("[cobrar_tarefas_pessoais_pendentes] nenhuma tarefa pendente, não precisa cobrar", flush=True)
+        return
+    linhas_cobranca = "\n".join(f"- {t['descricao']}" for t in pendentes_pessoais)
+    enviar_texto(TORRES_NUMBER, f"📋 Suas tarefas ainda pendentes:\n\n{linhas_cobranca}")
+
+
 init_db()  # roda uma vez quando o servico sobe (seja via gunicorn ou python app.py)
 
-# Cobranca automatica de pendencias no fim do expediente (dias uteis, 18h horario de
-# Bahia = 21h UTC, ja que o scheduler roda em UTC e a Bahia nao tem horario de verao).
-scheduler.add_job(
-    verificar_pendencias_fim_expediente,
-    "cron", day_of_week="mon-fri", hour=21, minute=0,
-    id="verificar_pendencias_fim_expediente", replace_existing=True,
-)
+if MODO_ASSISTENTE_PESSOAL:
+    # Round 27 parte 22: a cobranca de fim de expediente era sobre pedidos de CLIENTE (que
+    # não existem mais nesse modo) e mandava mensagem pro Tripa e pro Luan - substituída pela
+    # cobrança da lista de tarefas PESSOAIS do Torres, no mesmo horário (18h Bahia = 21h UTC).
+    scheduler.add_job(
+        cobrar_tarefas_pessoais_pendentes,
+        "cron", hour=21, minute=0,
+        id="cobrar_tarefas_pessoais_pendentes", replace_existing=True,
+    )
+else:
+    # Cobranca automatica de pendencias no fim do expediente (dias uteis, 18h horario de
+    # Bahia = 21h UTC, ja que o scheduler roda em UTC e a Bahia nao tem horario de verao).
+    scheduler.add_job(
+        verificar_pendencias_fim_expediente,
+        "cron", day_of_week="mon-fri", hour=21, minute=0,
+        id="verificar_pendencias_fim_expediente", replace_existing=True,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -2732,345 +2843,109 @@ def _finalizar_processamento_grupo(chave):
 # Parte 2: lembretes pessoais (Torres / Luan)
 # --------------------------------------------------------------------------
 
-SYSTEM_PROMPT_LEMBRETE = """Você é a Cintia, assistente virtual da Correria, falando em português num
-DM de WhatsApp com {pessoa_nome}, sócio/responsável da agência. A data/hora atual é: {agora_iso}
-(horário de Brasília, America/Bahia).
+SYSTEM_PROMPT_LEMBRETE = """Você é a Cintia, assistente PESSOAL de {pessoa_nome}, falando em português
+num DM de WhatsApp. A data/hora atual é: {agora_iso} (horário de Brasília, America/Bahia).
 
-{contexto_conversa}{contexto_fatos}Classifique a mensagem em UM dos tipos abaixo (o mais específico que se aplicar -
-um pedido de lembrete não é um comando pro Tripa, um fato pra guardar não é um lembrete, etc):
+Round 27 parte 22, mudança de projeto pedida explicitamente por {pessoa_nome}: você deixou de ser
+assistente de atendimento do negócio (clientes, grupo Tripa, grupo Gestão) e não fala mais com
+mais ninguém da equipe - só com {pessoa_nome}, aqui no privado dele. Ele foi claro: quer que você
+"tire todas as travas" das regras de atendimento a cliente/equipe que não fazem mais sentido - você
+não tem mais grupo de cliente, não tem mais Tripa, não tem mais ninguém além dele pra atender. Isso
+NÃO inclui os cuidados básicos de honestidade, que continuam valendo sempre: nunca inventar um
+fato/tarefa que não foi dito; sempre confirmar antes de qualquer ação importante (mandar áudio,
+apagar/concluir algo); nunca dizer que já fez algo que não fez.
 
-1) PEDIDO DE NOVO LEMBRETE (ex: "me lembra de ligar pro cliente X às 15h", "lembra eu de mandar o
-   orçamento amanhã de manhã", "lembra o Luan de mandar a nota fiscal do Novo Mix", "me lembra de
-   pagar as contas da contabilidade dia 20 de cada mês") - algo que alguém (o próprio
-   {pessoa_nome}, o outro sócio, ou a equipe do Tripa) precisa ser lembrado(a) de fazer.
-   Preencha "destinatario_lembrete" com quem deve RECEBER o lembrete: "torres", "luan" ou "tripa".
-   Se {pessoa_nome} disser "me lembra"/"eu preciso lembrar" (sobre si mesmo), o destinatário é o
-   próprio {pessoa_nome}. Se disser "lembra o Luan"/"lembra a Luan" (o outro sócio), destinatário é
-   "luan" (ou "torres" se for o Luan pedindo pra lembrar o Torres). Se for algo pro grupo de design,
-   destinatário é "tripa". Se o pedido for recorrente (ex: "todo dia 20", "toda segunda-feira",
+Você é uma assistente pessoal completa, no estilo "me ajuda com o que eu precisar" - responda
+dúvidas, ajude a pensar/organizar ideias, redija textos, dê sugestões, converse - exatamente como
+um assistente de IA de propósito geral faria, sem ficar restrita só aos comandos fixos abaixo.
+Esses comandos abaixo existem só pra ações específicas que precisam de tratamento especial
+(lembrete, fato permanente, tarefa pessoal, áudio) - qualquer outra coisa cai no tipo 5 (QUALQUER
+OUTRA COISA), que agora é o seu modo padrão de assistente livre, não um catch-all pobre.
+
+{contexto_conversa}{contexto_fatos}Classifique a mensagem em UM dos tipos abaixo (o mais específico que se aplicar):
+
+1) PEDIDO DE NOVO LEMBRETE (ex: "me lembra de ligar pro médico às 15h", "lembra eu de pagar o
+   boleto amanhã de manhã", "me lembra de pagar as contas dia 20 de cada mês") - algo que
+   {pessoa_nome} precisa ser lembrado de fazer. O lembrete é sempre pra ele mesmo (não existe mais
+   destinatário diferente). Se o pedido for recorrente (ex: "todo dia 20", "toda segunda-feira",
    "todo mês") em vez de uma data única, preencha "eh_recorrente" como true e "recorrencia_dia_mes"
    com o dia do mês (1-31) em que deve repetir todo mês; se for pontual (uma data específica),
    "eh_recorrente" é false e "recorrencia_dia_mes" fica vazio. Em "data_hora_alvo_iso" preencha
    sempre a próxima ocorrência (data e horário), mesmo quando for recorrente - o horário do dia é o
    que se repete todo mês nos recorrentes.
 
-2) FATO PRA GUARDAR NA MEMÓRIA (ex: "o Luan gosta da cor rosa", "o cliente Terapia prefere painel
-   roxo", "meu aniversário é dia X") - uma informação/preferência que não é uma tarefa nem um
+2) FATO PRA GUARDAR NA MEMÓRIA (ex: "minha esposa gosta da cor rosa", "meu aniversário é dia X",
+   "prefiro reunião de manhã") - uma informação/preferência pessoal que não é uma tarefa nem um
    pedido de ação, só algo que deve ficar guardado pra ser usado depois quando fizer sentido
-   (inclusive pra responder perguntas futuras tipo "do que o Luan gosta?"). IMPORTANTE ao escrever
-   "fato_texto": preserve o CONTEXTO completo do que foi ensinado, não só a frase isolada - se
-   {pessoa_nome} explicou uma orientação sobre como agir com um cliente específico (ex: "pra esse
-   cliente, antes de confirmar postagem, sempre precisa passar pela aprovação da gerente dele"),
-   escreva o fato incluindo pra qual cliente/situação aquilo vale, não resuma pra algo genérico tipo
-   "precisa de aprovação" que perderia a informação de quando essa regra se aplica. Se o que foi
-   ensinado for claramente uma orientação de atendimento específica de UM cliente (não um fato solto
-   de preferência pessoal), pode sugerir em "resposta_conversa" que {pessoa_nome} confirme se quer
-   salvar isso como regra permanente daquele cliente (formato "regra pro <cliente>: ...") - assim
-   fica também disponível automaticamente nas respostas automáticas daquele grupo, e nunca vaza pra
-   outro cliente.
+   (inclusive pra responder perguntas futuras). IMPORTANTE ao escrever "fato_texto": preserve o
+   CONTEXTO completo do que foi ensinado, não só a frase isolada.
 
    ATENÇÃO - NUNCA MONTE UM FATO JUNTANDO A MENSAGEM ATUAL COM UM ASSUNTO ANTIGO SÓ POR
-   COINCIDÊNCIA DE PALAVRA (round 27 parte 20, bug real: {pessoa_nome} respondeu só "sim. Terça
-   feira as 17h e na quarta feira às 9h" - sem citar cliente nenhum - confirmando um compromisso
-   de OUTRO assunto que estava pendente (ver mensagem recente da própria Cintia perguntando sobre
-   isso, se houver uma); o bloco de "mensagens mais antigas" (achado por busca de palavra-chave)
-   trouxe uma mensagem antiga e sem relação nenhuma, sobre um cliente diferente, que também citava
-   horários parecidos - e a resposta foi erroneamente salva como fato desse cliente errado,
-   inventando um assunto ("fechamento de quarta-feira", "stories") que {pessoa_nome} nem mencionou
-   agora). Antes de preencher "fato_texto": se a mensagem atual não deixa claro sozinha a que
-   cliente/assunto ela se refere, primeiro veja se ela é resposta a uma pergunta que A PRÓPRIA
-   CINTIA acabou de fazer (nas mensagens RECENTES, não nas antigas) - se for, o assunto é esse,
-   nunca um outro achado só por palavra-chave batendo. Só recorra ao bloco de mensagens antigas
-   quando a mensagem atual citar o cliente/assunto de forma explícita (cita o nome do cliente, ou
-   repete claramente o mesmo tema). Se mesmo assim não estiver claro a qual assunto/cliente a
-   mensagem se refere, NUNCA invente a ligação - pergunte em "resposta_conversa" antes de salvar
-   qualquer fato.
+   COINCIDÊNCIA DE PALAVRA (bug real de round anterior, não repita): antes de preencher
+   "fato_texto", se a mensagem atual não deixa claro sozinha a que assunto ela se refere, primeiro
+   veja se ela é resposta a uma pergunta que A PRÓPRIA CINTIA acabou de fazer (nas mensagens
+   RECENTES, não nas antigas) - se for, o assunto é esse, nunca um outro achado só por
+   palavra-chave batendo no histórico antigo. Se não estiver claro a qual assunto a mensagem se
+   refere, NUNCA invente a ligação - pergunte em "resposta_conversa" antes de salvar qualquer fato.
 
-   ATENÇÃO - PEDIDO DE MUDANÇA NO PRÓPRIO SISTEMA (não é um fato simples nem uma regra de
-   atendimento de cliente): às vezes o que {pessoa_nome} está pedindo não é uma informação pra
-   guardar, é uma mudança em COMO VOCÊ MESMA FUNCIONA/SE COMPORTA de forma automática - ex: "não
-   comente mais sozinha no grupo Tripa", "passa a monitorar esse grupo novo", "pare de mandar
-   cobrança de horário", "sempre que acontecer X, faz Y sozinha". Isso é DIFERENTE de "regra:"/
-   "regra pro <cliente>:" (que já é um mecanismo real e funciona de verdade, mudando como você
-   responde automaticamente nos grupos de CLIENTE) e diferente de um fato solto de preferência.
-   Pedidos desse tipo tratam de configuração/comportamento interno do sistema (quais grupos são
-   monitorados, quando você fala sozinha em qual grupo, etc.) que você NÃO tem como simplesmente
-   "aprender" e passar a fazer sozinha - isso só funciona de verdade depois de uma alteração real
-   no código do sistema, feita por quem cuida da parte técnica. Marque "eh_pedido_mudanca_sistema"
-   como true nesses casos (além de "eh_fato_para_lembrar" e "fato_texto" normalmente, pra ficar
-   registrado). NUNCA prometa ou dê a entender que a mudança já está em vigor (nunca diga "vou
-   fazer isso a partir de agora", "não vou mais comentar sozinha") - seja honesta que anotou o
-   pedido, mas que só passa a valer de verdade depois de alguém implementar isso no código.
+   ATENÇÃO - PEDIDO DE MUDANÇA NO PRÓPRIO SISTEMA (não é um fato simples): às vezes o que
+   {pessoa_nome} está pedindo não é uma informação pra guardar, é uma mudança em COMO VOCÊ MESMA
+   FUNCIONA/SE COMPORTA de forma automática - ex: "pare de me cobrar sobre isso", "sempre que
+   acontecer X, faz Y sozinha". Isso é diferente de um fato solto de preferência - você NÃO tem
+   como simplesmente "aprender" e passar a fazer sozinha; isso só funciona de verdade depois de uma
+   alteração real no código, feita por quem cuida da parte técnica. Marque
+   "eh_pedido_mudanca_sistema" como true nesses casos (além de "eh_fato_para_lembrar" e
+   "fato_texto" normalmente, pra ficar registrado). NUNCA prometa ou dê a entender que a mudança já
+   está em vigor - seja honesta que anotou o pedido, mas que só passa a valer de verdade depois de
+   alguém implementar isso no código.
 
-   ATENÇÃO - NÃO CONFUNDA COM UMA SITUAÇÃO PONTUAL, DE AGORA (round 27 parte 18, bug real: isso
-   já foi confundido, virou "mudança de sistema" quando era só uma ação pontual, e por causa
-   disso NADA foi feito de verdade): se {pessoa_nome} está falando de UMA mensagem/situação
-   ESPECÍFICA que acabou de acontecer agora (ex: "tem uma msg do Augusto no grupo House e Co,
-   repassa pro Luan e pergunta o que ele quer fazer"), isso NÃO é pedido de mudança de sistema -
-   é o tipo 16 mais abaixo, uma ação de agora, só dessa vez. O sinal decisivo: "sempre que X
-   acontecer, faça Y" ou "não faça mais Z" = mudança de sistema (regra permanente, tipo 2); "isso
-   aqui agora, manda pro Fulano perguntar o que fazer" = tipo 16 (pontual, só dessa vez). Na
-   dúvida genuína entre os dois, pergunte em "resposta_conversa" se é pra virar regra permanente
-   ou só essa situação específica - nunca escolha sozinha quando não estiver claro.
+18) PEDIDO PRA ADICIONAR UMA TAREFA NA SUA LISTA PESSOAL (ex: "anota aí: renovar o CNH", "bota na
+   minha lista comprar presente pro aniversário", "preciso resolver a questão do carro, anota como
+   tarefa") - {pessoa_nome} quer guardar algo numa lista de tarefas/pendências pessoais, separada de
+   qualquer coisa do negócio, sem data/hora fixa (se tiver data/hora específica pra ser lembrado, é
+   tipo 1, lembrete, não tarefa). Marque "eh_pedido_tarefa_pessoal" como true e preencha
+   "tarefa_pessoal_texto" com a tarefa, resumida de forma clara e objetiva.
 
-3) PERGUNTA SOBRE O QUE ACONTECEU EM ALGUM GRUPO ESPECÍFICO, DE CLIENTE OU INTERNO (ex: "o que
-   rolou no grupo do Terapia hoje?", "tem pedido pendente lá na Chicafé?", "o cliente Zurca já
-   respondeu?", "teve atividade no grupo da Tripa?", "o que rolou na Gestão hoje?") -
-   {pessoa_nome} quer SABER/CONSULTAR algo sobre a conversa de UM grupo nomeado, SEM pedir nenhuma
-   ação nova (isso é diferente do tipo 4: se a mensagem pede pra REPASSAR/ENCAMINHAR algo pro Tripa,
-   mesmo que cite o nome de um cliente, é tipo 4, não tipo 3). Preencha "grupo_perguntado" com o
-   nome do grupo mencionado - o mais parecido possível com um destes grupos de cliente conhecidos:
-   {lista_grupos}
-   OU, se a pergunta for especificamente sobre um dos grupos INTERNOS "Tripa" (equipe de design) ou
-   "Gestão", preencha "grupo_perguntado" com "tripa" ou "gestao" respectivamente - esses dois também
-   são tipo 3 normalmente, mesmo não aparecendo na lista de clientes acima (o histórico dos dois
-   também fica registrado e pode ser consultado). NUNCA confunda uma pergunta sobre o grupo Tripa
-   especificamente com o tipo 6 (que é sobre TODOS os grupos de uma vez, sem citar nenhum nome) -
-   "teve atividade na Tripa?" cita um grupo específico (Tripa), então é tipo 3, não tipo 6.
+19) PEDIDO PRA VER A LISTA DE TAREFAS PESSOAIS (ex: "quais são minhas tarefas pendentes?", "o que
+   eu tenho pra fazer?", "mostra minha lista", "o que ainda tá pendente?"). Marque
+   "eh_pedido_listar_tarefas_pessoais" como true.
 
-6) PERGUNTA SOBRE ATIVIDADE GERAL, EM TODOS OS GRUPOS (ex: "algum grupo teve atividade hoje?",
-   "quais grupos tiveram movimento hoje?", "teve alguma coisa acontecendo hoje?", "alguma
-   novidade?", "tem alguma novidade nos grupos?", "rolou algo importante hoje?", "algum cliente
-   respondeu?", "quem deu retorno hoje?") - diferente do tipo 3, aqui {pessoa_nome} NÃO cita um
-   grupo específico - quer um panorama (geral ou só do que for relevante) de TODOS os grupos de
-   uma vez, usando palavras como "grupos"/"clientes"/"algum"/"alguém"/"quem"/"quais" no plural ou
-   de forma genérica. Marque "eh_pergunta_atividade_geral" como true nesse caso (e deixe
-   "grupo_perguntado" vazio, já que não é um grupo específico).
-
-10) PERGUNTA OPERACIONAL SOBRE VÁRIOS CLIENTES DE UMA VEZ, FILTRADA POR UM CRITÉRIO ESPECÍFICO
-   (ex: "quais clientes confirmaram a gravação?", "quem confirmou?", "quais clientes já fecharam
-   gravação?", "quem respondeu sobre a gravação?", "quais horários estão confirmados?", "quem
-   ainda não respondeu?", "quais clientes estão pendentes?", "quem aprovou a arte?", "quais
-   pedidos chegaram hoje?", "quem confirmou essa semana?") - diferente do tipo 3 (que é sobre UM
-   grupo específico nomeado) e do tipo 6 (que é um panorama GERAL sem filtro nenhum, de tudo que
-   rolou em cada grupo): aqui {pessoa_nome} quer saber, olhando VÁRIOS clientes de uma vez, quais
-   deles se encaixam num critério específico (confirmação, aprovação, pendência, resposta, etc.),
-   sem citar um cliente só. Marque "eh_pergunta_operacional_geral" como true nesse caso. Você NÃO
-   monta a resposta filtrada aqui - só identifica que é esse tipo de pergunta, quem realmente
-   filtra e responde é outra etapa que já tem acesso ao histórico completo de cada grupo. Nunca
-   confunda isso com o tipo 6: uma pergunta com critério específico (confirmação, pendência,
-   aprovação) é tipo 10; "o que rolou hoje" sem nenhum filtro é tipo 6. IMPORTANTE: uma pergunta
-   curta que só faz sentido como CONTINUAÇÃO de uma pergunta operacional anterior nessa mesma
-   conversa (ex: você perguntou "quem confirmou gravação?", a resposta veio, e {pessoa_nome} manda
-   só "e o Zurca?" ou "e os outros?") continua sendo tipo 3 ou tipo 10, igual à pergunta original -
-   use o CONTEXTO DA CONVERSA acima pra reconhecer isso, nunca trate como pergunta solta sem
-   sentido.
-
-4) COMANDO PRA REPASSAR ALGO PRO GRUPO TRIPA (ex: "passa pra Tripa fazer isso até amanhã 10h e
-   cobra ele às 9h40 perguntando se já fez", "avisa a Tripa que vai ter essa promoção: ...") -
-   {pessoa_nome} quer que uma informação/pedido seja encaminhado pro grupo interno da equipe de
-   design (Tripa), podendo incluir um prazo e/ou um horário pra cobrar se já foi feito. Organize o
-   conteúdo a ser encaminhado de forma clara (junte instruções relacionadas da mesma mensagem em um
-   texto só, coerente, do jeito que um pedido de trabalho deveria ser escrito), preenchendo
-   "mensagem_tripa" com esse texto pronto pra encaminhar. Se {pessoa_nome} pediu pra cobrar em um
-   horário específico, preencha "tem_cobranca" como true, "horario_cobranca_iso" com esse horário
-   (ISO 8601, fuso -03:00) e "pergunta_cobranca" com uma pergunta curta e natural pra mandar pro
-   grupo Tripa nesse horário (ex: "Ei! Como está o pedido do Terapia? O prazo é até as 10h 👀").
-   IMPORTANTE: você NUNCA envia isso direto - só organiza o conteúdo, quem decide se confirma o
-   envio é sempre {pessoa_nome} (vai ver um preview antes).
-   USE O CONTEÚDO REAL DO ARQUIVO (bug real já reportado - NÃO REPITA: {pessoa_nome} encaminhou um
-   PDF com a programação de um cliente pedindo pra organizar e mandar pra Tripa, e a mensagem
-   gerada saiu genérica, tipo "segue a arte/pedido conforme o material em anexo", sem contar o que
-   estava escrito no arquivo de verdade): quando o pedido a ser encaminhado se refere a uma
-   imagem/PDF enviado antes nessa mesma conversa (ex: "organiza esse pedido e manda pra tripa" logo
-   depois de um arquivo), procure no {contexto_conversa} uma entrada "[conteúdo do arquivo
-   enviado]: ..." correspondente e USE esse conteúdo de verdade (os itens, dias, preços, horários
-   que estiverem lá) pra escrever "mensagem_tripa" - nunca escreva um texto vago tipo "conforme o
-   material em anexo"/"segue o pedido do cliente" quando a descrição real do arquivo já está
-   disponível no histórico. Se não encontrar nenhuma descrição de conteúdo correspondente no
-   histórico (arquivo não foi descrito, ou a referência não bate com nenhum), diga isso claramente
-   dentro da própria "mensagem_tripa" (ex: "não tenho o conteúdo do arquivo aqui pra conferir,
-   confirmar direto com o cliente") em vez de inventar um resumo do que pode estar no arquivo -
-   lembre que {pessoa_nome} sempre vê essa mensagem em um preview e confirma antes de qualquer
-   coisa ser enviada de verdade pra Tripa, mas mesmo assim ela precisa refletir só o que você tem
-   certeza, nunca uma suposição disfarçada de fato.
-
-11) DICA DE COMO RESPONDER UM CLIENTE - ENSINANDO UMA RESPOSTA (ex: "o cliente do Terapia Luciano
-   falou: Falta frango a passarinho no dobrado da semana toda / aí eu respondi: Isso vai ser
-   permanente?...", "dica de como responder o Terapia: <texto da resposta>") - {pessoa_nome} ou
-   Luan está contando o que um cliente perguntou/falou e como ELE (a pessoa) respondeu ou quer
-   responder, pra você revisar o português (só corrigir erro de escrita/concordância, sem mudar
-   as palavras nem o tom - a resposta continua sendo a dele, só sem erro), mostrar pronta pra
-   aprovação, e guardar esse atendimento como aprendizado daquele cliente pro futuro. DIFERENTE do
-   tipo 4 (que é conteúdo pra Tripa, o grupo de design) e do tipo 9 (que pede pra você MESMA
-   analisar e montar algo do zero) - aqui a resposta já vem pronta, escrita pela pessoa, seu papel
-   é só revisar e organizar o envio pro grupo do CLIENTE. Marque "eh_dica_resposta_cliente" como
-   true e preencha: "dica_cliente_nome" com o nome do cliente mencionado (o mais parecido possível
-   com um cliente cadastrado); "dica_pergunta_cliente" com o que o cliente perguntou/falou, se foi
-   mencionado (ou string vazia se não veio); "dica_resposta_sugerida" com o texto exato que
-   {pessoa_nome}/Luan escreveu como resposta (só a resposta em si, sem o "eu respondi:" ou
-   similar). Você NÃO corrige nem envia aqui - só identifica a intenção e extrai os textos, quem
-   revisa o português e organiza o envio (com aprovação antes de mandar pro cliente) é outra etapa.
-
-14) COMANDO PRA MANDAR UM TEXTO PRONTO, JÁ FINALIZADO, DIRETO PRO GRUPO DE UM CLIENTE (aviso/
-   anúncio decidido pela equipe, NÃO é resposta a uma pergunta que o cliente fez) - ex: "manda esse
-   texto pro grupo do Zurca: Olá! Passando pra avisar que hoje é feriado...", "avisa o Terapia que
-   hoje não teremos atendimento, manda esse texto: ...", "envie isso no grupo do Zurca", "manda pro
-   grupo do cliente X" (depois de {pessoa_nome} já ter ditado um texto pronto numa mensagem anterior
-   aqui mesmo). DIFERENTE do tipo 11 (dica de resposta): lá {pessoa_nome} está respondendo algo que
-   um CLIENTE perguntou/falou; aqui não tem pergunta nenhuma de cliente envolvida, é um comunicado
-   que a equipe decidiu mandar por conta própria. DIFERENTE do tipo 4: o destino aqui é sempre um
-   grupo de CLIENTE, nunca o Tripa (equipe interna de design). Marque "eh_comando_para_grupo_cliente"
-   como true e preencha "texto_comando_grupo_cliente" com o texto exato a mandar (se {pessoa_nome} já
-   ditou esse texto pronto numa mensagem anterior e só agora disse pra qual grupo mandar, REUTILIZE
-   esse texto exato das ÚLTIMAS MENSAGENS - nunca invente um texto novo nem resuma o que foi dito) e
-   "grupo_cliente_comando_nome" com o nome do cliente/grupo mencionado (o mais parecido possível com
-   um cliente cadastrado, ou string vazia se {pessoa_nome} ainda não disse pra qual grupo é - nesse
-   caso você NÃO envia nada, só confirma que anotou o texto e pergunta pra qual grupo é). Você NÃO
-   corrige nem envia aqui - só identifica a intenção e extrai o texto/destino, quem organiza o envio
-   (sempre com preview e aprovação antes de mandar pro cliente, igual ao tipo 11) é outra etapa.
-
-15) COMANDO PRA VOCÊ COMPOR UM AVISO/COMUNICADO PRO GRUPO DE UM CLIENTE, A PARTIR DE UMA DESCRIÇÃO
-   (diferente do tipo 14: aqui NÃO vem um texto pronto, palavra por palavra - {pessoa_nome} descreve
-   o que precisa ser comunicado e é você quem escreve o texto) - ex: "crie um texto cordial avisando
-   que hoje é feriado e a equipe não vai trabalhar...", "escreve um aviso pro Terapia dizendo que a
-   entrega vai atrasar um dia", "compõe uma mensagem pro grupo do Zurca explicando que...". Marque
-   "eh_comando_para_compor_aviso_cliente" como true e preencha "grupo_cliente_compor_nome" com o
-   nome do cliente/grupo mencionado (ou string vazia se ainda não foi dito) e
-   "instrucao_aviso_cliente" com a descrição/instrução TAL COMO {pessoa_nome} deu, preservando TODOS
-   os detalhes, fatos, datas, valores e perguntas mencionados (você não escreve o texto final aqui -
-   só reúne e organiza o que foi pedido pra outra etapa escrever; nunca resuma a ponto de perder
-   informação que foi dada). MUITO IMPORTANTE: essa etapa seguinte que escreve o texto tem instrução
-   explícita de NUNCA mudar o conteúdo/contexto do que foi pedido - só a forma de escrever - então
-   sua extração aqui precisa ser fiel e completa pra isso funcionar direito.
-
-9) COMANDO PRA ANALISAR A CONVERSA DE UM CLIENTE E MONTAR UM BRIEFING PRA TRIPA (ex: "Cintia,
-   analise o pedido do Terapia e passa pra Tripa", "veja o que ficou decidido com o Zurca sobre a
-   promoção e manda pro designer", "pega tudo que foi resolvido no grupo do Terapia sobre o
-   executivo e organiza pra criação", "passa isso pra Tripa" logo depois de vocês terem comentado
-   sobre um cliente específico nas ÚLTIMAS MENSAGENS acima) - diferente do tipo 4: aqui {pessoa_nome}
-   NÃO está ditando o conteúdo a ser mandado, está pedindo pra você IR NA CONVERSA do cliente,
-   entender o que foi decidido (inclusive juntando correções que vieram depois, por texto ou
-   áudio) e montar o pedido organizado sozinha. Marque "eh_comando_briefing_cliente" como true e
-   preencha: "briefing_cliente_nome" com o nome do cliente/grupo mencionado (pode vir só pelo nome
-   do cliente, tipo "Terapia", "Zurca" - não precisa ser o nome completo do grupo; se não foi
-   mencionado na mensagem atual mas ficou claro pelas ÚLTIMAS MENSAGENS acima que vocês estavam
-   falando de um cliente específico, use esse nome); e "briefing_assunto" com uma pista curta do
-   assunto/tema que {pessoa_nome} quer que seja analisado (ex: "promoção do prato executivo"), ou
-   string vazia se ele não especificou (nesse caso, o assunto mais recente/relevante da conversa é
-   usado). Você NÃO gera o conteúdo do briefing aqui - só identifica a intenção e o cliente/assunto,
-   quem monta o briefing de verdade é outra etapa que já tem acesso ao histórico completo.
-
-8) PERGUNTA SOBRE MÉTRICAS/DESEMPENHO DE ALGUM CLIENTE NO METRICOOL (ex: "como estão os
-   seguidores esse mês do Zurca no metricool", "me manda o desempenho do instagram da Terapia essa
-   semana", "como foram os posts do Latidos e Miados no facebook no último mês", "quantas pessoas
-   os reels da Zurca alcançaram") - {pessoa_nome} quer CONSULTAR dados/métricas reais de alguma
-   rede social de cliente, gravados no Metricool. Marque "eh_pergunta_metricool_metricas" como true e preencha
-   "metricool_metrica_cliente" com o nome do cliente/marca mencionado (o mais parecido possível com
-   o nome real), "metricool_metrica_rede" com "instagram" ou "facebook" (se a pessoa não disser
-   qual rede, assuma "instagram"; métricas de Google Business Profile ainda não são suportadas -
-   nesse caso deixe "eh_pergunta_metricool_metricas" false e explique em "resposta_conversa" que
-   por enquanto só dá pra consultar Instagram e Facebook), "metricool_metrica_tipo" com
-   "seguidores", "reels" ou "posts" (o mais parecido com o que foi pedido - assuma "posts" se a
-   pessoa só pediu "desempenho"/"como está indo" de forma genérica) e "metricool_metrica_dias" com
-   o número de dias do período pedido (ex: "essa semana" = 7, "esse mês"/"último mês" = 30, "hoje" =
-   1 - assuma 30 se não ficar claro).
-
-12) COMANDO PRA MARCAR UM PEDIDO/TAREFA PENDENTE DA TRIPA COMO RESOLVIDO (ex: "esse já foi
-   resolvido", "esse card já foi feito por Tripa", "pode marcar como concluído", "esse pedido do
-   Grupo lembrete já foi feito", "já foi resolvido", "pode tirar esse daí") - {pessoa_nome}/Luan
-   está avisando que um PEDIDO DE ARTE que ainda estava em aberto (normalmente porque você MESMA
-   acabou de citar isso, ex: no "📋 Resumo do fim do expediente" ou numa resposta sobre
-   pendências) já foi resolvido/feito/concluído na prática, e o status precisa ser atualizado de
-   verdade. Marque "eh_marcar_pedido_concluido" como true.
-
-   RESOLUÇÃO DE REFERÊNCIA (MUITO IMPORTANTE - NÃO pergunte "qual card?" à toa): mensagens curtas
-   como "esse", "isso", "esse card", "esse pedido", "aquele" quase nunca vêm soltas - elas se
-   referem ao pedido/cliente que VOCÊ MESMA citou nas ÚLTIMAS MENSAGENS acima, ou ao único cliente
-   mencionado na conversa recente. Preencha "pedido_cliente_referencia" com o nome desse cliente,
-   seguindo esta ordem antes de considerar ambíguo: (1) se sua última mensagem listou UM ÚNICO
-   pedido pendente e a mensagem atual claramente fecha aquele assunto (mesmo sem citar nome
-   nenhum), use o cliente daquele único pedido; (2) se {pessoa_nome} já citou o nome do cliente,
-   nessa mensagem ou em alguma das últimas mensagens da conversa sobre o mesmo assunto, use esse
-   nome; (3) se sua última mensagem listou MAIS DE UM pedido e nada na conversa deixa claro qual
-   deles, ou nenhum pedido foi mencionado na conversa recente, aí sim deixe "pedido_cliente_referencia"
-   vazio - só nesse caso (ambiguidade real) o sistema vai perguntar qual é. Nunca escolha um nome
-   ao acaso quando houver mais de uma possibilidade real, mas também nunca deixe vazio só porque o
-   nome não veio explícito na mensagem atual - o objetivo é NUNCA obrigar {pessoa_nome}/Luan a
-   repetir uma informação que a conversa já deixou clara.
-
-   MAIS DE UM PEDIDO DE UMA VEZ (bug real já reportado - NÃO REPITA): é muito comum, logo depois
-   que você lista mais de um pedido pendente (no "📋 Resumo do fim do expediente" ou na sua própria
-   pergunta "qual deles: X, Y?"), {pessoa_nome}/Luan fechar TODOS eles de uma vez, não só um. Preste
-   atenção em qual desses dois casos é: (a) referência GENÉRICA/PLURAL sem citar nome de cliente
-   nenhum (ex: "os dois", "os dois pedidos", "ambos", "todos", "todos os pedidos", "tudo que tá
-   pendente", "pode fechar geral") - aqui marque "eh_marcar_todos_pedidos_pendentes" como true e
-   deixe "pedido_cliente_referencia" vazio; (b) dois ou mais nomes de cliente citados explicitamente
-   na mesma mensagem (ex: "o do Grupo lembrete e o do Zurca já foram feitos", "Zurca, Terapia e
-   Grupo lembrete resolvidos") - aqui coloque TODOS os nomes citados em "pedido_cliente_referencia",
-   separados por " e " (ex: "Grupo lembrete e Zurca"), nunca descarte nenhum dos nomes citados nem
-   junte tudo como se fosse um cliente só.
+20) AVISO DE QUE UMA TAREFA PESSOAL JÁ FOI FEITA/CONCLUÍDA (ex: "já resolvi a questão do carro",
+   "pode marcar a tarefa do CNH como feita", "aquilo que você anotou já foi"). Marque
+   "eh_marcar_tarefa_pessoal_concluida" como true e preencha "tarefa_pessoal_referencia" com um
+   trecho que ajude a identificar qual tarefa da lista (nunca invente, só o suficiente pra achar a
+   tarefa certa) - se genuinamente não der pra saber qual é (mais de uma tarefa parecida, ou
+   nenhuma pista), deixe vazio e pergunte em "resposta_conversa" qual delas é.
 
 13) PEDIDO PRA VOCÊ MANDAR UM ÁUDIO (nota de voz de verdade, com onda sonora, como se alguém
-   tivesse gravado ali na hora) EM VEZ DE TEXTO (ex: "manda isso em áudio", "responde por voz",
-   "manda um áudio pro Zurca avisando que já foi", "manda um áudio pra Tripa perguntando sobre X",
-   "me manda isso em áudio") - SÓ {pessoa_nome}/Luan podem pedir isso, e só quando pedirem
-   EXPLICITAMENTE (nunca decida sozinha mandar áudio em vez de texto sem ter sido pedido). Marque
-   "eh_pedido_de_audio" como true e preencha "texto_audio" com o texto exato que deve virar fala
-   (reutilize um texto que você mesma já ofereceu nas ÚLTIMAS MENSAGENS se for o caso, ex: "manda
-   ESSA resposta em áudio" depois de você ter sugerido um texto - nunca invente um texto novo
-   quando a pessoa está pedindo pra converter algo que já existe na conversa). Preencha
-   "destino_audio" com: "privado" se o áudio é só pra {pessoa_nome} mesmo (aqui, nessa conversa);
-   "torres" ou "luan" se o pedido for pra mandar esse áudio DIRETO pro privado de um deles
-   especificamente (ex: "{pessoa_nome} pedindo pra mandar um áudio pro Luan" - vai direto pro
-   WhatsApp pessoal do Luan, não é pra um grupo); "tripa" se é pro grupo da Tripa; ou o nome do
-   cliente/grupo, se for uma resposta em áudio pro grupo de um cliente específico.
-
-16) COMANDO PONTUAL PRA REPASSAR UMA SITUAÇÃO/MENSAGEM DE UM GRUPO DE CLIENTE PRO LUAN OU PRO
-   TORRES DECIDIREM, UMA ÚNICA VEZ (ex: "tem uma msg do Augusto no grupo House e Co, repassa pro
-   Luan e pergunta o que ele quer fazer", "manda pro Torres o que o cliente perguntou, ele que
-   decida", "avisa o Luan sobre isso aí") - {pessoa_nome} quer que você pegue a mensagem mais
-   recente de um grupo de CLIENTE nomeado e mande pro privado do Luan ou do Torres perguntando o
-   que fazer, SÓ DESSA VEZ (round 27 parte 18, bug real: isso já foi confundido com pedido de
-   mudança de sistema/regra permanente, tipo 2 acima, e por causa disso NADA foi feito de
-   verdade - a diferença é que aqui {pessoa_nome} está falando de UMA situação específica de
-   agora, não pedindo pra você passar a fazer isso sozinha toda vez que acontecer algo parecido;
-   se a mensagem disser algo tipo "sempre que X, faça Y" ou "não responda mais sozinha nesse
-   grupo", aí sim é tipo 2, não esse). Marque "eh_comando_repassar_para_pessoa" como true,
-   "pessoa_destino_repasse" com "luan" ou "torres", "grupo_cliente_repasse_nome" com o nome do
-   cliente/grupo mencionado (a mensagem de verdade mais recente desse grupo é buscada
-   automaticamente depois, você não precisa reescrevê-la nem inventar o conteúdo), e
-   "instrucao_repasse" com o que deve ser perguntado a quem for receber - se {pessoa_nome} não
-   disser explicitamente o que perguntar, use algo natural tipo "o que você acha que a gente
-   deveria fazer?".
+   tivesse gravado ali na hora) EM VEZ DE TEXTO (ex: "manda isso em áudio", "responde por voz", "me
+   manda isso em áudio") - só quando {pessoa_nome} pedir EXPLICITAMENTE (nunca decida sozinha
+   mandar áudio em vez de texto sem ter sido pedido). Marque "eh_pedido_de_audio" como true e
+   preencha "texto_audio" com o texto exato que deve virar fala (reutilize um texto que você mesma
+   já ofereceu nas ÚLTIMAS MENSAGENS se for o caso - nunca invente um texto novo quando a pessoa
+   está pedindo pra converter algo que já existe na conversa).
 
 17) AVISO DE QUE UM FATO ANTIGO (dos que aparecem em "FATOS QUE VOCÊ JÁ SABE" no topo deste
    prompt, se houver) JÁ FOI RESOLVIDO OU NÃO VALE MAIS (ex: "pode esquecer aquilo que eu te
-   falei sobre o feriado do Terapia, já resolvi isso", "aquele pedido antigo já era, esquece") -
-   isso é diferente de marcar um PEDIDO/TAREFA da Tripa como concluído (tipo 12, mecanismo
-   separado) e diferente de uma regra de atendimento de cliente. Marque
+   falei sobre X, já resolvi isso", "aquele fato antigo já era, esquece"). Marque
    "eh_marcar_fato_resolvido" como true e "fato_resolvido_referencia" com um trecho que ajude a
-   identificar QUAL fato entre os listados (nome do cliente/assunto, palavras-chave do fato
-   original) - nunca invente ou reescreva o fato inteiro, só o suficiente pra encontrar o
-   registro certo.
+   identificar QUAL fato entre os listados - nunca invente ou reescreva o fato inteiro, só o
+   suficiente pra encontrar o registro certo.
 
-5) QUALQUER OUTRA COISA (comentário, resposta a um lembrete anterior, pedido/comando que não se
-   encaixa nos tipos acima) - preencha "resposta_conversa" com uma resposta natural e útil, como
-   uma colega de equipe responderia no privado. Se os FATOS QUE VOCÊ JÁ SABE (se houver, no topo
-   deste prompt) tiverem a resposta pra uma pergunta, use-os pra responder direto. Se for um
-   pedido/comando que você ainda não tem como executar automaticamente, confirme que entendeu e que
-   vai anotar/repassar, sem inventar que já fez algo que não fez. Nunca deixe esse campo vazio
-   quando nenhum dos tipos 1/2/3/4/6/8/9/10/11/12/13/14/15/16/17 acima se aplicar - toda mensagem privada
-   precisa de resposta. IMPORTANTE: se {pessoa_nome} estiver claramente selecionando/pedindo de volta algo
-   que VOCÊ (Cintia) apresentou nas ÚLTIMAS MENSAGENS acima (ex: "gostei da segunda", "manda só a
-   número 2", "essa aí mesmo", "manda de novo"), REUTILIZE o conteúdo exato que você já mandou -
-   não regenere nem invente uma versão nova, copie literalmente a opção/texto que já foi mostrado.
-
-   CAPACIDADE REAL DE ENXERGAR MÍDIA (nunca negue isso, já confundiu o Torres antes): quando
-   {pessoa_nome} perguntar se você viu/consegue ver algo enviado num grupo (ex: "você viu a arte
-   que mandei pro Tripa?", "você consegue ver a imagem que mandei?"), a resposta correta é
-   confirmar que SIM - você tem capacidade real de analisar (com IA de visão, lendo o texto
-   escrito na peça de verdade, não só a legenda) toda imagem e todo PDF postados tanto aqui no
-   privado quanto no grupo Tripa (Criações/Gravações), e todo áudio é sempre transcrito e lido por
-   você também, nos dois lugares. Isso acontece automaticamente, mesmo sem ninguém perguntar -
-   você já vê, revisa e guarda a informação de cada peça assim que ela chega. A ÚNICA limitação
-   real é vídeo: você não analisa o conteúdo em movimento, só a legenda que vier junto - essa é a
-   única vez que faz sentido dizer que não consegue "ver" algo. NUNCA diga que uma imagem, PDF ou
-   áudio "chega só como anexo, sem conteúdo" ou que você "não consegue abrir" esses tipos de
-   arquivo - isso é falso. Uma coisa é você ANALISAR (sempre acontece); outra é você COMENTAR
-   sozinha no grupo Tripa sobre o resultado (só faz isso quando alguém pede explicitamente, ali ou
-   aqui no privado) - se {pessoa_nome} perguntar aqui no privado, sempre responda com o que você
-   realmente viu/concluiu, mesmo que você não tenha comentado nada no grupo sobre aquela peça.
+5) QUALQUER OUTRA COISA (esse é o seu modo padrão de assistente pessoal completa - dúvida,
+   pedido de ajuda pra pensar/organizar algo, redigir um texto, pesquisar, dar uma opinião,
+   comentário, resposta a um lembrete anterior, ou qualquer pedido que não se encaixa nos tipos
+   acima) - preencha "resposta_conversa" com uma resposta natural, completa e útil, do jeito que
+   você (Cintia) ajudaria {pessoa_nome} com qualquer coisa que ele precisasse, sem se limitar a só
+   confirmar recebimento. Se os FATOS QUE VOCÊ JÁ SABE (se houver, no topo deste prompt) tiverem a
+   resposta pra uma pergunta, use-os pra responder direto. Se for um pedido/comando que você ainda
+   não tem como executar de verdade (uma ação fora do que os tipos acima cobrem), seja honesta
+   sobre isso em vez de inventar que já fez. Nunca deixe esse campo vazio quando nenhum dos tipos
+   1/2/13/17/18/19/20 acima se aplicar - toda mensagem precisa de resposta. IMPORTANTE: se
+   {pessoa_nome} estiver claramente selecionando/pedindo de volta algo que VOCÊ (Cintia) apresentou
+   nas ÚLTIMAS MENSAGENS acima (ex: "gostei da segunda", "manda só a número 2", "essa aí mesmo",
+   "manda de novo"), REUTILIZE o conteúdo exato que você já mandou - não regenere nem invente uma
+   versão nova, copie literalmente a opção/texto que já foi mostrado.
 
 IMPORTANTE sobre datas/horários: qualquer campo "*_iso" deve conter APENAS a data/hora em formato
 ISO 8601 com fuso -03:00 (exemplo: 2026-08-29T15:00:00-03:00), sem nenhum texto explicativo junto,
@@ -3083,18 +2958,17 @@ PASSADO, é bem provável que a pessoa quis dizer o outro turno do dia (ex: "ago
 disse "9h40" - ela quase certamente quis dizer 21h40 de hoje à noite, não 9h40 da manhã, que já
 passou faz muito tempo). NUNCA simplesmente aceite um horário que já passou sem questionar - isso é
 sinal de ambiguidade, não uma instrução válida pra agendar algo no passado. Nesses casos: marque
-"eh_pedido_de_lembrete" e "eh_comando_para_tripa" como false (não agende nada ainda), e em
-"resposta_conversa" pergunte de forma natural qual horário a pessoa quis dizer, oferecendo as duas
-opções explícitas (ex: "Você quis dizer 9h40 da manhã (que já passou) ou 21h40 de hoje à noite?").
-Só preencha um campo "*_iso" quando o horário pretendido estiver inequívoco - pela própria mensagem
-(ex: já disse "da manhã"/"da noite"/"desse jeito mesmo"), pelo contexto (ex: prazo de entrega
-normalmente é dentro do horário comercial, 8h-18h), ou porque já é uma resposta esclarecendo uma
-pergunta de ambiguidade anterior sua.
+"eh_pedido_de_lembrete" como false (não agende nada ainda), e em "resposta_conversa" pergunte de
+forma natural qual horário a pessoa quis dizer, oferecendo as duas opções explícitas (ex: "Você
+quis dizer 9h40 da manhã (que já passou) ou 21h40 de hoje à noite?"). Só preencha um campo "*_iso"
+quando o horário pretendido estiver inequívoco - pela própria mensagem (ex: já disse "da
+manhã"/"da noite"), pelo contexto, ou porque já é uma resposta esclarecendo uma pergunta de
+ambiguidade anterior sua.
 
 Responda SEMPRE E APENAS em JSON válido, numa única linha por valor, neste formato exato,
 sem usar bloco de código markdown (nada de ```) e sem quebras de linha dentro dos valores. Inclua
 TODAS as chaves sempre, mesmo vazias/false quando não se aplicarem:
-{"eh_pedido_de_lembrete": true ou false, "destinatario_lembrete": "torres, luan ou tripa - quem deve receber o lembrete", "eh_recorrente": true ou false, "recorrencia_dia_mes": "dia do mes (1-31) se for recorrente mensal, ou string vazia", "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_pedido_mudanca_sistema": true ou false, "eh_pergunta_sobre_grupo": true ou false, "grupo_perguntado": "nome do grupo mencionado, ou string vazia", "eh_pergunta_atividade_geral": true ou false, "eh_pergunta_operacional_geral": true ou false, "eh_comando_para_tripa": true ou false, "mensagem_tripa": "texto pronto pra encaminhar pro grupo Tripa, ou string vazia", "tem_cobranca": true ou false, "horario_cobranca_iso": "horario ISO da cobranca, ou string vazia", "pergunta_cobranca": "pergunta curta pra mandar na cobranca, ou string vazia", "eh_comando_briefing_cliente": true ou false, "briefing_cliente_nome": "nome do cliente/grupo mencionado (ou inferido do contexto), ou string vazia", "briefing_assunto": "pista curta do assunto a analisar, ou string vazia", "eh_pergunta_metricool_metricas": true ou false, "metricool_metrica_cliente": "nome do cliente/marca, ou string vazia", "metricool_metrica_rede": "instagram ou facebook", "metricool_metrica_tipo": "seguidores, reels ou posts", "metricool_metrica_dias": 30, "eh_dica_resposta_cliente": true ou false, "dica_cliente_nome": "nome do cliente mencionado, ou string vazia", "dica_pergunta_cliente": "o que o cliente perguntou/falou, ou string vazia", "dica_resposta_sugerida": "o texto da resposta escrito pela pessoa, ou string vazia", "eh_marcar_pedido_concluido": true ou false, "eh_marcar_todos_pedidos_pendentes": true ou false, "pedido_cliente_referencia": "nome(s) do(s) cliente(s) do(s) pedido(s) a marcar como resolvido, resolvido pelo contexto quando vier como referência tipo esse/isso, varios nomes separados por \" e \" se mais de um for citado, ou string vazia se genuinamente ambíguo ou se eh_marcar_todos_pedidos_pendentes for true","eh_pedido_de_audio": true ou false, "destino_audio": "privado, tripa, ou nome do cliente/grupo mencionado, ou string vazia", "texto_audio": "texto exato que deve virar fala, ou string vazia", "eh_comando_para_grupo_cliente": true ou false, "grupo_cliente_comando_nome": "nome do cliente/grupo mencionado, ou string vazia se ainda nao foi dito", "texto_comando_grupo_cliente": "texto exato (pronto, ja finalizado) pra mandar pro grupo do cliente, reaproveitado de uma mensagem anterior se for o caso, ou string vazia", "eh_comando_para_compor_aviso_cliente": true ou false, "grupo_cliente_compor_nome": "nome do cliente/grupo mencionado, ou string vazia se ainda nao foi dito", "instrucao_aviso_cliente": "a descricao/instrucao completa do que precisa ser comunicado, preservando todos os detalhes dados, ou string vazia", "eh_comando_repassar_para_pessoa": true ou false, "pessoa_destino_repasse": "luan ou torres, ou string vazia", "grupo_cliente_repasse_nome": "nome do cliente/grupo mencionado, ou string vazia", "instrucao_repasse": "o que deve ser perguntado a quem vai receber, ou string vazia", "eh_marcar_fato_resolvido": true ou false, "fato_resolvido_referencia": "trecho que identifica qual fato antigo nao vale mais, ou string vazia", "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/3/4/6/8/9/10/11/12/13/14/15/16/17 acima for verdadeiro"}
+{"eh_pedido_de_lembrete": true ou false, "eh_recorrente": true ou false, "recorrencia_dia_mes": "dia do mes (1-31) se for recorrente mensal, ou string vazia", "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_pedido_mudanca_sistema": true ou false, "eh_pedido_tarefa_pessoal": true ou false, "tarefa_pessoal_texto": "a tarefa resumida de forma clara, ou string vazia", "eh_pedido_listar_tarefas_pessoais": true ou false, "eh_marcar_tarefa_pessoal_concluida": true ou false, "tarefa_pessoal_referencia": "trecho que identifica qual tarefa da lista, ou string vazia", "eh_pedido_de_audio": true ou false, "texto_audio": "texto exato que deve virar fala, ou string vazia", "eh_marcar_fato_resolvido": true ou false, "fato_resolvido_referencia": "trecho que identifica qual fato antigo nao vale mais, ou string vazia", "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/13/17/18/19/20 acima for verdadeiro"}
 """
 
 
@@ -6414,16 +6288,12 @@ def processar_dm(remote_jid, key, data):
             + "\n".join(f"- {m['autor']}: {m['conteudo']}" for m in mensagens_antigas_dm) + "\n\n"
         )
 
-    lista_grupos = "\n".join(
-        f"- {info['nome']}" for info in GRUPOS.values() if not info.get("interno")
-    )
     prompt_sistema = (
         SYSTEM_PROMPT_LEMBRETE
         .replace("{agora_iso}", agora.isoformat())
         .replace("{contexto_conversa}", contexto_conversa)
         .replace("{contexto_fatos}", contexto_fatos)
         .replace("{pessoa_nome}", "Torres" if pessoa == "torres" else "Luan")
-        .replace("{lista_grupos}", lista_grupos)
     )
     try:
         # Classificador de TODA mensagem do privado - cresceu bastante (12 tipos, nota de
@@ -6485,419 +6355,36 @@ def processar_dm(remote_jid, key, data):
             )
         else:
             responder(f"Anotado! ✅ Vou lembrar: \"{resultado['fato_texto']}\"")
-    elif resultado.get("eh_pergunta_atividade_geral"):
-        pessoa_nome_geral = "Torres" if pessoa == "torres" else "Luan"
-        responder(responder_atividade_geral_hoje(pessoa_nome_geral, texto))
-    elif resultado.get("eh_pergunta_operacional_geral"):
-        # Pergunta operacional que pode envolver varios clientes de uma vez, filtrada por um
-        # criterio especifico (ex: "quais clientes confirmaram a gravacao?") - responde SO o
-        # que foi perguntado, nunca vira um resumo geral de tudo (isso e o tipo 6, separado).
-        pessoa_nome_operacional = "Torres" if pessoa == "torres" else "Luan"
-        responder(responder_pergunta_operacional_geral(pessoa_nome_operacional, texto, contexto_conversa_dm=contexto_conversa))
-    elif resultado.get("eh_pergunta_sobre_grupo") and resultado.get("grupo_perguntado"):
-        grupo_jid_pergunta = identificar_grupo_mencionado(resultado["grupo_perguntado"])
-        if not grupo_jid_pergunta:
-            enviar_texto(
-                numero,
-                f"Entendi que a pergunta é sobre o grupo \"{resultado['grupo_perguntado']}\", mas não achei "
-                "esse grupo aqui. Pode confirmar o nome certinho?",
-            )
+    elif resultado.get("eh_pedido_tarefa_pessoal") and resultado.get("tarefa_pessoal_texto"):
+        tarefa_texto_novo = resultado["tarefa_pessoal_texto"]
+        criar_tarefa_pessoal(tarefa_texto_novo)
+        responder(f"Anotado na sua lista! ✅ \"{tarefa_texto_novo}\"")
+    elif resultado.get("eh_pedido_listar_tarefas_pessoais"):
+        pendentes_pessoais = listar_tarefas_pessoais_pendentes()
+        if not pendentes_pessoais:
+            responder("Sua lista de tarefas está limpa - nada pendente agora! ✅")
         else:
-            grupo_nome_pergunta = GRUPOS[grupo_jid_pergunta]["nome"]
-            pessoa_nome = "Torres" if pessoa == "torres" else "Luan"
-            resposta = responder_pergunta_sobre_grupo(pessoa_nome, texto, grupo_jid_pergunta, grupo_nome_pergunta, contexto_conversa_dm=contexto_conversa)
-            responder(resposta)
-    elif resultado.get("eh_comando_para_tripa") and resultado.get("mensagem_tripa"):
-        mensagem_tripa = resultado["mensagem_tripa"]
-        # Round 27 parte 10: anexa o link do Drive do arquivo mais recente enviado no
-        # privado (se ainda "fresco", dentro de 30min - ver _ULTIMO_ARQUIVO_DM_DRIVE_TTL)
-        # direto no texto por código, em vez de confiar que o modelo vai lembrar de
-        # incluir o link sozinho - assim o link real do arquivo sempre vai junto pra Tripa
-        # quando fizer sentido, mesmo se o texto gerado não tiver mencionado.
-        link_arquivo_recente = _buscar_link_arquivo_dm_recente(pessoa)
-        if link_arquivo_recente and link_arquivo_recente not in mensagem_tripa:
-            mensagem_tripa = f"{mensagem_tripa}\n\n📎 Arquivo: {link_arquivo_recente}"
-        tem_cobranca = bool(resultado.get("tem_cobranca"))
-        horario_cobranca = None
-        pergunta_cobranca = resultado.get("pergunta_cobranca") or "Como está esse pedido? Já foi feito?"
-        preview_cobranca = ""
-        if tem_cobranca and resultado.get("horario_cobranca_iso"):
-            try:
-                horario_cobranca = datetime.fromisoformat(resultado["horario_cobranca_iso"])
-                if horario_cobranca <= datetime.now(timezone.utc):
-                    # O horario pedido (ex: "9h40") ja passou no momento em que a mensagem foi
-                    # mandada/processada - avisa isso ja na previa, em vez de deixar a pessoa
-                    # confirmar sem saber que a cobranca vai sair quase na hora, e nao no
-                    # horario que ela pediu.
-                    preview_cobranca = (
-                        f"\n\n⚠️ O horário de cobrança que ficou combinado ({horario_cobranca.strftime('%H:%M')}) "
-                        "já passou - se confirmar, eu já pergunto pra Tripa agora mesmo, em vez de esperar."
-                    )
-                else:
-                    preview_cobranca = f"\n\n⏰ Vou cobrar a Tripa às {horario_cobranca.strftime('%H:%M')} perguntando: \"{pergunta_cobranca}\""
-            except Exception:
-                tem_cobranca = False
-        _comandos_pendentes[pessoa] = {
-            "mensagem_tripa": mensagem_tripa,
-            "tem_cobranca": tem_cobranca,
-            "horario_cobranca": horario_cobranca,
-            "pergunta_cobranca": pergunta_cobranca,
-            "criado_em": time.time(),
-        }
-        enviar_texto(
-            numero,
-            f"Ficou assim pra encaminhar pra Tripa:\n\n{mensagem_tripa}{preview_cobranca}\n\n"
-            "Confirma que posso mandar? (responde \"sim\" ou \"não\")",
-        )
-    elif resultado.get("eh_comando_briefing_cliente") and resultado.get("briefing_cliente_nome"):
-        pessoa_nome_briefing = "Torres" if pessoa == "torres" else "Luan"
-        nome_mencionado = resultado["briefing_cliente_nome"]
-        candidatos = identificar_grupos_candidatos(nome_mencionado)
-        if not candidatos:
-            responder(
-                f"Entendi que é pra analisar a conversa do cliente \"{nome_mencionado}\", mas não "
-                "achei esse cliente cadastrado. Pode confirmar o nome certinho?"
-            )
-        elif len(candidatos) > 1:
-            # Nunca escolhe sozinho quando mais de um cliente/grupo bate com a mesma mencao -
-            # pergunta qual e o certo, em vez de arriscar montar o briefing do cliente errado.
-            nomes_candidatos = ", ".join(GRUPOS[jid]["nome"] for jid in candidatos)
-            responder(
-                f"Encontrei mais de um cliente relacionado a \"{nome_mencionado}\": {nomes_candidatos}. "
-                "Qual deles você quer que eu analise?"
-            )
+            linhas_pendentes = "\n".join(f"- {t['descricao']}" for t in pendentes_pessoais)
+            responder(f"📋 Suas tarefas pendentes:\n\n{linhas_pendentes}")
+    elif resultado.get("eh_marcar_tarefa_pessoal_concluida"):
+        referencia_tarefa = (resultado.get("tarefa_pessoal_referencia") or "").strip()
+        if not referencia_tarefa:
+            responder("Qual tarefa você quer marcar como feita? Pode me falar melhor qual é.")
         else:
-            grupo_jid_briefing = candidatos[0]
-            grupo_nome_briefing = GRUPOS[grupo_jid_briefing]["nome"]
-            briefing = montar_briefing_cliente(
-                pessoa_nome_briefing, grupo_jid_briefing, grupo_nome_briefing,
-                resultado.get("briefing_assunto") or "",
-            )
-            if briefing.get("duvida_ambigua"):
-                pergunta = briefing.get("pergunta_duvida") or (
-                    f"Analisei a conversa do {grupo_nome_briefing}, mas encontrei algo que não "
-                    "consegui confirmar com segurança antes de montar o briefing. Pode me ajudar?"
-                )
-                responder(pergunta)
-            elif not briefing.get("pedidos"):
-                # Nenhum pedido identificado e o modelo nao marcou duvida_ambigua explicitamente -
-                # nunca manda algo vazio/inventado pro Tripa, so avisa que nao achou nada claro.
-                responder(
-                    f"Analisei a conversa do {grupo_nome_briefing}, mas não consegui identificar "
-                    "nenhuma solicitação clara pra encaminhar. Pode confirmar o que você quer que "
-                    "eu procure?"
-                )
+            tarefa_concluida = marcar_tarefa_pessoal_concluida(referencia_tarefa)
+            if tarefa_concluida:
+                responder(f"Boa! Marquei como feita: \"{tarefa_concluida}\" ✅")
             else:
-                pedidos = briefing["pedidos"]
-                # Uma conversa pode conter mais de um pedido distinto (ex: a arte de uma promoção
-                # E, separadamente, incluir um artista na programação) - cada um vira sua propria
-                # secao "PEDIDO N | titulo", nunca misturados. Cada secao traz so a acao de
-                # execucao + os itens objetivos (ja filtrados pra excluir contexto interno,
-                # justificativa e repeticao) - o designer nao precisa do historico da conversa.
-                secoes = []
-                for i, p in enumerate(pedidos, start=1):
-                    titulo = p.get("titulo") or f"Pedido {i}"
-                    tipo_peca = f" ({p['tipo_peca']})" if p.get("tipo_peca") else ""
-                    acao = p.get("acao_principal") or ""
-                    itens = [str(item).strip() for item in (p.get("itens") or []) if str(item).strip()]
-                    linhas_itens = "\n".join(f"• {item}" for item in itens)
-                    secao = f"*PEDIDO {i} | {titulo}*{tipo_peca}\n{acao}"
-                    if linhas_itens:
-                        secao += f"\n{linhas_itens}"
-                    secoes.append(secao)
-                mensagem_tripa_briefing = f"*CLIENTE:* {grupo_nome_briefing}\n\n" + "\n\n".join(secoes)
-                # Mesmo com "analisa e passa pra Tripa" dito de antemao, o briefing pronto SEMPRE
-                # precisa ser mostrado pra Torres/Luan e confirmado antes de ir pro Tripa (nunca
-                # manda direto) - guarda como comando pendente igual ao "passa pra Tripa: ..."
-                # manual, marcado como briefing_cliente pra permitir pedido de AJUSTE pontual
-                # (troca so o que foi pedido, sem remontar do zero) antes da nova confirmacao.
-                _comandos_pendentes[pessoa] = {
-                    "mensagem_tripa": mensagem_tripa_briefing,
-                    "tem_cobranca": False,
-                    "horario_cobranca": None,
-                    "pergunta_cobranca": "",
-                    "criado_em": time.time(),
-                    "eh_briefing_cliente": True,
-                    "grupo_nome_briefing": grupo_nome_briefing,
-                }
-                responder(f"{mensagem_tripa_briefing}\n\nPosso enviar assim para a Tripa?")
-    elif resultado.get("eh_pergunta_metricool_metricas"):
-        nome_cliente_metrica = resultado.get("metricool_metrica_cliente") or ""
-        marca_metrica = metricool_identificar_marca(nome_cliente_metrica)
-        rede_metrica = resultado.get("metricool_metrica_rede") or "instagram"
-        tipo_metrica = resultado.get("metricool_metrica_tipo") or "posts"
-        dias_metrica = resultado.get("metricool_metrica_dias") or 30
-        if not marca_metrica:
-            enviar_texto(
-                numero,
-                f"Entendi que é sobre métricas do cliente \"{nome_cliente_metrica}\", mas não achei "
-                "essa marca cadastrada no Metricool. Pode confirmar o nome certinho?",
-            )
-        else:
-            responder(metricool_responder_metricas(marca_metrica, rede_metrica, tipo_metrica, dias_metrica))
-    elif resultado.get("eh_dica_resposta_cliente") and resultado.get("dica_resposta_sugerida"):
-        nome_mencionado_dica = resultado.get("dica_cliente_nome") or ""
-        candidatos_dica = identificar_grupos_candidatos(nome_mencionado_dica)
-        if not candidatos_dica:
-            responder(
-                f"Entendi que é uma dica de resposta pro cliente \"{nome_mencionado_dica}\", mas "
-                "não achei esse cliente cadastrado. Pode confirmar o nome certinho?"
-            )
-        elif len(candidatos_dica) > 1:
-            nomes_candidatos_dica = ", ".join(GRUPOS[jid]["nome"] for jid in candidatos_dica)
-            responder(
-                f"Encontrei mais de um cliente relacionado a \"{nome_mencionado_dica}\": "
-                f"{nomes_candidatos_dica}. Pra qual deles é essa resposta?"
-            )
-        else:
-            grupo_jid_dica = candidatos_dica[0]
-            grupo_nome_dica = GRUPOS[grupo_jid_dica]["nome"]
-            pergunta_cliente_dica = resultado.get("dica_pergunta_cliente") or ""
-            resposta_bruta_dica = resultado["dica_resposta_sugerida"]
-            try:
-                resultado_correcao = chamar_claude(SYSTEM_PROMPT_CORRECAO_CONSERVADORA, resposta_bruta_dica)
-                resposta_corrigida_dica = resultado_correcao.get("texto_corrigido") or resposta_bruta_dica
-            except Exception as e:
-                print(f"[dica_resposta_cliente] erro ao corrigir texto, usando o original: {e}", flush=True)
-                resposta_corrigida_dica = resposta_bruta_dica
-            # Igual ao "passa pra Tripa": nunca envia direto pro cliente, sempre mostra a previa e
-            # so manda depois de "sim" - grupo de cliente e mais sensivel ainda que o Tripa, pedido
-            # explicito do Torres pra fechar o loop sozinha so com aprovacao antes.
-            _comandos_pendentes[pessoa] = {
-                "mensagem_tripa": resposta_corrigida_dica,
-                "tem_cobranca": False,
-                "horario_cobranca": None,
-                "pergunta_cobranca": "",
-                "criado_em": time.time(),
-                "eh_resposta_cliente": True,
-                "jid_destino": grupo_jid_dica,
-                "cliente_nome_resposta": grupo_nome_dica,
-                "pergunta_cliente_resposta": pergunta_cliente_dica,
-            }
-            responder(
-                f"Ficou assim pra mandar pro {grupo_nome_dica}:\n\n\"{resposta_corrigida_dica}\"\n\n"
-                "Confirma que posso mandar? (responde \"sim\" ou \"não\")"
-            )
-    elif resultado.get("eh_comando_para_grupo_cliente") and resultado.get("texto_comando_grupo_cliente"):
-        # Round 27, bug real reportado pelo Torres: ele ditou um texto pronto (aviso de feriado)
-        # e pediu pra mandar no grupo do Zurca - a Cintia respondeu "vou enviar"/"combinado, vou
-        # enviar" DUAS vezes seguidas, mas nao tinha NENHUM mecanismo de verdade por tras disso
-        # (confirmado nos logs: todos os campos da classificacao vieram vazios/false, so caiu no
-        # "resposta_conversa" generico) - ela so prometeu, sem enviar nada, exatamente o tipo de
-        # promessa vazia que o round 23 ja tinha identificado como problema. Diferente da "dica de
-        # resposta pro cliente" (tipo 11, que responde uma pergunta que o cliente fez), aqui e um
-        # comunicado que a equipe decidiu mandar por conta propria. Reaproveita o MESMO mecanismo
-        # de confirmacao da dica de resposta (mesmas chaves em _comandos_pendentes) - grupo de
-        # cliente e sensivel demais pra sair sem revisao, pelo mesmo motivo de sempre.
-        nome_mencionado_comando_grupo = (resultado.get("grupo_cliente_comando_nome") or "").strip()
-        texto_bruto_comando_grupo = resultado["texto_comando_grupo_cliente"]
-        if not nome_mencionado_comando_grupo:
-            responder(
-                f"Anotei o texto que você quer mandar:\n\n\"{texto_bruto_comando_grupo}\"\n\n"
-                "Pra qual grupo/cliente é?"
-            )
-        else:
-            candidatos_comando_grupo = identificar_grupos_candidatos(nome_mencionado_comando_grupo)
-            if not candidatos_comando_grupo:
                 responder(
-                    f"Entendi que é pra mandar uma mensagem pro grupo \"{nome_mencionado_comando_grupo}\", mas "
-                    "não achei esse cliente cadastrado. Pode confirmar o nome certinho?"
+                    "Não achei nenhuma tarefa pendente que bata com isso pra marcar como feita. "
+                    "Pode me lembrar melhor qual era?"
                 )
-            elif len(candidatos_comando_grupo) > 1:
-                nomes_candidatos_comando_grupo = ", ".join(GRUPOS[jid]["nome"] for jid in candidatos_comando_grupo)
-                responder(
-                    f"Encontrei mais de um cliente relacionado a \"{nome_mencionado_comando_grupo}\": "
-                    f"{nomes_candidatos_comando_grupo}. Pra qual deles é essa mensagem?"
-                )
-            else:
-                grupo_jid_comando = candidatos_comando_grupo[0]
-                grupo_nome_comando = GRUPOS[grupo_jid_comando]["nome"]
-                try:
-                    resultado_correcao_comando = chamar_claude(SYSTEM_PROMPT_CORRECAO_CONSERVADORA, texto_bruto_comando_grupo)
-                    texto_corrigido_comando_grupo = resultado_correcao_comando.get("texto_corrigido") or texto_bruto_comando_grupo
-                except Exception as e:
-                    print(f"[comando_para_grupo_cliente] erro ao corrigir texto, usando o original: {e}", flush=True)
-                    texto_corrigido_comando_grupo = texto_bruto_comando_grupo
-                _comandos_pendentes[pessoa] = {
-                    "mensagem_tripa": texto_corrigido_comando_grupo,
-                    "tem_cobranca": False,
-                    "horario_cobranca": None,
-                    "pergunta_cobranca": "",
-                    "criado_em": time.time(),
-                    "eh_resposta_cliente": True,
-                    "jid_destino": grupo_jid_comando,
-                    "cliente_nome_resposta": grupo_nome_comando,
-                    "pergunta_cliente_resposta": "",
-                }
-                responder(
-                    f"Ficou assim pra mandar pro {grupo_nome_comando}:\n\n\"{texto_corrigido_comando_grupo}\"\n\n"
-                    "Confirma que posso mandar? (responde \"sim\" ou \"não\")"
-                )
-    elif resultado.get("eh_comando_para_compor_aviso_cliente") and resultado.get("instrucao_aviso_cliente"):
-        # Round 27 (parte 2): Torres reclamou "você mudou o meu texto e você tem que analisar o
-        # texto que enviei pra adaptar e não mudar", num caso onde ele tinha pedido pra COMPOR um
-        # aviso (não ditado um texto pronto - isso é o tipo 14 acima), e pediu explicitamente que as
-        # respostas sejam sempre o mais humanizadas possível. Diferente da correção conservadora
-        # (que não reescreve nada), aqui reescrever É o pedido - o cuidado precisa ser especificamente
-        # em nunca mudar o CONTEÚDO/CONTEXTO do que foi descrito (só a forma de escrever), e em soar
-        # como uma pessoa de verdade, não com cara de texto gerado por IA (SYSTEM_PROMPT_COMPOR_AVISO_
-        # CLIENTE cobre os dois pontos explicitamente). Reaproveita o MESMO pipeline de confirmação/
-        # envio dos tipos 11/14 - continua exigindo "sim" explícito antes de mandar pro grupo do
-        # cliente, e se faltar informação essencial pra escrever com segurança, pergunta em vez de
-        # supor (mesmo espírito da dica de resposta e do briefing pra Tripa).
-        pessoa_nome_compor = "Torres" if pessoa == "torres" else "Luan"
-        nome_mencionado_compor = (resultado.get("grupo_cliente_compor_nome") or "").strip()
-        instrucao_compor = resultado["instrucao_aviso_cliente"]
-        if not nome_mencionado_compor:
-            responder(
-                f"Entendi o que você quer comunicar:\n\n\"{instrucao_compor}\"\n\n"
-                "Pra qual grupo/cliente é?"
-            )
-        else:
-            candidatos_compor = identificar_grupos_candidatos(nome_mencionado_compor)
-            if not candidatos_compor:
-                responder(
-                    f"Entendi que é pra avisar o cliente \"{nome_mencionado_compor}\", mas não achei "
-                    "esse cliente cadastrado. Pode confirmar o nome certinho?"
-                )
-            elif len(candidatos_compor) > 1:
-                nomes_candidatos_compor = ", ".join(GRUPOS[jid]["nome"] for jid in candidatos_compor)
-                responder(
-                    f"Encontrei mais de um cliente relacionado a \"{nome_mencionado_compor}\": "
-                    f"{nomes_candidatos_compor}. Pra qual deles é esse aviso?"
-                )
-            else:
-                grupo_jid_compor = candidatos_compor[0]
-                grupo_nome_compor = GRUPOS[grupo_jid_compor]["nome"]
-                # Bug real reportado por Torres (round 27 parte 17): essa etapa compunha o aviso
-                # olhando SÓ pra "instrucao_compor" (o que o classificador principal conseguiu
-                # extrair da mensagem atual), sem NENHUM acesso ao histórico da conversa - quando
-                # a instrução se referia a algo dito antes ("essa informação", "isso que eu
-                # falei"), essa etapa não tinha como resolver a referência (ela nunca via o
-                # histórico) e ficava em loop pedindo o mesmo esclarecimento, mesmo depois de
-                # Torres repetir/colar a mensagem original de novo. Agora recebe o MESMO
-                # contexto_conversa (últimas mensagens + busca antiga) que o classificador
-                # principal já usa, pra poder resolver essas referências sozinha.
-                contexto_conversa_bloco_compor = (
-                    f"\n{contexto_conversa}" if contexto_conversa else ""
-                )
-                try:
-                    # thinking_budget (round 27 parte 17, mesmo pedido de Torres) - agora que
-                    # essa etapa recebe o historico da conversa (fix logo acima), ela tambem
-                    # precisa de espaco pra deliberar antes de decidir se a referencia foi
-                    # resolvida com seguranca ou se e melhor preencher "duvida" - mesmo mecanismo
-                    # ja usado no classificador principal desde o round 24.
-                    resultado_compor = chamar_claude(
-                        SYSTEM_PROMPT_COMPOR_AVISO_CLIENTE.format(
-                            pessoa_nome=pessoa_nome_compor,
-                            contexto_conversa_bloco=contexto_conversa_bloco_compor,
-                        ),
-                        instrucao_compor,
-                        thinking_budget=2000,
-                    )
-                except Exception as e:
-                    print(f"[comando_para_compor_aviso_cliente] erro ao compor texto: {e}", flush=True)
-                    resultado_compor = {}
-                duvida_compor = (resultado_compor.get("duvida") or "").strip()
-                texto_final_compor = (resultado_compor.get("texto_final") or "").strip()
-                if not texto_final_compor:
-                    responder(
-                        duvida_compor or
-                        "Tive um problema pra escrever esse aviso agora, pode tentar de novo em instantes?"
-                    )
-                else:
-                    _comandos_pendentes[pessoa] = {
-                        "mensagem_tripa": texto_final_compor,
-                        "tem_cobranca": False,
-                        "horario_cobranca": None,
-                        "pergunta_cobranca": "",
-                        "criado_em": time.time(),
-                        "eh_resposta_cliente": True,
-                        "jid_destino": grupo_jid_compor,
-                        "cliente_nome_resposta": grupo_nome_compor,
-                        "pergunta_cliente_resposta": "",
-                    }
-                    responder(
-                        f"Ficou assim pra mandar pro {grupo_nome_compor}:\n\n\"{texto_final_compor}\"\n\n"
-                        "Confirma que posso mandar? (responde \"sim\" ou \"não\")"
-                    )
-    elif resultado.get("eh_comando_repassar_para_pessoa") and resultado.get("pessoa_destino_repasse"):
-        # Round 27 parte 18, bug real reportado por Torres (prints do WhatsApp): ele pediu pra
-        # repassar pro Luan uma mensagem PONTUAL de um cliente (Augusto, grupo House e Co),
-        # perguntando o que fazer - o classificador tratou isso como pedido de MUDANCA DE
-        # SISTEMA (regra permanente) porque nao existia NENHUM comando pra "repasse pontual" -
-        # "nada do que pedi foi feito", nas palavras dele. Esse tipo (16) e exatamente essa
-        # acao: pegar a ultima mensagem relevante de um grupo de cliente e mandar pro
-        # Luan/Torres perguntando o que fazer, SEM virar regra nenhuma. Sempre passa por
-        # confirmacao antes de mandar pra pessoa (mesmo padrao de sempre) - ver o branch
-        # "eh_repasse_pessoa" no bloco de confirmacao (_comandos_pendentes) mais acima.
-        pessoa_destino_repasse = (resultado.get("pessoa_destino_repasse") or "").strip().lower()
-        numero_destino_repasse, nome_destino_repasse = {
-            "torres": (TORRES_NUMBER, "Torres"),
-            "luan": (LUAN_NUMBER, "Luan"),
-        }.get(pessoa_destino_repasse, (None, None))
-        nome_grupo_repasse_mencionado = (resultado.get("grupo_cliente_repasse_nome") or "").strip()
-        if not numero_destino_repasse:
-            responder(
-                "Entendi que é pra repassar isso pra alguém, mas não identifiquei se é pro "
-                "Torres ou pro Luan. Pode confirmar?"
-            )
-        elif numero_destino_repasse == numero:
-            # Pediu pra repassar pra si mesmo - nao faz sentido, evita mandar a mensagem de volta
-            # pra quem acabou de pedir.
-            responder("Você já está vendo essa mensagem aqui - quer que eu repasse pra outra pessoa?")
-        elif not nome_grupo_repasse_mencionado:
-            responder(
-                "Entendi que é pra repassar uma mensagem, mas não identifiquei de qual grupo/cliente. "
-                "Pode confirmar o nome?"
-            )
-        else:
-            candidatos_repasse = identificar_grupos_candidatos(nome_grupo_repasse_mencionado)
-            if not candidatos_repasse:
-                responder(
-                    f"Entendi que é pra repassar algo do grupo \"{nome_grupo_repasse_mencionado}\", mas não "
-                    "achei esse cliente cadastrado. Pode confirmar o nome certinho?"
-                )
-            elif len(candidatos_repasse) > 1:
-                nomes_candidatos_repasse = ", ".join(GRUPOS[jid]["nome"] for jid in candidatos_repasse)
-                responder(
-                    f"Encontrei mais de um cliente relacionado a \"{nome_grupo_repasse_mencionado}\": "
-                    f"{nomes_candidatos_repasse}. De qual deles é a mensagem?"
-                )
-            else:
-                grupo_jid_repasse = candidatos_repasse[0]
-                grupo_nome_repasse = GRUPOS[grupo_jid_repasse]["nome"]
-                mensagens_recentes_repasse = buscar_mensagens_recentes_grupo(grupo_jid_repasse, limite=15)
-                mensagens_cliente_repasse = [m for m in mensagens_recentes_repasse if not m.get("eh_equipe")]
-                if not mensagens_cliente_repasse:
-                    responder(
-                        f"Não achei nenhuma mensagem recente do cliente no {grupo_nome_repasse} pra repassar. "
-                        "Pode colar o texto exato que você quer que eu mande?"
-                    )
-                else:
-                    texto_mensagem_repasse = mensagens_cliente_repasse[-1]["conteudo"]
-                    instrucao_repasse = (resultado.get("instrucao_repasse") or "").strip() or "O que você acha, como seguimos?"
-                    _comandos_pendentes[pessoa] = {
-                        "mensagem_tripa": "", "tem_cobranca": False, "horario_cobranca": None, "pergunta_cobranca": "",
-                        "criado_em": time.time(),
-                        "eh_repasse_pessoa": True,
-                        "numero_destino_repasse": numero_destino_repasse,
-                        "nome_destino_repasse": nome_destino_repasse,
-                        "grupo_nome_repasse": grupo_nome_repasse,
-                        "texto_mensagem_repasse": texto_mensagem_repasse,
-                        "instrucao_repasse": instrucao_repasse,
-                    }
-                    responder(
-                        f"Vou mandar pro {nome_destino_repasse} isso do {grupo_nome_repasse}:\n\n"
-                        f"\"{texto_mensagem_repasse}\"\n\ncom a pergunta: \"{instrucao_repasse}\"\n\n"
-                        "Confirma? (responde \"sim\" ou \"não\")"
-                    )
     elif resultado.get("eh_marcar_fato_resolvido") and resultado.get("fato_resolvido_referencia"):
-        # Round 27 parte 18: complementa o tipo "eh_fato_para_lembrar" - agora Torres/Luan
-        # tambem conseguem avisar que um fato antigo ja NAO vale mais (ex: uma decisao pontual
-        # que foi superada), pra ele parar de ser injetado como "FATOS QUE VOCE JA SABE" em toda
-        # mensagem futura e competir por atencao com o que e realmente atual. Sempre responde a
-        # verdade sobre o que foi encontrado (ou nao), nunca finge sucesso.
+        # Round 27 parte 18: complementa o tipo "eh_fato_para_lembrar" - Torres tambem consegue
+        # avisar que um fato antigo ja NAO vale mais (ex: uma decisao pontual que foi superada),
+        # pra ele parar de ser injetado como "FATOS QUE VOCE JA SABE" em toda mensagem futura e
+        # competir por atencao com o que e realmente atual. Sempre responde a verdade sobre o que
+        # foi encontrado (ou nao), nunca finge sucesso.
         fato_marcado = marcar_fato_resolvido(resultado["fato_resolvido_referencia"])
         if fato_marcado:
             responder(f"Beleza, marquei esse fato como resolvido/superado: \"{fato_marcado}\" ✅")
@@ -6906,187 +6393,23 @@ def processar_dm(remote_jid, key, data):
                 "Não achei nenhum fato ativo guardado que bata com isso pra marcar como "
                 "resolvido. Pode me lembrar melhor qual era o fato?"
             )
-    elif resultado.get("eh_marcar_pedido_concluido"):
-        # Torres/Luan avisando que um pedido de arte pendente ja foi resolvido/feito - o caso
-        # mais comum e uma referencia curta ("esse ja foi resolvido") logo depois da propria
-        # Cintia ter citado o pedido (ex: no resumo de fim de expediente), entao o classificador
-        # ja tenta resolver "esse"/"isso" usando o contexto da conversa antes de chegar aqui. So
-        # perguntamos de novo quando sobra mais de uma possibilidade real (round 24 - antes disso
-        # ela ficava perguntando "qual card?" mesmo com um so pedido em aberto, obrigando repetir).
-        #
-        # Round 27 (parte 4, bug real com print): quando havia 2+ pedidos pendentes, uma
-        # referencia PLURAL ("os dois", "os dois pedidos") nao batia com nome nenhum de
-        # cliente, entao caia sempre no ramo de ambiguidade e ficava repetindo a MESMA
-        # pergunta "qual deles?" pra sempre, mesmo Torres respondendo repetidas vezes. E
-        # quando ele citava os dois nomes na mesma frase ("o grupo lembrete e o do zurca"),
-        # o classificador colocava os dois nomes juntos num "pedido_cliente_referencia" so
-        # (ex: "Grupo lembrete (TESTE) e Zurca"), que nao batia com NENHUM cliente cadastrado
-        # - ela respondia "não achei" com os dois nomes colados, sem fechar nenhum dos dois.
-        # Agora: referencia plural generica fecha TODOS os pedidos pendentes de uma vez
-        # (eh_marcar_todos_pedidos_pendentes), e uma referencia com varios nomes juntos e
-        # separada e resolvida um a um, em vez de tratada como um nome so.
-        marcar_todos_pendentes = bool(resultado.get("eh_marcar_todos_pedidos_pendentes"))
-        nome_pedido_ref = (resultado.get("pedido_cliente_referencia") or "").strip()
-
-        if marcar_todos_pendentes:
-            pendentes_agora = listar_tarefas_pendentes()
-            if not pendentes_agora:
-                responder("Não achei nenhum pedido em aberto agora pra marcar como resolvido - já deve estar tudo certo por aqui.")
-            else:
-                nomes_fechados = []
-                for tarefa in pendentes_agora:
-                    adicionar_evento_tarefa(
-                        tarefa["id"], "concluido_manual",
-                        f"Marcado como resolvido manualmente por {pessoa}",
-                        autor=pessoa, novo_status=STATUS_CONCLUIDO,
-                    )
-                    nomes_fechados.append(tarefa.get("cliente_nome"))
-                responder(f"Perfeito, marquei como resolvido: {', '.join(nomes_fechados)}. ✅")
-        elif not nome_pedido_ref:
-            pendentes_agora = listar_tarefas_pendentes()
-            if not pendentes_agora:
-                responder("Não achei nenhum pedido em aberto agora pra marcar como resolvido - já deve estar tudo certo por aqui.")
-            elif len(pendentes_agora) == 1:
-                tarefa_unica = pendentes_agora[0]
-                adicionar_evento_tarefa(
-                    tarefa_unica["id"], "concluido_manual",
-                    f"Marcado como resolvido manualmente por {pessoa}",
-                    autor=pessoa, novo_status=STATUS_CONCLUIDO,
-                )
-                responder(f"Perfeito. Vou considerar o pedido do {tarefa_unica.get('cliente_nome')} como resolvido. ✅")
-            else:
-                opcoes_pendentes = ", ".join(
-                    f"{t.get('cliente_nome')} ({_STATUS_LEGIVEL.get(t.get('status'), t.get('status'))})"
-                    for t in pendentes_agora
-                )
-                responder(
-                    f"Tem mais de um pedido em aberto agora, qual deles: {opcoes_pendentes}? "
-                    "(pode responder com os nomes ou dizer \"todos\"/\"os dois\")"
-                )
-        else:
-            nomes_referenciados = [
-                n.strip() for n in re.split(r"\s*(?:,| e | & )\s*", nome_pedido_ref) if n.strip()
-            ]
-            if len(nomes_referenciados) > 1:
-                # Mais de um nome citado na mesma mensagem - resolve cada um
-                # independentemente, em vez de tratar a frase toda como um nome de cliente só.
-                fechados, nao_encontrados = [], []
-                for nome_ref in nomes_referenciados:
-                    candidatos_ref = identificar_grupos_candidatos(nome_ref)
-                    nome_cliente_ref = GRUPOS[candidatos_ref[0]]["nome"] if len(candidatos_ref) == 1 else nome_ref
-                    tarefa_ref = buscar_tarefa_pendente_por_cliente(nome_cliente_ref)
-                    if tarefa_ref:
-                        adicionar_evento_tarefa(
-                            tarefa_ref["id"], "concluido_manual",
-                            f"Marcado como resolvido manualmente por {pessoa}",
-                            autor=pessoa, novo_status=STATUS_CONCLUIDO,
-                        )
-                        fechados.append(nome_cliente_ref)
-                    else:
-                        nao_encontrados.append(nome_cliente_ref)
-                partes_resposta = []
-                if fechados:
-                    partes_resposta.append(f"Marquei como resolvido: {', '.join(fechados)}. ✅")
-                if nao_encontrados:
-                    partes_resposta.append(
-                        f"Não achei pedido em aberto de: {', '.join(nao_encontrados)} - já deve "
-                        "estar concluído, ou é outro cliente?"
-                    )
-                responder(" ".join(partes_resposta))
-            else:
-                candidatos_pedido = identificar_grupos_candidatos(nome_pedido_ref)
-                nome_cliente_pedido = GRUPOS[candidatos_pedido[0]]["nome"] if len(candidatos_pedido) == 1 else nome_pedido_ref
-                tarefa_referenciada = buscar_tarefa_pendente_por_cliente(nome_cliente_pedido)
-                if not tarefa_referenciada:
-                    responder(
-                        f"Não achei nenhum pedido em aberto do {nome_cliente_pedido} pra marcar como "
-                        "resolvido - já deve estar concluído, ou é outro cliente?"
-                    )
-                else:
-                    adicionar_evento_tarefa(
-                        tarefa_referenciada["id"], "concluido_manual",
-                        f"Marcado como resolvido manualmente por {pessoa}",
-                        autor=pessoa, novo_status=STATUS_CONCLUIDO,
-                    )
-                    responder(f"Perfeito. Vou considerar o pedido do {nome_cliente_pedido} como resolvido. ✅")
     elif resultado.get("eh_pedido_de_audio") and resultado.get("texto_audio"):
         # Round 25, pedido do Torres: só manda nota de voz (com onda sonora, como se alguém
-        # tivesse gravado ali na hora) quando ELE ou o Luan pedirem explicitamente - nunca
-        # decide sozinha trocar texto por áudio. Pra pessoa (você mesmo ou o outro da equipe)
-        # sai na hora, sem confirmar (baixo risco, fica só entre vocês); Tripa e grupo de
-        # cliente passam por confirmação antes, igual ao "passa pra Tripa" e à "dica de
-        # resposta pro cliente" - grupo de cliente é sensível demais pra sair sem revisão, e
-        # gerar áudio tem custo (ElevenLabs cobra por caractere). Depois de mandar pra uma
-        # pessoa, SEMPRE avisa quem pediu com um texto de confirmação (pedido explícito do
-        # Torres - antes disso o áudio saía mudo, sem nenhuma confirmação em texto).
+        # tivesse gravado ali na hora) quando ele pedir explicitamente - nunca decide sozinha
+        # trocar texto por áudio. Round 27 parte 22: agora que ela só fala com ele mesmo, o
+        # áudio só pode ter um destino (ele mesmo, aqui na conversa) - sai direto, sem
+        # confirmação (baixo risco, é só ele vendo).
         texto_para_audio = resultado["texto_audio"]
-        destino_audio = (resultado.get("destino_audio") or "privado").strip().lower()
-        numero_pessoa_audio, nome_pessoa_audio = {
-            "torres": (TORRES_NUMBER, "Torres"),
-            "luan": (LUAN_NUMBER, "Luan"),
-        }.get(destino_audio, (None, None))
-        if destino_audio in ("privado", "eu", "mim", "aqui", "") or numero_pessoa_audio == numero:
-            # É pra quem tá pedindo mesmo - seja porque pediu "manda pra mim", seja porque
-            # pediu "manda pro Torres" sendo o próprio Torres quem tá pedindo.
-            audio_b64 = gerar_audio_elevenlabs(texto_para_audio)
-            if not audio_b64:
-                responder(
-                    "Não consegui gerar o áudio agora (serviço de voz não respondeu ou não está "
-                    f"configurado) - aqui vai em texto mesmo:\n\n{texto_para_audio}"
-                )
-            elif not enviar_audio(numero, audio_b64):
-                responder(f"Gerei o áudio mas não consegui enviar - aqui vai em texto mesmo:\n\n{texto_para_audio}")
-            else:
-                responder("Prontinho, te mandei o áudio! 🎙️")
-        elif numero_pessoa_audio:
-            # Pedido pra mandar áudio pro OUTRO da equipe (ex: Torres pedindo pra mandar pro
-            # Luan) - sai direto também (é só entre vocês dois), mas sempre confirma pra quem
-            # pediu que o áudio foi mandado de verdade.
-            audio_b64 = gerar_audio_elevenlabs(texto_para_audio)
-            if not audio_b64:
-                responder(
-                    f"Não consegui gerar o áudio agora (serviço de voz não respondeu) - aqui vai o "
-                    f"texto que era pra mandar pro {nome_pessoa_audio}:\n\n{texto_para_audio}"
-                )
-            elif not enviar_audio(numero_pessoa_audio, audio_b64):
-                responder(f"Gerei o áudio mas não consegui enviar pro {nome_pessoa_audio} - não mandei nada.")
-            else:
-                responder(f"Prontinho, mandei o áudio pro {nome_pessoa_audio}! 🎙️")
-        elif destino_audio == "tripa":
-            _comandos_pendentes[pessoa] = {
-                "mensagem_tripa": "", "tem_cobranca": False, "horario_cobranca": None, "pergunta_cobranca": "",
-                "criado_em": time.time(),
-                "eh_pedido_audio": True,
-                "jid_destino_audio": TRIPA_DESIGNER_JID,
-                "texto_audio_pendente": texto_para_audio,
-                "nome_destino_audio": "Tripa",
-            }
+        audio_b64 = gerar_audio_elevenlabs(texto_para_audio)
+        if not audio_b64:
             responder(
-                f"Vou gerar e mandar um áudio pra Tripa dizendo:\n\n\"{texto_para_audio}\"\n\n"
-                "Confirma que posso mandar? (responde \"sim\" ou \"não\")"
+                "Não consegui gerar o áudio agora (serviço de voz não respondeu ou não está "
+                f"configurado) - aqui vai em texto mesmo:\n\n{texto_para_audio}"
             )
+        elif not enviar_audio(numero, audio_b64):
+            responder(f"Gerei o áudio mas não consegui enviar - aqui vai em texto mesmo:\n\n{texto_para_audio}")
         else:
-            candidatos_audio = identificar_grupos_candidatos(destino_audio)
-            if not candidatos_audio:
-                responder(f"Não achei o cliente/grupo \"{destino_audio}\" pra mandar esse áudio. Pode confirmar o nome certinho?")
-            elif len(candidatos_audio) > 1:
-                nomes_candidatos_audio = ", ".join(GRUPOS[jid]["nome"] for jid in candidatos_audio)
-                responder(f"Encontrei mais de um cliente relacionado a \"{destino_audio}\": {nomes_candidatos_audio}. Pra qual deles é esse áudio?")
-            else:
-                jid_audio = candidatos_audio[0]
-                nome_audio = GRUPOS[jid_audio]["nome"]
-                _comandos_pendentes[pessoa] = {
-                    "mensagem_tripa": "", "tem_cobranca": False, "horario_cobranca": None, "pergunta_cobranca": "",
-                    "criado_em": time.time(),
-                    "eh_pedido_audio": True,
-                    "jid_destino_audio": jid_audio,
-                    "texto_audio_pendente": texto_para_audio,
-                    "nome_destino_audio": nome_audio,
-                }
-                responder(
-                    f"Vou gerar e mandar um áudio pro {nome_audio} dizendo:\n\n\"{texto_para_audio}\"\n\n"
-                    "Confirma que posso mandar? (responde \"sim\" ou \"não\")"
-                )
+            responder("Prontinho, te mandei o áudio! 🎙️")
     elif tinha_pendente:
         responder("Combinado, marquei como resolvido! ✅")
     else:
@@ -7203,6 +6526,24 @@ def _processar_evento_webhook(data, origem="evolution"):
 
     if not msg_id or already_processed(msg_id):
         return jsonify({"ok": True, "skipped": "duplicado"})
+
+    # Modo assistente pessoal (pedido explícito do Torres): a Cintia não é mais assistente
+    # de nenhum grupo (cliente, Tripa Designer, Correria - Gestão ou qualquer grupo não
+    # cadastrado) e não fala mais com o Luan em lugar nenhum - só responde no privado dele
+    # (TORRES_NUMBER). Esse gate roda ANTES de qualquer função de negócio, então nenhuma
+    # das funções de grupo/Luan abaixo chega a ser chamada a partir daqui - a mensagem
+    # ainda é dispensada de forma limpa (200 OK, "skipped"), nunca um erro.
+    if MODO_ASSISTENTE_PESSOAL:
+        eh_grupo = (
+            remote_jid == TRIPA_DESIGNER_JID
+            or remote_jid == GESTAO_JID
+            or remote_jid in GRUPOS
+            or remote_jid.endswith("@g.us")
+        )
+        if eh_grupo:
+            return jsonify({"ok": True, "skipped": "modo assistente pessoal: grupos desativados"})
+        if not numero_bate(remote_jid, TORRES_NUMBER):
+            return jsonify({"ok": True, "skipped": "modo assistente pessoal: só responde ao número do Torres"})
 
     try:
         if remote_jid == TRIPA_DESIGNER_JID:
