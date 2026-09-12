@@ -400,6 +400,21 @@ def init_db():
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_compromissos_agenda_data ON compromissos_agenda (data_hora)"
             )
+            # Round 27 parte 24: sincronismo com o app de Mac "Lembrete da Lagobada" (pedido do
+            # Torres - ele tem um app local no Mac com listas de Lembretes/Tarefas e queria que
+            # elas conversassem com a Cintia nos dois sentidos). Pra isso, tarefas_pessoais e
+            # compromissos_agenda precisam de "atualizado_em" (pra sincronismo incremental via
+            # "desde quando mudou algo") e "excluido" (soft delete - exclusão no app precisa
+            # refletir aqui sem apagar linha, já que o histórico dessas tabelas nunca foi
+            # apagado de propósito no resto do sistema). lembretes_agendados só precisa de
+            # "atualizado_em" (exclusão nesse tipo já é coberta pelo "resolvido" existente,
+            # ver `_lagobada_listar_itens_desde`).
+            cur.execute("ALTER TABLE tarefas_pessoais ADD COLUMN IF NOT EXISTS atualizado_em TIMESTAMPTZ NOT NULL DEFAULT now()")
+            cur.execute("ALTER TABLE tarefas_pessoais ADD COLUMN IF NOT EXISTS excluido BOOLEAN NOT NULL DEFAULT false")
+            cur.execute("ALTER TABLE compromissos_agenda ADD COLUMN IF NOT EXISTS atualizado_em TIMESTAMPTZ NOT NULL DEFAULT now()")
+            cur.execute("ALTER TABLE compromissos_agenda ADD COLUMN IF NOT EXISTS excluido BOOLEAN NOT NULL DEFAULT false")
+            cur.execute("ALTER TABLE compromissos_agenda ADD COLUMN IF NOT EXISTS concluido BOOLEAN NOT NULL DEFAULT false")
+            cur.execute("ALTER TABLE lembretes_agendados ADD COLUMN IF NOT EXISTS atualizado_em TIMESTAMPTZ NOT NULL DEFAULT now()")
         print(f"[init_db] banco de dados pronto (schema '{DB_SCHEMA}', tabelas tarefas/tarefas_eventos/regras_atendimento/fatos_memoria/mensagens_grupo/fatos_cliente/fatos_cliente_historico/pedidos_mudanca/lembretes_agendados/tarefas_pessoais/compromissos_agenda)", flush=True)
     except Exception as e:
         print(f"[init_db] erro ao inicializar banco de dados: {e}", flush=True)
@@ -910,7 +925,7 @@ def listar_tarefas_pessoais_pendentes():
     try:
         with db_cursor() as cur:
             cur.execute(
-                "SELECT * FROM tarefas_pessoais WHERE status != 'CONCLUIDA' ORDER BY criado_em ASC"
+                "SELECT * FROM tarefas_pessoais WHERE status != 'CONCLUIDA' AND NOT excluido ORDER BY criado_em ASC"
             )
             return cur.fetchall()
     except Exception as e:
@@ -926,14 +941,14 @@ def marcar_tarefa_pessoal_concluida(termo_busca):
         with db_cursor(commit=True) as cur:
             cur.execute(
                 "SELECT id, descricao FROM tarefas_pessoais WHERE status != 'CONCLUIDA' "
-                "AND descricao ILIKE %s ORDER BY criado_em DESC LIMIT 1",
+                "AND NOT excluido AND descricao ILIKE %s ORDER BY criado_em DESC LIMIT 1",
                 (f"%{termo_busca}%",),
             )
             linha = cur.fetchone()
             if not linha:
                 return None
             cur.execute(
-                "UPDATE tarefas_pessoais SET status = 'CONCLUIDA', concluido_em = now() WHERE id = %s",
+                "UPDATE tarefas_pessoais SET status = 'CONCLUIDA', concluido_em = now(), atualizado_em = now() WHERE id = %s",
                 (linha["id"],),
             )
             return linha["descricao"]
@@ -1052,13 +1067,219 @@ def listar_compromissos_periodo(inicio, fim):
         with db_cursor() as cur:
             cur.execute(
                 "SELECT descricao, data_hora, tem_horario FROM compromissos_agenda "
-                "WHERE data_hora >= %s AND data_hora < %s ORDER BY data_hora ASC",
+                "WHERE data_hora >= %s AND data_hora < %s AND NOT excluido ORDER BY data_hora ASC",
                 (inicio, fim),
             )
             return cur.fetchall()
     except Exception as e:
         print(f"[listar_compromissos_periodo] erro: {e}", flush=True)
         return []
+
+
+# ============================================================================
+# Round 27 parte 24: sincronismo com o app de Mac "Lembrete da Lagobada" (nos dois
+# sentidos, pedido explícito do Torres - lembretes avulsos, agenda e tarefas pessoais).
+# Protocolo simples de "puxar o que mudou desde X" (cursor por timestamp) + "empurrar o
+# que mudou localmente" (upsert por sync_id), sem fila/broker - já que são só 2 clientes
+# (Cintia e o app do Mac) e o volume é baixo (uso pessoal).
+#
+# Mapeamento de listas (decisão explicada ao Torres, não é 1:1 óbvio):
+# - Tarefas pessoais (tarefas_pessoais) <-> aba "Tarefas" do app: direto, sem data dos
+#   dois lados (o campo de data que o app tem na aba Tarefas não é sincronizado - Cintia
+#   não tem esse conceito pra tarefa).
+# - Agenda (compromissos_agenda) <-> aba "Lembretes" do app: um compromisso sempre tem
+#   data, então só sincroniza lembrete do app que tenha data marcada (item sem data fica
+#   só local). Esse é o único tipo que o app pode CRIAR do lado dele.
+# - Lembrete avulso (lembretes_agendados, só os NÃO recorrentes e com data marcada) entra
+#   só de LEITURA no app (aparece na aba Lembretes pra você ver, e marcar como feito lá
+#   também marca resolvido de verdade aqui) - o app não cria esse tipo, porque ele tem
+#   comportamento (aviso 10 min antes + cobrança a cada 30min) que o app não representa.
+# ============================================================================
+
+LAGOBADA_SYNC_TOKEN = os.environ.get("LAGOBADA_SYNC_TOKEN", "")
+
+
+def _lagobada_autenticado(req):
+    """Sincronismo é leitura+ESCRITA (diferente dos paineis de debug, que só leem) -
+    por isso, ao contrário do DEBUG_TOKEN, sem token configurado o endpoint fica
+    DESATIVADO (403 sempre), nunca aberto por padrão."""
+    if not LAGOBADA_SYNC_TOKEN:
+        return False
+    auth = req.headers.get("Authorization", "")
+    token = auth[7:].strip() if auth.startswith("Bearer ") else req.args.get("token", "")
+    return token == LAGOBADA_SYNC_TOKEN
+
+
+def _lagobada_item_tarefa(row):
+    return {
+        "sync_id": f"tarefa:{row['id']}",
+        "lista": "tarefas",
+        "titulo": row["descricao"],
+        "data_iso": None,
+        "observacao": "",
+        "concluido": row["status"] == "CONCLUIDA",
+        "excluido": row["excluido"],
+        "atualizado_em": row["atualizado_em"].isoformat(),
+    }
+
+
+def _lagobada_item_agenda(row):
+    return {
+        "sync_id": f"agenda:{row['id']}",
+        "lista": "lembretes",
+        "titulo": row["descricao"],
+        "data_iso": row["data_hora"].date().isoformat(),  # data_hora é NOT NULL em compromissos_agenda, sempre tem data
+        "observacao": "",
+        "concluido": row["concluido"],
+        "excluido": row["excluido"],
+        "atualizado_em": row["atualizado_em"].isoformat(),
+    }
+
+
+def _lagobada_item_lembrete_avulso(row):
+    return {
+        "sync_id": f"lembrete:{row['id']}",
+        "lista": "lembretes",
+        "titulo": row["texto"],
+        "data_iso": row["data_hora_alvo"].date().isoformat() if row["data_hora_alvo"] else None,
+        "observacao": "",
+        "concluido": row["resolvido"],
+        "excluido": row["resolvido"],
+        "atualizado_em": row["atualizado_em"].isoformat(),
+    }
+
+
+def _lagobada_listar_itens_desde(since):
+    """Devolve todos os itens sincronizáveis alterados depois de "since" (ou todos os
+    ativos, se since for None - primeira sincronização). Sempre por CÓDIGO (3 SELECTs
+    simples), nunca junta as 3 tabelas numa query só, pra manter cada uma isolada e fácil
+    de revisar."""
+    itens = []
+    try:
+        with db_cursor() as cur:
+            if since is None:
+                cur.execute("SELECT * FROM tarefas_pessoais WHERE NOT excluido ORDER BY criado_em ASC")
+            else:
+                cur.execute("SELECT * FROM tarefas_pessoais WHERE atualizado_em > %s ORDER BY atualizado_em ASC", (since,))
+            itens.extend(_lagobada_item_tarefa(r) for r in cur.fetchall())
+
+            if since is None:
+                cur.execute("SELECT * FROM compromissos_agenda WHERE NOT excluido ORDER BY criado_em ASC")
+            else:
+                cur.execute("SELECT * FROM compromissos_agenda WHERE atualizado_em > %s ORDER BY atualizado_em ASC", (since,))
+            itens.extend(_lagobada_item_agenda(r) for r in cur.fetchall())
+
+            if since is None:
+                cur.execute(
+                    "SELECT * FROM lembretes_agendados WHERE NOT eh_recorrente AND data_hora_alvo IS NOT NULL "
+                    "AND NOT resolvido ORDER BY criado_em ASC"
+                )
+            else:
+                cur.execute(
+                    "SELECT * FROM lembretes_agendados WHERE NOT eh_recorrente AND data_hora_alvo IS NOT NULL "
+                    "AND atualizado_em > %s ORDER BY atualizado_em ASC", (since,)
+                )
+            itens.extend(_lagobada_item_lembrete_avulso(r) for r in cur.fetchall())
+    except Exception as e:
+        print(f"[_lagobada_listar_itens_desde] erro: {e}", flush=True)
+    return itens
+
+
+def _lagobada_parse_data_iso(data_iso):
+    """Converte 'AAAA-MM-DD' (formato do app) num datetime UTC ao meio-dia (mesmo
+    placeholder técnico já usado pra compromisso sem horário, ver comentário em
+    `compromissos_agenda`). None/vazio -> None."""
+    if not data_iso:
+        return None
+    try:
+        d = datetime.strptime(data_iso, "%Y-%m-%d").date()
+        return datetime(d.year, d.month, d.day, 12, 0, tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _lagobada_aplicar_item(item):
+    """Aplica um item mandado pelo app (criação, edição, conclusão ou exclusão) e devolve
+    o resultado {"local_id":..., "sync_id":..., "atualizado_em":...} ou {"local_id":...,
+    "erro":...}. Nunca inventa/ignora silenciosamente - todo item mandado recebe uma
+    resposta dizendo o que aconteceu."""
+    local_id = item.get("local_id")
+    sync_id = (item.get("sync_id") or "").strip()
+    excluido = bool(item.get("excluido"))
+
+    try:
+        if sync_id.startswith("tarefa:"):
+            tid = int(sync_id.split(":", 1)[1])
+            with db_cursor(commit=True) as cur:
+                if excluido:
+                    cur.execute("UPDATE tarefas_pessoais SET excluido = true, atualizado_em = now() WHERE id = %s", (tid,))
+                else:
+                    status = "CONCLUIDA" if item.get("concluido") else "PENDENTE"
+                    cur.execute(
+                        "UPDATE tarefas_pessoais SET descricao = %s, status = %s, atualizado_em = now() WHERE id = %s",
+                        (item.get("titulo", ""), status, tid),
+                    )
+            return {"local_id": local_id, "sync_id": sync_id}
+
+        if sync_id.startswith("agenda:"):
+            aid = int(sync_id.split(":", 1)[1])
+            with db_cursor(commit=True) as cur:
+                if excluido:
+                    cur.execute("UPDATE compromissos_agenda SET excluido = true, atualizado_em = now() WHERE id = %s", (aid,))
+                else:
+                    data_hora = _lagobada_parse_data_iso(item.get("data_iso"))
+                    if data_hora is None:
+                        # lembrete perdeu a data no app - agenda exige data, então some daqui
+                        # (fica registrado como excluído, sem apagar a linha)
+                        cur.execute("UPDATE compromissos_agenda SET excluido = true, atualizado_em = now() WHERE id = %s", (aid,))
+                    else:
+                        cur.execute(
+                            "UPDATE compromissos_agenda SET descricao = %s, data_hora = %s, concluido = %s, "
+                            "atualizado_em = now() WHERE id = %s",
+                            (item.get("titulo", ""), data_hora, bool(item.get("concluido")), aid),
+                        )
+            return {"local_id": local_id, "sync_id": sync_id}
+
+        if sync_id.startswith("lembrete:"):
+            lid = int(sync_id.split(":", 1)[1])
+            # só suporta concluir/excluir vindo do app (título/data desse tipo continuam
+            # comandados só por WhatsApp, ver comentário no topo desta seção)
+            if excluido or item.get("concluido"):
+                with db_cursor(commit=True) as cur:
+                    cur.execute("UPDATE lembretes_agendados SET resolvido = true, atualizado_em = now() WHERE id = %s", (lid,))
+            return {"local_id": local_id, "sync_id": sync_id}
+
+        if not sync_id:
+            # item novo, criado no app - só vira agenda ou tarefa (nunca lembrete avulso)
+            lista = item.get("lista")
+            titulo = (item.get("titulo") or "").strip()
+            if not titulo:
+                return {"local_id": local_id, "erro": "título vazio"}
+            if lista == "tarefas":
+                novo_id = criar_tarefa_pessoal(titulo)
+                if novo_id is None:
+                    return {"local_id": local_id, "erro": "banco indisponível"}
+                if item.get("concluido"):
+                    with db_cursor(commit=True) as cur:
+                        cur.execute("UPDATE tarefas_pessoais SET status = 'CONCLUIDA', atualizado_em = now() WHERE id = %s", (novo_id,))
+                return {"local_id": local_id, "sync_id": f"tarefa:{novo_id}"}
+            if lista == "lembretes":
+                data_hora = _lagobada_parse_data_iso(item.get("data_iso"))
+                if data_hora is None:
+                    return {"local_id": local_id, "erro": "sem data - lembrete sem data não vira compromisso de agenda"}
+                novo_id = criar_compromisso_agenda(titulo, data_hora, tem_horario=False)
+                if novo_id is None:
+                    return {"local_id": local_id, "erro": "banco indisponível"}
+                if item.get("concluido"):
+                    with db_cursor(commit=True) as cur:
+                        cur.execute("UPDATE compromissos_agenda SET concluido = true, atualizado_em = now() WHERE id = %s", (novo_id,))
+                return {"local_id": local_id, "sync_id": f"agenda:{novo_id}"}
+            return {"local_id": local_id, "erro": f"lista desconhecida: {lista!r}"}
+
+        return {"local_id": local_id, "erro": f"sync_id desconhecido: {sync_id!r}"}
+    except Exception as e:
+        print(f"[_lagobada_aplicar_item] erro pro item {item!r}: {e}", flush=True)
+        return {"local_id": local_id, "erro": "erro interno"}
 
 
 def _calcular_periodo_agenda(escopo, data_referencia: datetime):
@@ -7233,6 +7454,46 @@ def painel_conversas():
     )
     mensagens = buscar_mensagens_recentes_grupo(grupo_jid, limite=_LIMITE_MENSAGENS_PAINEL_CONVERSAS) if grupo_jid else []
     return _render_painel_conversas_html(token, grupo_jid, mensagens, grupos_ordenados)
+
+
+@app.route("/api/lagobada/sync", methods=["GET"])
+def lagobada_sync_pull():
+    """App de Mac 'Lembrete da Lagobada' puxando o que mudou desde a última vez
+    (?since=<ISO8601>, vazio/ausente = primeira sincronização, devolve tudo que está
+    ativo hoje). Protegido por LAGOBADA_SYNC_TOKEN - sem essa env configurada, o
+    endpoint fica DESATIVADO (ver `_lagobada_autenticado`), diferente dos paineis de
+    debug que ficam abertos por padrão, porque aqui dá pra ESCREVER, não só ler."""
+    if not _lagobada_autenticado(request):
+        return jsonify({"erro": "token inválido, ausente, ou LAGOBADA_SYNC_TOKEN não configurada no Railway"}), 403
+
+    since = None
+    since_str = (request.args.get("since") or "").strip()
+    if since_str:
+        try:
+            since = datetime.fromisoformat(since_str.replace("Z", "+00:00"))
+        except ValueError:
+            return jsonify({"erro": "parâmetro since inválido, use ISO8601 (ex: 2026-09-12T10:00:00+00:00)"}), 400
+
+    agora = datetime.now(timezone.utc)
+    return jsonify({"servidor_agora": agora.isoformat(), "itens": _lagobada_listar_itens_desde(since)})
+
+
+@app.route("/api/lagobada/sync", methods=["POST"])
+def lagobada_sync_push():
+    """App de Mac empurrando o que foi criado/editado/concluído/excluído localmente desde
+    a última sincronização. Corpo: {"itens": [{"local_id", "sync_id"(opcional, ausente =
+    item novo), "lista", "titulo", "data_iso", "concluido", "excluido"}, ...]}. Cada item é
+    aplicado e respondido individualmente - um item com erro não derruba os outros."""
+    if not _lagobada_autenticado(request):
+        return jsonify({"erro": "token inválido, ausente, ou LAGOBADA_SYNC_TOKEN não configurada no Railway"}), 403
+
+    corpo = request.get_json(silent=True) or {}
+    itens_recebidos = corpo.get("itens", [])
+    if not isinstance(itens_recebidos, list):
+        return jsonify({"erro": "campo 'itens' deve ser uma lista"}), 400
+
+    resultados = [_lagobada_aplicar_item(item) for item in itens_recebidos if isinstance(item, dict)]
+    return jsonify({"servidor_agora": datetime.now(timezone.utc).isoformat(), "resultados": resultados})
 
 
 @app.route("/status-memoria", methods=["GET"])
