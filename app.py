@@ -414,6 +414,12 @@ def init_db():
             cur.execute("ALTER TABLE compromissos_agenda ADD COLUMN IF NOT EXISTS atualizado_em TIMESTAMPTZ NOT NULL DEFAULT now()")
             cur.execute("ALTER TABLE compromissos_agenda ADD COLUMN IF NOT EXISTS excluido BOOLEAN NOT NULL DEFAULT false")
             cur.execute("ALTER TABLE compromissos_agenda ADD COLUMN IF NOT EXISTS concluido BOOLEAN NOT NULL DEFAULT false")
+            # Round 27 parte 25 (pedido do Torres): "cancelado" e diferente de "excluido" -
+            # cancelado continua aparecendo na agenda (so com uma marcacao do lado, pra ele
+            # lembrar que existiu mas nao vai acontecer), excluido some de vez da lista. Nao
+            # e sincronizado com o app do Mac de proposito (o app so entende feito/nao-feito,
+            # sem conceito de "cancelado" - ver comentario em `_lagobada_item_agenda`).
+            cur.execute("ALTER TABLE compromissos_agenda ADD COLUMN IF NOT EXISTS cancelado BOOLEAN NOT NULL DEFAULT false")
             cur.execute("ALTER TABLE lembretes_agendados ADD COLUMN IF NOT EXISTS atualizado_em TIMESTAMPTZ NOT NULL DEFAULT now()")
         print(f"[init_db] banco de dados pronto (schema '{DB_SCHEMA}', tabelas tarefas/tarefas_eventos/regras_atendimento/fatos_memoria/mensagens_grupo/fatos_cliente/fatos_cliente_historico/pedidos_mudanca/lembretes_agendados/tarefas_pessoais/compromissos_agenda)", flush=True)
     except Exception as e:
@@ -1060,13 +1066,15 @@ def criar_compromisso_agenda(descricao, data_hora, tem_horario=True):
 
 def listar_compromissos_periodo(inicio, fim):
     """Lista os compromissos da agenda com data_hora dentro de [inicio, fim), ordenados por
-    data/hora - usado tanto pra 'agenda de um dia' quanto 'agenda do mês' (quem calcula o
-    intervalo certo é sempre CÓDIGO, nunca o classificador - mesma regra já seguida por
-    qualquer validação de data/calendário nesse sistema)."""
+    data/hora - usado tanto pra 'agenda de um dia' quanto 'agenda do mês'/'agenda completa'
+    (quem calcula o intervalo certo é sempre CÓDIGO, nunca o classificador - mesma regra já
+    seguida por qualquer validação de data/calendário nesse sistema). Traz também
+    concluido/cancelado pra `_formatar_lista_compromissos` poder mostrar a marcação certa -
+    um compromisso concluído ou cancelado continua na lista (só excluído some de vez)."""
     try:
         with db_cursor() as cur:
             cur.execute(
-                "SELECT descricao, data_hora, tem_horario FROM compromissos_agenda "
+                "SELECT descricao, data_hora, tem_horario, concluido, cancelado FROM compromissos_agenda "
                 "WHERE data_hora >= %s AND data_hora < %s AND NOT excluido ORDER BY data_hora ASC",
                 (inicio, fim),
             )
@@ -1074,6 +1082,90 @@ def listar_compromissos_periodo(inicio, fim):
     except Exception as e:
         print(f"[listar_compromissos_periodo] erro: {e}", flush=True)
         return []
+
+
+def _cancelar_avisos_compromisso(compromisso_id):
+    """Cancela os 2 avisos automáticos ainda pendentes de um compromisso (dia anterior 19h /
+    no próprio dia 7h) - usado quando o compromisso é marcado concluído antes da hora,
+    cancelado, ou excluído: não faz sentido continuar avisando de algo que não vai mais
+    acontecer como planejado. Mesmo padrão (try/except silencioso) já usado por
+    `marcar_resolvido` pra cancelar o job do lembrete - o job pode já ter disparado e sumido
+    sozinho, e não tem problema nenhum nisso."""
+    for prefixo in ("agenda-aviso-antes-", "agenda-aviso-dia-"):
+        try:
+            scheduler.remove_job(f"{prefixo}{compromisso_id}")
+        except Exception:
+            pass
+
+
+def _buscar_compromisso_por_referencia(termo_busca, data_referencia_iso=None):
+    """Acha o compromisso ativo (não excluído) cuja descrição bate (ILIKE) com termo_busca,
+    opcionalmente restrito a um dia específico quando a pessoa citou uma data (ex: "o trabalho
+    com o Deivid do dia 13" entre vários "Trabalho com Deivid" em dias diferentes). Devolve
+    ("ok", linha) quando acha exatamente um, ("ambiguo", lista_de_linhas) quando tem mais de
+    um candidato e não dá pra saber sozinho qual é, ou ("nao_achado", None). Nunca escolhe um
+    compromisso "no chute" entre vários parecidos - mesma cautela já usada em
+    `marcar_tarefa_pessoal_concluida`/`marcar_fato_resolvido`."""
+    termo = (termo_busca or "").strip()
+    if not termo:
+        return ("nao_achado", None)
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                "SELECT id, descricao, data_hora, tem_horario FROM compromissos_agenda "
+                "WHERE NOT excluido AND descricao ILIKE %s ORDER BY data_hora ASC",
+                (f"%{termo}%",),
+            )
+            candidatos = cur.fetchall()
+    except Exception as e:
+        print(f"[_buscar_compromisso_por_referencia] erro: {e}", flush=True)
+        return ("nao_achado", None)
+    if not candidatos:
+        return ("nao_achado", None)
+    if data_referencia_iso:
+        try:
+            data_alvo = datetime.fromisoformat(data_referencia_iso).astimezone(BAHIA_TZ).date()
+            filtrados = [c for c in candidatos if c["data_hora"].astimezone(BAHIA_TZ).date() == data_alvo]
+            if filtrados:
+                candidatos = filtrados
+        except Exception:
+            pass
+    if len(candidatos) == 1:
+        return ("ok", candidatos[0])
+    return ("ambiguo", candidatos)
+
+
+def _atualizar_flag_compromisso(termo_busca, data_referencia_iso, coluna):
+    """Função compartilhada por marcar_compromisso_concluido/cancelado/excluir_compromisso_agenda
+    - todas fazem a mesma coisa (achar o compromisso certo e ligar uma flag booleana), só muda
+    qual coluna. `coluna` vem sempre de uma constante fixa aqui embaixo, nunca de entrada
+    externa, então não tem risco de SQL injection por interpolar o nome da coluna."""
+    status, valor = _buscar_compromisso_por_referencia(termo_busca, data_referencia_iso)
+    if status != "ok":
+        return status, valor
+    try:
+        with db_cursor(commit=True) as cur:
+            cur.execute(
+                f"UPDATE compromissos_agenda SET {coluna} = true, atualizado_em = now() WHERE id = %s",
+                (valor["id"],),
+            )
+    except Exception as e:
+        print(f"[_atualizar_flag_compromisso:{coluna}] erro: {e}", flush=True)
+        return ("nao_achado", None)
+    _cancelar_avisos_compromisso(valor["id"])
+    return ("ok", valor)
+
+
+def marcar_compromisso_concluido(termo_busca, data_referencia_iso=None):
+    return _atualizar_flag_compromisso(termo_busca, data_referencia_iso, "concluido")
+
+
+def marcar_compromisso_cancelado(termo_busca, data_referencia_iso=None):
+    return _atualizar_flag_compromisso(termo_busca, data_referencia_iso, "cancelado")
+
+
+def excluir_compromisso_agenda(termo_busca, data_referencia_iso=None):
+    return _atualizar_flag_compromisso(termo_busca, data_referencia_iso, "excluido")
 
 
 # ============================================================================
@@ -1124,6 +1216,8 @@ def _lagobada_item_tarefa(row):
 
 
 def _lagobada_item_agenda(row):
+    # "cancelado" (round 27 parte 25) não entra aqui de propósito - o app do Mac só entende
+    # feito/não-feito (checkbox), sem conceito de "cancelado"; fica só do lado da Cintia.
     return {
         "sync_id": f"agenda:{row['id']}",
         "lista": "lembretes",
@@ -1283,10 +1377,21 @@ def _lagobada_aplicar_item(item):
 
 
 def _calcular_periodo_agenda(escopo, data_referencia: datetime):
-    """Calcula [início, fim) em UTC a partir do escopo ('dia' ou 'mes') e de uma data de
-    referência dentro do período pedido - sempre por CÓDIGO. Devolve (inicio_utc, fim_utc,
-    rótulo) onde rótulo é um texto pronto tipo 'domingo, 14/09' ou 'setembro de 2026'."""
+    """Calcula [início, fim) em UTC a partir do escopo ('dia', 'mes' ou 'completa') e de uma
+    data de referência dentro do período pedido - sempre por CÓDIGO. Devolve (inicio_utc,
+    fim_utc, rótulo) onde rótulo é um texto pronto tipo 'domingo, 14/09' ou 'setembro de 2026'
+    (None pra 'completa', que não tem um único período/rótulo - quem chama trata esse caso)."""
     ref_bahia = data_referencia.astimezone(BAHIA_TZ)
+    if escopo == "completa":
+        # Round 27 parte 25 (bug real reportado pelo Torres): pedir "a agenda" sem especificar
+        # dia/mes só mostrava o MÊS ATUAL, escondendo compromissos já marcados pro mês seguinte
+        # (ele já tinha itens de setembro E outubro, mas só via setembro). "Completa" cobre
+        # tudo a partir de hoje, sem se limitar a um mês - ~2 anos à frente é bem mais do que
+        # qualquer compromisso real vai precisar.
+        agora_bahia = datetime.now(BAHIA_TZ)
+        inicio_bahia = datetime(agora_bahia.year, agora_bahia.month, agora_bahia.day, 0, 0, tzinfo=BAHIA_TZ)
+        fim_bahia = inicio_bahia + timedelta(days=730)
+        return inicio_bahia.astimezone(timezone.utc), fim_bahia.astimezone(timezone.utc), None
     if escopo == "mes":
         inicio_bahia = datetime(ref_bahia.year, ref_bahia.month, 1, 0, 0, tzinfo=BAHIA_TZ)
         if ref_bahia.month == 12:
@@ -1303,16 +1408,25 @@ def _calcular_periodo_agenda(escopo, data_referencia: datetime):
 
 def _formatar_lista_compromissos(compromissos, escopo):
     """Monta o texto com os compromissos encontrados - com a data na frente de cada linha
-    quando o pedido foi pelo MÊS (lista mistura vários dias), ou só a hora quando foi um dia
-    só (já dá pra saber o dia pelo cabeçalho da resposta)."""
+    quando o pedido foi pelo MÊS ou pela agenda COMPLETA (lista mistura vários dias/meses), ou
+    só a hora quando foi um dia só (já dá pra saber o dia pelo cabeçalho da resposta). Cada
+    linha ganha uma marcação quando o compromisso já foi concluído ou cancelado (pedido do
+    Torres, round 27 parte 25) - ele continua na lista em vez de sumir, só sinalizado."""
     linhas = []
     for c in compromissos:
         c_bahia = c["data_hora"].astimezone(BAHIA_TZ)
         hora_texto = f" às {c_bahia.strftime('%H:%M')}" if c["tem_horario"] else ""
-        if escopo == "mes":
-            linhas.append(f"- {c_bahia.strftime('%d/%m')}{hora_texto}: {c['descricao']}")
+        if c["concluido"]:
+            marcador = " ✅ (concluído)"
+        elif c["cancelado"]:
+            marcador = " ❌ (cancelado)"
         else:
-            linhas.append(f"-{hora_texto} {c['descricao']}" if hora_texto else f"- {c['descricao']}")
+            marcador = ""
+        if escopo in ("mes", "completa"):
+            linhas.append(f"- {c_bahia.strftime('%d/%m')}{hora_texto}: {c['descricao']}{marcador}")
+        else:
+            base = f"-{hora_texto} {c['descricao']}" if hora_texto else f"- {c['descricao']}"
+            linhas.append(f"{base}{marcador}")
     return "\n".join(linhas)
 
 
@@ -3381,13 +3495,44 @@ OUTRA COISA), que agora é o seu modo padrão de assistente livre, não um catch
    avisar sobre os avisos automáticos - todo compromisso já gera sozinho um aviso às 19h do dia
    anterior e outro às 7h da manhã do próprio dia, isso é automático.
 
-22) PEDIDO PRA VER A AGENDA (ex: "me manda minha agenda do mês", "o que eu tenho pra essa
-   semana", "o que eu tenho amanhã", "agenda de domingo", "o que tá marcado pro dia 20"). Marque
-   "eh_pedido_listar_agenda" como true, "agenda_escopo" como "dia" (um dia específico) ou "mes" (o
-   mês inteiro), e "agenda_data_referencia_iso" com QUALQUER data dentro do dia/mês perguntado (não
-   precisa ser o primeiro dia do mês nem calcular início/fim - isso é sempre feito por código) em
-   ISO 8601 com fuso -03:00. Ainda não existe um escopo de "semana" - se a pessoa pedir "essa
-   semana" ou não deixar claro um dia/mês específico, use "mes" com o mês atual como aproximação.
+22) PEDIDO PRA VER A AGENDA (ex: "me manda minha agenda", "o que eu tenho marcado?", "me manda
+   minha agenda do mês", "o que eu tenho pra essa semana", "o que eu tenho amanhã", "agenda de
+   domingo", "o que tá marcado pro dia 20"). Marque "eh_pedido_listar_agenda" como true,
+   "agenda_escopo" como "dia" (um dia específico), "mes" (o mês inteiro) ou "completa" (TODOS os
+   compromissos futuros, sem se limitar a um mês só), e "agenda_data_referencia_iso" com QUALQUER
+   data dentro do dia/mês perguntado quando o escopo for "dia" ou "mes" (não precisa ser o primeiro
+   dia do mês nem calcular início/fim - isso é sempre feito por código; pode deixar vazio quando o
+   escopo for "completa") em ISO 8601 com fuso -03:00. Ainda não existe um escopo de "semana" de
+   verdade - se a pessoa pedir "essa semana", ou não citar um dia/mês específico (ex: só "me manda
+   minha agenda"/"o que eu tenho marcado"), use "completa": ela precisa ver TUDO que está por vir,
+   mesmo que passe pro mês seguinte - nunca estreite pro mês atual sozinha só porque não foi
+   especificado, isso esconde compromissos reais já marcados mais à frente.
+
+23) AVISO DE QUE UM COMPROMISSO DA AGENDA JÁ FOI CONCLUÍDO/FEITO (ex: "já fiz a gravação do Gran
+   Hotel", "o trabalho com o Deivid do dia 13 já foi concluído", "pode marcar como feito o
+   compromisso de amanhã com o Tony"). DIFERENTE de cancelar (tipo 24) ou excluir (tipo 25): o
+   compromisso continua aparecendo na agenda, só com um ✅ do lado. Marque
+   "eh_marcar_compromisso_concluido" como true e preencha "compromisso_referencia_texto" com um
+   trecho da descrição que ajude a achar o compromisso certo (nunca invente) e, se a pessoa citar um
+   dia específico, "compromisso_referencia_data_iso" com essa data em ISO 8601 -03:00 (só a data
+   basta) - isso desambigua quando existe mais de um compromisso parecido em dias diferentes (ex:
+   vários "Trabalho com Deivid"). Se genuinamente não der pra saber qual compromisso é, deixe
+   "compromisso_referencia_texto" vazio e pergunte em "resposta_conversa".
+
+24) PEDIDO PRA CANCELAR UM COMPROMISSO DA AGENDA (ex: "cancela o show de Santiago", "aquele
+   compromisso com o Nando dia 20 foi cancelado", "não vai rolar mais o trabalho com o Tony dia
+   25"). DIFERENTE de excluir (tipo 25): cancelado continua aparecendo na agenda, só com uma
+   marcação de "❌ (cancelado)" do lado, pra você lembrar que existiu mas não vai acontecer. Marque
+   "eh_marcar_compromisso_cancelado" como true e preencha "compromisso_referencia_texto"/
+   "compromisso_referencia_data_iso" do mesmo jeito do tipo 23.
+
+25) PEDIDO PRA EXCLUIR/APAGAR UM COMPROMISSO DA AGENDA DE VEZ (ex: "exclui aquela data da
+   agenda", "apaga o compromisso de dia 20 com o Nando", "tira isso da minha agenda, foi engano",
+   "some com aquele compromisso"). DIFERENTE de cancelar (tipo 24): excluir remove
+   COMPLETAMENTE, some da agenda sem deixar rastro nenhum (nem marcação, nem histórico) - só use
+   este tipo quando a pessoa pedir claramente pra tirar/apagar/excluir, não só avisar que foi
+   cancelado. Marque "eh_excluir_compromisso" como true e preencha
+   "compromisso_referencia_texto"/"compromisso_referencia_data_iso" do mesmo jeito do tipo 23.
 
 13) PEDIDO PRA VOCÊ MANDAR UM ÁUDIO (nota de voz de verdade, com onda sonora, como se alguém
    tivesse gravado ali na hora) EM VEZ DE TEXTO (ex: "manda isso em áudio", "responde por voz", "me
@@ -3413,7 +3558,7 @@ OUTRA COISA), que agora é o seu modo padrão de assistente livre, não um catch
    resposta pra uma pergunta, use-os pra responder direto. Se for um pedido/comando que você ainda
    não tem como executar de verdade (uma ação fora do que os tipos acima cobrem), seja honesta
    sobre isso em vez de inventar que já fez. Nunca deixe esse campo vazio quando nenhum dos tipos
-   1/2/13/17/18/19/20/21/22 acima se aplicar - toda mensagem precisa de resposta. IMPORTANTE: se
+   1/2/13/17/18/19/20/21/22/23/24/25 acima se aplicar - toda mensagem precisa de resposta. IMPORTANTE: se
    {pessoa_nome} estiver claramente selecionando/pedindo de volta algo que VOCÊ (Cintia) apresentou
    nas ÚLTIMAS MENSAGENS acima (ex: "gostei da segunda", "manda só a número 2", "essa aí mesmo",
    "manda de novo"), REUTILIZE o conteúdo exato que você já mandou - não regenere nem invente uma
@@ -3440,7 +3585,7 @@ ambiguidade anterior sua.
 Responda SEMPRE E APENAS em JSON válido, numa única linha por valor, neste formato exato,
 sem usar bloco de código markdown (nada de ```) e sem quebras de linha dentro dos valores. Inclua
 TODAS as chaves sempre, mesmo vazias/false quando não se aplicarem:
-{"eh_pedido_de_lembrete": true ou false, "eh_recorrente": true ou false, "recorrencia_dia_mes": "dia do mes (1-31) se for recorrente mensal, ou string vazia", "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_pedido_mudanca_sistema": true ou false, "eh_pedido_tarefa_pessoal": true ou false, "tarefa_pessoal_texto": "a tarefa resumida de forma clara, ou string vazia", "eh_pedido_listar_tarefas_pessoais": true ou false, "eh_marcar_tarefa_pessoal_concluida": true ou false, "tarefa_pessoal_referencia": "trecho que identifica qual tarefa da lista, ou string vazia", "eh_pedido_de_audio": true ou false, "texto_audio": "texto exato que deve virar fala, ou string vazia", "eh_marcar_fato_resolvido": true ou false, "fato_resolvido_referencia": "trecho que identifica qual fato antigo nao vale mais, ou string vazia", "eh_pedido_agenda": true ou false, "compromissos_agenda": [{"descricao": "resumo curto", "data_hora_iso": "2026-08-29T10:00:00-03:00", "tem_horario": true ou false}], "eh_pedido_listar_agenda": true ou false, "agenda_escopo": "dia ou mes", "agenda_data_referencia_iso": "2026-08-29T00:00:00-03:00 (qualquer data dentro do dia/mes perguntado)", "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/13/17/18/19/20/21/22 acima for verdadeiro"}
+{"eh_pedido_de_lembrete": true ou false, "eh_recorrente": true ou false, "recorrencia_dia_mes": "dia do mes (1-31) se for recorrente mensal, ou string vazia", "data_hora_alvo_iso": "2026-08-29T15:00:00-03:00", "texto_lembrete": "um resumo curto e claro do que a pessoa quer ser lembrada de fazer", "eh_fato_para_lembrar": true ou false, "fato_texto": "o fato reescrito de forma clara e objetiva, ou string vazia", "eh_pedido_mudanca_sistema": true ou false, "eh_pedido_tarefa_pessoal": true ou false, "tarefa_pessoal_texto": "a tarefa resumida de forma clara, ou string vazia", "eh_pedido_listar_tarefas_pessoais": true ou false, "eh_marcar_tarefa_pessoal_concluida": true ou false, "tarefa_pessoal_referencia": "trecho que identifica qual tarefa da lista, ou string vazia", "eh_pedido_de_audio": true ou false, "texto_audio": "texto exato que deve virar fala, ou string vazia", "eh_marcar_fato_resolvido": true ou false, "fato_resolvido_referencia": "trecho que identifica qual fato antigo nao vale mais, ou string vazia", "eh_pedido_agenda": true ou false, "compromissos_agenda": [{"descricao": "resumo curto", "data_hora_iso": "2026-08-29T10:00:00-03:00", "tem_horario": true ou false}], "eh_pedido_listar_agenda": true ou false, "agenda_escopo": "dia, mes ou completa", "agenda_data_referencia_iso": "2026-08-29T00:00:00-03:00 (qualquer data dentro do dia/mes perguntado, vazio se completa)", "eh_marcar_compromisso_concluido": true ou false, "eh_marcar_compromisso_cancelado": true ou false, "eh_excluir_compromisso": true ou false, "compromisso_referencia_texto": "trecho que identifica qual compromisso da agenda, ou string vazia", "compromisso_referencia_data_iso": "data (so a data) que ajuda a desambiguar, ou string vazia", "resposta_conversa": "resposta natural pra mensagem, preenchida sempre que nenhum dos tipos 1/2/13/17/18/19/20/21/22/23/24/25 acima for verdadeiro"}
 """
 
 
@@ -6895,9 +7040,9 @@ def processar_dm(remote_jid, key, data):
                 f"Anotado na agenda! 📅 Compromisso{plural_c}:\n\n" + "\n".join(linhas_confirmacao) + aviso_extra
             )
     elif resultado.get("eh_pedido_listar_agenda"):
-        escopo_agenda = (resultado.get("agenda_escopo") or "dia").strip().lower()
-        if escopo_agenda not in ("dia", "mes"):
-            escopo_agenda = "dia"
+        escopo_agenda = (resultado.get("agenda_escopo") or "completa").strip().lower()
+        if escopo_agenda not in ("dia", "mes", "completa"):
+            escopo_agenda = "completa"
         data_ref_str = (resultado.get("agenda_data_referencia_iso") or "").strip()
         try:
             data_referencia_agenda = datetime.fromisoformat(data_ref_str) if data_ref_str else agora
@@ -6906,10 +7051,43 @@ def processar_dm(remote_jid, key, data):
         inicio_periodo, fim_periodo, rotulo_periodo = _calcular_periodo_agenda(escopo_agenda, data_referencia_agenda)
         compromissos_periodo = listar_compromissos_periodo(inicio_periodo, fim_periodo)
         if not compromissos_periodo:
-            responder(f"Sua agenda de {rotulo_periodo} está livre, nada anotado! 📅")
+            responder("Sua agenda está livre, nada anotado! 📅" if not rotulo_periodo else f"Sua agenda de {rotulo_periodo} está livre, nada anotado! 📅")
         else:
             texto_lista_agenda = _formatar_lista_compromissos(compromissos_periodo, escopo_agenda)
-            responder(f"📅 Sua agenda de {rotulo_periodo}:\n\n{texto_lista_agenda}")
+            cabecalho_agenda = "📅 Sua agenda (todos os próximos compromissos):" if not rotulo_periodo else f"📅 Sua agenda de {rotulo_periodo}:"
+            responder(f"{cabecalho_agenda}\n\n{texto_lista_agenda}")
+    elif resultado.get("eh_marcar_compromisso_concluido") or resultado.get("eh_marcar_compromisso_cancelado") or resultado.get("eh_excluir_compromisso"):
+        # Round 27 parte 25, pedido do Torres: concluir/cancelar deixam o compromisso na
+        # agenda com uma marcação do lado (✅/❌); excluir tira de vez. As 3 ações compartilham
+        # a mesma busca/desambiguação (`_buscar_compromisso_por_referencia`) - só muda a
+        # função chamada e o texto de confirmação.
+        referencia_compromisso = (resultado.get("compromisso_referencia_texto") or "").strip()
+        referencia_data_compromisso = (resultado.get("compromisso_referencia_data_iso") or "").strip() or None
+        if resultado.get("eh_marcar_compromisso_concluido"):
+            acao_func, verbo_ok, emoji_ok = marcar_compromisso_concluido, "Marquei como concluído", "✅"
+        elif resultado.get("eh_marcar_compromisso_cancelado"):
+            acao_func, verbo_ok, emoji_ok = marcar_compromisso_cancelado, "Marquei como cancelado", "❌"
+        else:
+            acao_func, verbo_ok, emoji_ok = excluir_compromisso_agenda, "Excluí da agenda", "🗑️"
+        if not referencia_compromisso:
+            responder("Qual compromisso da agenda? Me fala um pouco mais sobre qual é (e o dia, se lembrar).")
+        else:
+            status_compromisso, valor_compromisso = acao_func(referencia_compromisso, referencia_data_compromisso)
+            if status_compromisso == "ok":
+                data_bahia_compromisso = valor_compromisso["data_hora"].astimezone(BAHIA_TZ)
+                responder(f"{verbo_ok}: \"{valor_compromisso['descricao']}\" ({data_bahia_compromisso.strftime('%d/%m')}) {emoji_ok}")
+            elif status_compromisso == "ambiguo":
+                opcoes_compromisso = "\n".join(
+                    f"- {c['data_hora'].astimezone(BAHIA_TZ).strftime('%d/%m')}"
+                    f"{(' às ' + c['data_hora'].astimezone(BAHIA_TZ).strftime('%H:%M')) if c['tem_horario'] else ''}: {c['descricao']}"
+                    for c in valor_compromisso
+                )
+                responder(f"Achei mais de um compromisso parecido, qual desses?\n\n{opcoes_compromisso}")
+            else:
+                responder(
+                    "Não achei nenhum compromisso na agenda que bata com isso. Pode me falar "
+                    "melhor qual é (e o dia, se lembrar)?"
+                )
     elif resultado.get("eh_marcar_fato_resolvido") and resultado.get("fato_resolvido_referencia"):
         # Round 27 parte 18: complementa o tipo "eh_fato_para_lembrar" - Torres tambem consegue
         # avisar que um fato antigo ja NAO vale mais (ex: uma decisao pontual que foi superada),
