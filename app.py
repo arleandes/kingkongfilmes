@@ -7756,6 +7756,92 @@ def status_memoria():
         }), 500
 
 
+# ============================================================================
+# Round 27 parte 27 [TESTE - nao faz parte de nenhum fluxo real do WhatsApp ainda]:
+# Torres perguntou se dava pra editar so um pedaco de texto dentro de uma imagem (tipo
+# corrigir a data errada de um flyer) sem mexer no resto/tipografia, do jeito que o
+# ChatGPT faz. Pesquisei e expliquei que o Claude (o "cerebro" da Cintia) nao gera nem
+# edita imagem - isso e outro tipo de modelo de IA. Combinado com Torres: testar essa
+# edicao usando a API do Gemini (Nano Banana 2/gemini-3.1-flash-image, do Google), que
+# hoje tem fama de ser mais precisa que a da OpenAI pra manter o resto da imagem intacto
+# numa edicao pontual. Este endpoint e SO PRA TESTE - valida a ferramenta antes de decidir
+# se vale integrar de vez num comando de verdade da Cintia no WhatsApp.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+# Token dedicado so pra este endpoint de teste (nao reaproveita o DEBUG_TOKEN dos outros
+# paineis) - cada chamada aqui tem custo real de API, entao o token e sempre obrigatorio,
+# diferente dos paineis de leitura (status-memoria etc) que ficam abertos sem DEBUG_TOKEN.
+GEMINI_TESTE_TOKEN = os.environ.get("GEMINI_TESTE_TOKEN", "")
+
+
+def _editar_imagem_gemini(imagem_base64, mime_type, instrucao):
+    """Chama a API do Gemini (modelo gemini-3.1-flash-image, "Nano Banana 2") pra editar
+    uma imagem existente a partir de uma instrucao em texto. Retorna uma tupla
+    ((imagem_base64_editada, mime_type_saida), None) em caso de sucesso, ou
+    (None, "motivo do erro em texto") em caso de falha - nunca inventa resultado nem
+    lanca excecao pra quem chamou, sempre devolve o motivo real."""
+    if not GEMINI_API_KEY:
+        return None, "GEMINI_API_KEY nao configurada nas variaveis de ambiente do Railway"
+    modelo = "gemini-3.1-flash-image"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent"
+    corpo = {
+        "contents": [{
+            "parts": [
+                {"text": instrucao},
+                {"inline_data": {"mime_type": mime_type, "data": imagem_base64}},
+            ]
+        }]
+    }
+    try:
+        resp = requests.post(
+            url,
+            headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
+            json=corpo,
+            timeout=90,
+        )
+    except Exception as e:
+        return None, f"erro de rede chamando a API do Gemini: {e}"
+    if resp.status_code != 200:
+        return None, f"Gemini respondeu HTTP {resp.status_code}: {resp.text[:2000]}"
+    try:
+        dados = resp.json()
+        partes = dados["candidates"][0]["content"]["parts"]
+    except Exception as e:
+        return None, f"resposta do Gemini em formato inesperado ({e}): {resp.text[:2000]}"
+    for parte in partes:
+        inline = parte.get("inlineData") or parte.get("inline_data")
+        if inline and inline.get("data"):
+            mime_saida = inline.get("mimeType") or inline.get("mime_type") or "image/png"
+            return (inline["data"], mime_saida), None
+    return None, f"Gemini respondeu OK mas sem nenhuma imagem no resultado: {json.dumps(dados)[:2000]}"
+
+
+@app.route("/debug/testar-edicao-imagem", methods=["POST"])
+def debug_testar_edicao_imagem():
+    """[TEMPORARIO - Round 27 parte 27] So pra teste manual, nao e chamado por nenhum
+    fluxo do WhatsApp. Recebe JSON {"imagem_base64": ..., "mime_type": ..., "instrucao": ...}
+    e devolve {"ok": true, "imagem_base64": ..., "mime_type": ...} com a imagem editada, ou
+    {"ok": false, "erro": "..."} com o motivo real da falha. Token dedicado obrigatorio
+    (env GEMINI_TESTE_TOKEN) via ?token=, sempre - essa chamada tem custo real por imagem,
+    entao aqui, ao contrario do /status-memoria, nunca fica aberto sem token configurado."""
+    if not GEMINI_TESTE_TOKEN or request.args.get("token") != GEMINI_TESTE_TOKEN:
+        return jsonify({"erro": "token invalido ou ausente"}), 403
+
+    corpo = request.get_json(silent=True) or {}
+    imagem_base64 = corpo.get("imagem_base64")
+    mime_type = corpo.get("mime_type") or "image/png"
+    instrucao = corpo.get("instrucao")
+    if not imagem_base64 or not instrucao:
+        return jsonify({"erro": "faltou imagem_base64 e/ou instrucao no corpo da requisicao"}), 400
+
+    resultado, erro = _editar_imagem_gemini(imagem_base64, mime_type, instrucao)
+    if erro:
+        print(f"[debug_testar_edicao_imagem] falhou: {erro}", flush=True)
+        return jsonify({"ok": False, "erro": erro}), 502
+
+    imagem_editada_b64, mime_saida = resultado
+    return jsonify({"ok": True, "imagem_base64": imagem_editada_b64, "mime_type": mime_saida})
+
+
 # Round 27 parte 21: re-arma no scheduler todo lembrete que ainda não disparou, salvo antes de
 # um reinício/deploy anterior (ver `_restaurar_lembretes_agendados` e o comentário em
 # `init_db`, no bloco da tabela lembretes_agendados). Precisa ficar aqui, depois de
