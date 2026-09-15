@@ -3385,6 +3385,7 @@ def _finalizar_processamento_grupo(chave):
 SYSTEM_PROMPT_LEMBRETE = """Você é a Cintia, assistente PESSOAL de {pessoa_nome}, falando em português
 num DM de WhatsApp. A data/hora atual é: {agora_iso} (horário de Brasília, America/Bahia).
 
+{bloco_dias_semana}
 Round 27 parte 22, mudança de projeto pedida explicitamente por {pessoa_nome}: você deixou de ser
 assistente de atendimento do negócio (clientes, grupo Tripa, grupo Gestão) e não fala mais com
 mais ninguém da equipe - só com {pessoa_nome}, aqui no privado dele. Ele foi claro: quer que você
@@ -3506,7 +3507,12 @@ OUTRA COISA), que agora é o seu modo padrão de assistente livre, não um catch
    verdade - se a pessoa pedir "essa semana", ou não citar um dia/mês específico (ex: só "me manda
    minha agenda"/"o que eu tenho marcado"), use "completa": ela precisa ver TUDO que está por vir,
    mesmo que passe pro mês seguinte - nunca estreite pro mês atual sozinha só porque não foi
-   especificado, isso esconde compromissos reais já marcados mais à frente.
+   especificado, isso esconde compromissos reais já marcados mais à frente. Quando a pessoa citar
+   um DIA DA SEMANA (ex: "tem algo nessa quinta?", "como está minha quarta", "sexta que vem tenho
+   algo?") em vez de uma data numérica, use "dia" como escopo e resolva "agenda_data_referencia_iso"
+   usando OBRIGATORIAMENTE a tabela "PRÓXIMOS DIAS DA SEMANA" mais acima - nunca calcule de cabeça
+   qual data cai naquele dia da semana, isso já causou erro real (perguntaram de quinta-feira e a
+   resposta saiu sobre sexta-feira).
 
 23) AVISO DE QUE UM COMPROMISSO DA AGENDA JÁ FOI CONCLUÍDO/FEITO (ex: "já fiz a gravação do Gran
    Hotel", "o trabalho com o Deivid do dia 13 já foi concluído", "pode marcar como feito o
@@ -4846,6 +4852,38 @@ _DIAS_SEMANA_PT = ["segunda-feira", "terça-feira", "quarta-feira", "quinta-feir
 
 def _dia_semana_pt(data_obj):
     return _DIAS_SEMANA_PT[data_obj.weekday()]
+
+
+def _bloco_proximos_dias_semana(agora):
+    """Round 27 parte 28: Torres pegou a Cintia errando o dia quando perguntou "tem algo nessa
+    quinta?" - ela respondeu sobre sexta-feira 18/09 em vez de quinta-feira 17/09 (só corrigiu
+    na segunda tentativa, quando ele repetiu "eu perguntei de quinta feira"). Causa: o prompt do
+    DM só recebe a data/hora atual (`agora_iso`) crua e pede pro proprio MODELO calcular de
+    cabeca qual data cai numa "quinta-feira"/"essa quarta"/etc - exatamente o tipo de calculo de
+    calendario que este projeto ja tem documentado como erro real e nao confiavel (ver o bloco
+    "VALIDACAO DE CALENDARIO" da conferencia de arte, que existe por causa de um bug parecido) -
+    so que pro fluxo pessoal (agenda por dia da semana) esse bloco nunca tinha sido criado.
+    Gera POR CODIGO (nunca pelo modelo) uma tabela dos proximos 14 dias com o dia da semana em
+    portugues de cada um, pra injetar no prompt como fonte unica de verdade - cobre 2 ocorrencias
+    de cada dia da semana (essa semana e a que vem), o suficiente pra resolver tanto "essa
+    quinta"/"quinta-feira" (a mais proxima, incluindo hoje) quanto "quinta que vem"/"semana que
+    vem" (a segunda ocorrencia)."""
+    linhas = []
+    for i in range(14):
+        data_dia = (agora + timedelta(days=i)).date()
+        rotulo = "hoje" if i == 0 else ("amanhã" if i == 1 else _dia_semana_pt(data_dia))
+        linhas.append(f"- {data_dia.strftime('%d/%m/%Y')} = {_dia_semana_pt(data_dia)}"
+                       + (f" ({rotulo})" if i <= 1 else ""))
+    return (
+        "PRÓXIMOS DIAS DA SEMANA (calculado por CÓDIGO, não pelo modelo - use SEMPRE esta tabela "
+        "pra resolver qualquer dia da semana mencionado, tipo \"quinta\", \"essa quarta\", \"sexta "
+        "que vem\" - NUNCA calcule de cabeça, é exatamente esse tipo de cálculo que já causou erro "
+        "real de dia errado em produção):\n"
+        + "\n".join(linhas)
+        + "\n(cada dia da semana aparece 2x nesta lista - use a 1ª ocorrência pra \"essa "
+        "quinta\"/\"quinta-feira\" sem mais nada, e a 2ª ocorrência só quando a pessoa disser "
+        "\"que vem\"/\"da semana que vem\"/\"semana seguinte\".)\n\n"
+    )
 
 
 def extrair_datas_mencionadas(texto, limite=12):
@@ -6908,6 +6946,7 @@ def processar_dm(remote_jid, key, data):
     prompt_sistema = (
         SYSTEM_PROMPT_LEMBRETE
         .replace("{agora_iso}", agora.isoformat())
+        .replace("{bloco_dias_semana}", _bloco_proximos_dias_semana(agora))
         .replace("{contexto_conversa}", contexto_conversa)
         .replace("{contexto_fatos}", contexto_fatos)
         .replace("{pessoa_nome}", "Torres" if pessoa == "torres" else "Luan")
@@ -7766,6 +7805,11 @@ def status_memoria():
 # hoje tem fama de ser mais precisa que a da OpenAI pra manter o resto da imagem intacto
 # numa edicao pontual. Este endpoint e SO PRA TESTE - valida a ferramenta antes de decidir
 # se vale integrar de vez num comando de verdade da Cintia no WhatsApp.
+# Round 27 parte 28: Torres pediu tambem o caso de DUAS imagens - mandar um flyer + uma foto
+# separada e pedir pra tirar uma pessoa do flyer e encaixar a foto mandada no lugar (recortada).
+# _editar_imagem_gemini/endpoint passaram a aceitar uma LISTA de imagens (nao so uma), o Gemini
+# usa a ordem delas + a instrucao em texto pra saber o que e o flyer base e o que e a foto a
+# inserir.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 # Token dedicado so pra este endpoint de teste (nao reaproveita o DEBUG_TOKEN dos outros
 # paineis) - cada chamada aqui tem custo real de API, entao o token e sempre obrigatorio,
@@ -7773,24 +7817,27 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_TESTE_TOKEN = os.environ.get("GEMINI_TESTE_TOKEN", "")
 
 
-def _editar_imagem_gemini(imagem_base64, mime_type, instrucao):
-    """Chama a API do Gemini (modelo gemini-3.1-flash-image, "Nano Banana 2") pra editar
-    uma imagem existente a partir de uma instrucao em texto. Retorna uma tupla
+def _editar_imagem_gemini(imagens, instrucao):
+    """Chama a API do Gemini (modelo gemini-3.1-flash-image, "Nano Banana 2") pra editar/compor
+    imagem(ns) a partir de uma instrucao em texto. "imagens" e uma LISTA de dicts
+    {"base64": ..., "mime_type": ...} - pode ser uma imagem so (corrigir texto num flyer) ou
+    varias (Round 27 parte 28: pedido do Torres de recortar uma foto separada e encaixar no
+    lugar de alguem no flyer - o Gemini aceita multiplas imagens na mesma chamada e usa a ORDEM
+    delas pra saber qual e o flyer base e qual e a foto de referencia a inserir, entao a ordem
+    da lista importa e deve seguir a mesma ordem citada na instrucao). Retorna uma tupla
     ((imagem_base64_editada, mime_type_saida), None) em caso de sucesso, ou
-    (None, "motivo do erro em texto") em caso de falha - nunca inventa resultado nem
-    lanca excecao pra quem chamou, sempre devolve o motivo real."""
+    (None, "motivo do erro em texto") em caso de falha - nunca inventa resultado nem lanca
+    excecao pra quem chamou, sempre devolve o motivo real."""
     if not GEMINI_API_KEY:
         return None, "GEMINI_API_KEY nao configurada nas variaveis de ambiente do Railway"
+    if not imagens:
+        return None, "nenhuma imagem recebida"
     modelo = "gemini-3.1-flash-image"
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent"
-    corpo = {
-        "contents": [{
-            "parts": [
-                {"text": instrucao},
-                {"inline_data": {"mime_type": mime_type, "data": imagem_base64}},
-            ]
-        }]
-    }
+    partes_pedido = [{"text": instrucao}]
+    for img in imagens:
+        partes_pedido.append({"inline_data": {"mime_type": img.get("mime_type") or "image/png", "data": img["base64"]}})
+    corpo = {"contents": [{"parts": partes_pedido}]}
     try:
         resp = requests.post(
             url,
@@ -7817,23 +7864,33 @@ def _editar_imagem_gemini(imagem_base64, mime_type, instrucao):
 
 @app.route("/debug/testar-edicao-imagem", methods=["POST"])
 def debug_testar_edicao_imagem():
-    """[TEMPORARIO - Round 27 parte 27] So pra teste manual, nao e chamado por nenhum
-    fluxo do WhatsApp. Recebe JSON {"imagem_base64": ..., "mime_type": ..., "instrucao": ...}
-    e devolve {"ok": true, "imagem_base64": ..., "mime_type": ...} com a imagem editada, ou
-    {"ok": false, "erro": "..."} com o motivo real da falha. Token dedicado obrigatorio
-    (env GEMINI_TESTE_TOKEN) via ?token=, sempre - essa chamada tem custo real por imagem,
-    entao aqui, ao contrario do /status-memoria, nunca fica aberto sem token configurado."""
+    """[TEMPORARIO - Round 27 parte 27/28] So pra teste manual, nao e chamado por nenhum fluxo
+    do WhatsApp. Aceita 2 formatos de corpo JSON: (a) uma imagem so - {"imagem_base64": ...,
+    "mime_type": ..., "instrucao": ...} (edicao pontual, ex: corrigir texto num flyer); ou (b)
+    varias imagens - {"imagens": [{"base64": ..., "mime_type": ...}, ...], "instrucao": ...}
+    (Round 27 parte 28: pedido do Torres de recortar uma foto separada e encaixar no flyer no
+    lugar de outra pessoa - a ORDEM da lista deve seguir a ordem citada na instrucao, ex: [flyer,
+    foto_da_pessoa_a_inserir]). Devolve {"ok": true, "imagem_base64": ..., "mime_type": ...} com
+    a imagem resultado, ou {"ok": false, "erro": "..."} com o motivo real da falha. Token
+    dedicado obrigatorio (env GEMINI_TESTE_TOKEN) via ?token=, sempre - essa chamada tem custo
+    real por imagem, entao aqui, ao contrario do /status-memoria, nunca fica aberto sem token
+    configurado."""
     if not GEMINI_TESTE_TOKEN or request.args.get("token") != GEMINI_TESTE_TOKEN:
         return jsonify({"erro": "token invalido ou ausente"}), 403
 
     corpo = request.get_json(silent=True) or {}
-    imagem_base64 = corpo.get("imagem_base64")
-    mime_type = corpo.get("mime_type") or "image/png"
     instrucao = corpo.get("instrucao")
-    if not imagem_base64 or not instrucao:
-        return jsonify({"erro": "faltou imagem_base64 e/ou instrucao no corpo da requisicao"}), 400
+    if corpo.get("imagens"):
+        imagens = [{"base64": img.get("base64"), "mime_type": img.get("mime_type") or "image/png"}
+                   for img in corpo["imagens"] if img.get("base64")]
+    elif corpo.get("imagem_base64"):
+        imagens = [{"base64": corpo["imagem_base64"], "mime_type": corpo.get("mime_type") or "image/png"}]
+    else:
+        imagens = []
+    if not imagens or not instrucao:
+        return jsonify({"erro": "faltou imagem_base64 (ou imagens) e/ou instrucao no corpo da requisicao"}), 400
 
-    resultado, erro = _editar_imagem_gemini(imagem_base64, mime_type, instrucao)
+    resultado, erro = _editar_imagem_gemini(imagens, instrucao)
     if erro:
         print(f"[debug_testar_edicao_imagem] falhou: {erro}", flush=True)
         return jsonify({"ok": False, "erro": erro}), 502
