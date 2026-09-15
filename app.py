@@ -4271,6 +4271,154 @@ def _buscar_ultima_arte(chave_conversa):
     return info
 
 
+# --------------------------------------------------------------------------
+# Edição de imagem de verdade no WhatsApp (Round 27 parte 29) - até aqui (parte 27/28) a
+# edição via Gemini/Nano Banana só existia no endpoint de teste /debug/testar-edicao-imagem,
+# nunca ligada a um comando real da Cintia. Torres mandou um print real mostrando ela dizendo
+# "só não consigo editar a arte em si" pra um pedido de correção, e pediu explicitamente:
+# "ela disse que não consegue fazer? eu preciso que ative essa opção nela". Isso liga a
+# funcionalidade já testada (_editar_imagem_gemini, definida mais abaixo) a um fluxo real: no
+# privado de Torres/Luan, uma imagem com uma legenda de edição (ex: "muda o texto X pra Y"),
+# ou uma mensagem de texto pedindo pra editar uma arte já enviada há pouco (ex: "edita aquele
+# flyer: troca a data"), dispara a edição de verdade e manda a imagem editada de volta.
+#
+# Guarda as últimas imagens enviadas em cada conversa privada (buffer curto, até 2, TTL
+# pequeno) - serve tanto pro caso de UMA imagem só (corrigir um texto/data/valor nela mesma)
+# quanto pro caso de DUAS imagens que Torres pediu no meio da parte 28 (manda um flyer, depois
+# manda uma foto separada e pede pra tirar alguém do flyer e encaixar essa foto no lugar,
+# recortada) - nesse caso a foto de referência chega numa mensagem separada, então quando ela
+# chegar com o pedido de edição, o flyer mandado logo antes ainda precisa estar disponível.
+# Deliberadamente SEPARADO do buffer de "_ultima_arte_por_conversa" (usado pra
+# conferência/ortografia) - são funcionalidades diferentes, com TTL e semântica próprios, e não
+# queremos que editar uma imagem interfira na reconferência de ortografia ou vice-versa.
+_imagens_recentes_edicao = {}  # chave_conversa -> lista de até 2 {"base64", "mime_type", "timestamp"}
+_imagens_recentes_edicao_lock = threading.Lock()
+_IMAGENS_RECENTES_EDICAO_TTL = 10 * 60  # 10min - tempo de sobra entre mandar o flyer e a foto de
+                                         # referência, sem arriscar puxar uma imagem antiga e
+                                         # sem relação nenhuma pra dentro de uma edição nova
+
+
+def _guardar_imagem_para_edicao(chave_conversa, imagem_base64, mime_type):
+    if not imagem_base64:
+        return
+    with _imagens_recentes_edicao_lock:
+        buffer = _imagens_recentes_edicao.setdefault(chave_conversa, [])
+        buffer.append({"base64": imagem_base64, "mime_type": mime_type or "image/jpeg", "timestamp": time.time()})
+        del buffer[:-2]  # mantém só as 2 mais recentes
+
+
+def _buscar_imagens_recentes_para_edicao(chave_conversa):
+    """Devolve as imagens recentes (dentro do TTL) guardadas nessa conversa, mais antiga
+    primeiro - já na ordem certa pra virar a lista de entrada de _editar_imagem_gemini quando
+    for o caso de duas imagens (flyer primeiro, foto de referência depois)."""
+    with _imagens_recentes_edicao_lock:
+        buffer = list(_imagens_recentes_edicao.get(chave_conversa, []))
+    agora = time.time()
+    return [img for img in buffer if agora - img["timestamp"] <= _IMAGENS_RECENTES_EDICAO_TTL]
+
+
+_PALAVRAS_GATILHO_EDICAO_IMAGEM = [
+    "edita", "edite", "editar", "edicao", "edição",
+    "muda", "mude", "mudar", "troca", "troque", "trocar",
+    "corrige", "corrija", "corrigir", "ajusta", "ajuste", "ajustar",
+    "substitui", "substitua", "substituir",
+    "tira", "tire", "tirar", "recorta", "recorte", "recortar",
+    "encaixa", "encaixe", "encaixar", "coloca essa foto", "coloque essa foto",
+    "poe essa foto", "põe essa foto", "bota essa foto",
+]
+
+
+def _pode_ser_pedido_edicao_imagem(texto):
+    """Filtro barato (por código, sem gastar chamada de IA) pra decidir se VALE A PENA
+    perguntar ao Claude se é um pedido de edição de imagem - nunca decide sozinho que É um
+    pedido de verdade (isso fica com _detectar_pedido_edicao_imagem, que entende o contexto
+    completo da frase), só evita gastar uma chamada de IA numa mensagem qualquer que claramente
+    não tem nada a ver com editar imagem."""
+    if not texto:
+        return False
+    texto_norm = normalizar_texto(texto)
+    return any(palavra in texto_norm for palavra in _PALAVRAS_GATILHO_EDICAO_IMAGEM)
+
+
+SYSTEM_PROMPT_DETECTAR_EDICAO_IMAGEM = """Você analisa uma mensagem que Torres ou Luan mandaram pra
+Cintia (assistente pessoal deles) no privado do WhatsApp. A Cintia agora consegue EDITAR IMAGENS DE
+VERDADE usando uma IA de edição (trocar um texto/data/valor numa arte ou flyer mantendo a mesma
+tipografia, tirar uma pessoa/objeto e colocar uma foto diferente no lugar recortada e encaixada,
+etc) - isso é uma funcionalidade nova e real, não um limite.
+
+Decida se esta mensagem é um PEDIDO PRA EDITAR DE VERDADE UMA IMAGEM/ARTE/FLYER (já enviada nessa
+conversa, ou que está sendo enviada agora). NÃO é pedido de edição: pedir pra CONFERIR/REVISAR se
+está tudo certo (ex: "está escrito certo?", "confere isso", "tem algum erro?"), pedir pra
+encaminhar/organizar algo pro designer/pra Tripa, corrigir o TOM de um texto solto (isso é outra
+ferramenta, de texto), ou qualquer mensagem sem relação com editar uma imagem.
+
+Exemplos que SÃO pedido de edição de imagem: "muda o nome de Semana pra Lagobada nessa arte,
+mesma tipografia", "troca a data de 17 a 20 para 27 a 30", "corrige o valor do chopp pra 8,99
+nesse flyer", "tira esse cantor do flyer e coloca essa foto que mandei no lugar dele, recorta e
+encaixa", "edita essa imagem".
+
+Responda SEMPRE E APENAS em JSON válido, numa única linha por valor, sem bloco de código
+markdown (nada de ```):
+{"eh_pedido_edicao_imagem": true ou false, "instrucao_edicao": "a instrução de edição reescrita de forma clara e completa (o que trocar/tirar/colocar, mantendo o resto igual), pronta pra mandar direto pra IA de edição executar - ou string vazia se não for pedido de edição"}
+"""
+
+
+def _detectar_pedido_edicao_imagem(texto):
+    """Chama o Claude só quando o filtro barato (_pode_ser_pedido_edicao_imagem) já indicou que
+    vale a pena, pra confirmar de verdade (a frase pode ter uma das palavras-gatilho sem ser um
+    pedido de edição de imagem, ex: "corrige o texto no tom formal") e extrair a instrução final
+    já pronta pra IA de edição. Nunca derruba o fluxo principal - devolve (False, "") se algo
+    falhar, tratando como se não fosse pedido de edição (comportamento antigo)."""
+    if not texto or not texto.strip():
+        return False, ""
+    try:
+        resultado = chamar_claude(SYSTEM_PROMPT_DETECTAR_EDICAO_IMAGEM, texto, max_tokens=400, timeout=20)
+        eh_pedido = bool(resultado.get("eh_pedido_edicao_imagem"))
+        instrucao = (resultado.get("instrucao_edicao") or "").strip()
+        return (eh_pedido and bool(instrucao)), instrucao
+    except Exception as e:
+        print(f"[_detectar_pedido_edicao_imagem] erro: {e}", flush=True)
+        return False, ""
+
+
+def _realizar_edicao_imagem_dm(numero, grupo_jid_dm, grupo_nome_dm, instrucao, imagem_nova=None):
+    """Executa de verdade o pedido de edição de imagem: junta a(s) imagem(ns) recente(s)
+    guardada(s) dessa conversa (mais a imagem que acabou de chegar agora, se houver -
+    "imagem_nova" é {"base64", "mime_type"}) com a instrução, chama _editar_imagem_gemini e
+    manda o resultado de volta pelo WhatsApp. Nunca finge sucesso - qualquer falha (sem
+    imagem, erro do Gemini, falha no envio) vira uma mensagem honesta explicando o que
+    aconteceu, nunca um silêncio ou uma resposta genérica de "feito"."""
+    imagens_guardadas = _buscar_imagens_recentes_para_edicao(grupo_jid_dm)
+    imagens = [{"base64": img["base64"], "mime_type": img["mime_type"]} for img in imagens_guardadas]
+    if imagem_nova and imagem_nova.get("base64"):
+        imagens.append({"base64": imagem_nova["base64"], "mime_type": imagem_nova.get("mime_type") or "image/jpeg"})
+    imagens = imagens[-2:]  # nunca mais que 2 - só o que já foi validado de verdade (parte 28)
+
+    if not imagens:
+        enviar_texto(numero, "Entendi que você quer editar uma imagem, mas não achei nenhuma foto recente nessa conversa pra usar - pode mandar a imagem de novo junto com o que quer mudar?")
+        registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", "[pedido de edição de imagem sem nenhuma imagem recente disponível]", False)
+        return {"edicao_imagem_sem_imagem": True}
+
+    resultado, erro = _editar_imagem_gemini(imagens, instrucao)
+    if erro:
+        print(f"[_realizar_edicao_imagem_dm] falhou: {erro}", flush=True)
+        enviar_texto(numero, f"Tentei editar a imagem mas não consegui: {erro}. Não mandei nada - quer que eu tente de novo?")
+        registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", f"[tentou editar a imagem, falhou: {erro}]", False)
+        return {"edicao_imagem_erro": erro}
+
+    imagem_editada_b64, mime_saida = resultado
+    if not enviar_midia(numero, imagem_editada_b64, "image", caption="Pronto, editei! Dá uma conferida 👀"):
+        enviar_texto(numero, "Consegui editar a imagem, mas não consegui te mandar de volta pelo WhatsApp agora - pode tentar de novo?")
+        registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", "[editou a imagem mas falhou ao enviar de volta]", False)
+        return {"edicao_imagem_falhou_envio": True}
+
+    registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", f"[editou a imagem conforme pedido: {instrucao}]", False)
+    # A imagem editada também fica disponível pro buffer, caso a próxima mensagem seja um
+    # novo ajuste em cima dela (ex: "agora troca também a cor do fundo").
+    _guardar_imagem_para_edicao(grupo_jid_dm, imagem_editada_b64, mime_saida)
+    return {"edicao_imagem_ok": True}
+
+
 def _conferir_ultima_arte_da_conversa(chave_arte, chave_historico, enviar_resposta_fn, log_prefixo):
     """Reexecuta a conferencia (ortografia + comparacao com o pedido do cliente) sobre a
     ULTIMA arte/PDF enviado numa conversa, quando alguem pergunta depois, em texto solto,
@@ -6564,6 +6712,23 @@ def processar_dm(remote_jid, key, data):
                 sufixo_arquivo=sufixo_dm,
             )
 
+        # Round 27 parte 29: legenda da própria imagem pedindo uma EDIÇÃO de verdade (ex: "muda
+        # o nome Semana pra Lagobada", "tira esse cantor e coloca essa foto no lugar dele") -
+        # checado ANTES do fluxo de revisão de ortografia/conteúdo abaixo, senão isso viraria só
+        # uma "conferência" (que nem edita nada) ou, pior, a resposta genérica de "recebi!".
+        # Só gasta a chamada de IA de confirmação (_detectar_pedido_edicao_imagem) quando o
+        # filtro barato já achou pistas de que pode ser isso - imagem sem legenda, ou legenda
+        # sem nenhuma palavra de edição, nem chega a perguntar, cai no fluxo de sempre.
+        if "image" in tipo_lower and midia_b64_dm and _pode_ser_pedido_edicao_imagem(caption_dm_recebida):
+            eh_pedido_edicao, instrucao_edicao = _detectar_pedido_edicao_imagem(caption_dm_recebida)
+            if eh_pedido_edicao:
+                registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, pessoa, f"[pediu edição de imagem]: {caption_dm_recebida}{sufixo_dm}", True)
+                resultado_edicao = _realizar_edicao_imagem_dm(
+                    numero, grupo_jid_dm, grupo_nome_dm, instrucao_edicao,
+                    imagem_nova={"base64": midia_b64_dm, "mime_type": "image/jpeg"},
+                )
+                return resultado_edicao
+
         descricao_arquivo_dm = None
         if midia_b64_dm:
             if "image" in tipo_lower:
@@ -6576,6 +6741,11 @@ def processar_dm(remote_jid, key, data):
         else:
             texto_historico_dm = f"[enviou imagem/PDF pra revisão de arte]{sufixo_dm}"
         registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, pessoa, texto_historico_dm, True)
+        if "image" in tipo_lower and midia_b64_dm:
+            # Guarda a imagem no buffer de edição (não é pedido de edição ESSA aqui, mas pode
+            # virar a "foto de referência" ou o "flyer base" de um pedido de edição na PRÓXIMA
+            # mensagem - ex: manda o flyer sem legenda, e só na foto seguinte pede a troca).
+            _guardar_imagem_para_edicao(grupo_jid_dm, midia_b64_dm, "image/jpeg")
         return revisar_arte_dm(numero, key, data, message_type, grupo_jid_dm=grupo_jid_dm)
 
     # Audio/PTT no privado: transcreve e trata como se fosse uma mensagem de texto normal
@@ -6735,6 +6905,19 @@ def processar_dm(remote_jid, key, data):
     modo_correcao, texto_a_corrigir = extrair_modo_e_texto_correcao(texto)
     if modo_correcao:
         return corrigir_texto_dm(numero, modo_correcao, texto_a_corrigir)
+
+    # Round 27 parte 29: pedido de EDIÇÃO de imagem em TEXTO solto, depois da(s) imagem(ns) já
+    # terem sido mandadas (ex: manda o flyer, depois em texto pede "troca a data pra 27 a 30") -
+    # só verifica de verdade (gastando a chamada de IA de confirmação) quando o filtro barato
+    # achou pistas de edição E existe pelo menos uma imagem recente guardada nessa conversa pra
+    # editar; sem nenhuma das duas coisas, nem chega a perguntar, cai no fluxo normal (evita
+    # gastar uma chamada de IA à toa numa mensagem comum do dia a dia).
+    if _pode_ser_pedido_edicao_imagem(texto) and _buscar_imagens_recentes_para_edicao(grupo_jid_dm):
+        eh_pedido_edicao, instrucao_edicao = _detectar_pedido_edicao_imagem(texto)
+        if eh_pedido_edicao:
+            # A mensagem de texto em si já foi registrada no histórico mais acima (fluxo normal
+            # de texto/áudio) - não registra de novo aqui, só executa a edição.
+            return _realizar_edicao_imagem_dm(numero, grupo_jid_dm, grupo_nome_dm, instrucao_edicao)
 
     # Pedido de conferência de arte/informação em TEXTO solto ("está certo?", "confere
     # isso", etc) - reconfere a ÚLTIMA arte enviada nesse privado (imagem/PDF), sem precisar
