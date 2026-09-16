@@ -8236,6 +8236,81 @@ def _baixar_midia_de_link_metricool(link):
     return resp.content, mime_type, None
 
 
+# Round 27 parte 32: bug real reportado pelo Torres - mandou uma PASTA do Drive (carrossel, várias
+# imagens) pro Metricool e a Cintia respondeu "análise da imagem falhou, ou é um vídeo" (mensagem
+# genuína, não travou) porque _extrair_arquivo_id_drive ignora link de pasta DE PROPÓSITO (só
+# reconhece link de ARQUIVO único - ver comentário lá, decisão da parte 14). O pedido de postagem
+# nunca tinha suporte a carrossel/múltiplas imagens, só a um arquivo por vez. Estas funções dão
+# suporte a pasta do Drive como uma segunda origem de mídia, devolvendo sempre uma LISTA (mesmo
+# que de 1 item só), preservando o comportamento de link de arquivo único/link público direto.
+_LIMITE_IMAGENS_CARROSSEL = 10  # limite real do Instagram pra carrossel
+
+
+def _extrair_pasta_id_drive(texto):
+    """Procura um link de PASTA do Google Drive (.../drive/folders/<id>) - diferente de
+    _extrair_arquivo_id_drive, que reconhece só link de ARQUIVO único de propósito."""
+    if not texto:
+        return None
+    m = re.search(r"https?://drive\.google\.com/drive/folders/([a-zA-Z0-9_-]+)", texto)
+    return m.group(1) if m else None
+
+
+def _listar_midias_pasta_drive(pasta_id):
+    """Lista os arquivos de imagem/vídeo dentro de uma pasta do Drive (ignora subpastas e
+    qualquer outro tipo de arquivo), em ordem alfabética de nome pra dar uma ordem previsível
+    ao carrossel. Devolve [] se a pasta não existir, não tiver acesso, ou estiver vazia - nunca
+    lança exceção. Mesma exigência de sempre: a pasta precisa estar compartilhada com a conta
+    de serviço da Cintia (ou dentro de um Drive Compartilhado do qual ela é membro)."""
+    service = _obter_drive_service()
+    if not service or not pasta_id:
+        return []
+    try:
+        resultado = service.files().list(
+            q=f"'{pasta_id}' in parents and trashed = false",
+            fields="files(id, name, mimeType)", pageSize=50, orderBy="name",
+            supportsAllDrives=True, includeItemsFromAllDrives=True,
+        ).execute()
+        arquivos = resultado.get("files", [])
+        return [a for a in arquivos if (a.get("mimeType") or "").startswith(("image/", "video/"))]
+    except Exception as e:
+        print(f"[_listar_midias_pasta_drive] erro ao listar pasta do Drive {pasta_id}: {e}", flush=True)
+        return []
+
+
+def _baixar_midias_de_link_metricool(link):
+    """Versão em LISTA de _baixar_midia_de_link_metricool, pra suportar carrossel (várias
+    imagens numa postagem só). Se o link for uma PASTA do Drive, baixa as imagens/vídeos de
+    dentro dela (em ordem de nome, até o limite do Instagram); se for link de arquivo único ou
+    link público direto, devolve uma lista com só esse item (mesmo comportamento de sempre).
+    Devolve (lista_de_{"bytes","mime_type"}, erro, aviso) - erro None em sucesso; aviso é um
+    texto extra (pode ser "") pra anexar na resposta quando algo relevante aconteceu mesmo com
+    sucesso (ex: pasta com mais imagens que o limite, ou algum arquivo que não baixou)."""
+    pasta_id = _extrair_pasta_id_drive(link)
+    if pasta_id:
+        arquivos_encontrados = _listar_midias_pasta_drive(pasta_id)
+        if not arquivos_encontrados:
+            return None, "não achei nenhuma imagem/vídeo dentro dessa pasta do Drive (confere se está compartilhada com a Cintia e se tem algum arquivo dentro)", ""
+        total_encontrado = len(arquivos_encontrados)
+        arquivos_usados = arquivos_encontrados[:_LIMITE_IMAGENS_CARROSSEL]
+        midias = []
+        for arquivo in arquivos_usados:
+            conteudo_b64, mimetype, _nome = _baixar_arquivo_drive_por_id(arquivo["id"])
+            if conteudo_b64:
+                midias.append({"bytes": base64.b64decode(conteudo_b64), "mime_type": mimetype})
+        if not midias:
+            return None, "encontrei a pasta mas não consegui baixar nenhum arquivo de dentro dela", ""
+        aviso = ""
+        if total_encontrado > _LIMITE_IMAGENS_CARROSSEL:
+            aviso = f" (a pasta tinha {total_encontrado} imagens/vídeos, usei só as {_LIMITE_IMAGENS_CARROSSEL} primeiras - limite do Instagram pra carrossel)"
+        elif len(midias) < len(arquivos_usados):
+            aviso = f" ({len(arquivos_usados) - len(midias)} arquivo(s) da pasta eu não consegui baixar, segui só com os que deram certo)"
+        return midias, None, aviso
+    conteudo_bytes, mime_type, erro = _baixar_midia_de_link_metricool(link)
+    if erro:
+        return None, erro, ""
+    return [{"bytes": conteudo_bytes, "mime_type": mime_type}], None, ""
+
+
 def _identificar_clientes_metricool_candidatos(texto):
     """Mesma lógica de identificar_grupos_candidatos, mas contra a lista de marcas do
     Metricool (que inclui contas sem grupo de WhatsApp próprio, como o perfil pessoal do
@@ -8465,13 +8540,17 @@ def _processar_pedido_metricool_dm(pessoa, numero, grupo_jid_dm, grupo_nome_dm, 
     eh_rascunho = "rascunho" in normalizar_texto(texto) or "draft" in normalizar_texto(texto)
     pede_sugestao_legenda = _pede_sugestao_legenda_metricool(texto)
 
-    conteudo_bytes, mime_type, erro_download = _baixar_midia_de_link_metricool(link)
+    # Round 27 parte 32: link pode ser um ARQUIVO único (comportamento de sempre) ou uma PASTA
+    # do Drive com várias imagens (carrossel) - _baixar_midias_de_link_metricool sempre devolve
+    # uma LISTA (1 item ou vários), pra tratar os dois casos com o mesmo código daqui pra frente.
+    midias, erro_download, aviso_midias = _baixar_midias_de_link_metricool(link)
     if erro_download:
         enviar_texto(numero, f"Não consegui baixar essa mídia pra postar: {erro_download}")
         registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", f"[pedido de postagem no Metricool falhou ao baixar a mídia: {erro_download}]", False)
         return {"metricool_erro_download": erro_download}
 
-    media_url_publica = _publicar_midia_temporaria(conteudo_bytes, mime_type)
+    media_urls_publicas = [_publicar_midia_temporaria(m["bytes"], m["mime_type"]) for m in midias]
+    eh_carrossel = len(midias) > 1
     rotulo_tipo = "feed" if tipo_instagram == "POST" else "story"
 
     # Round 27 parte 31: pedido explícito de SUGESTÃO de legenda (Torres pede pra Cintia olhar
@@ -8481,9 +8560,16 @@ def _processar_pedido_metricool_dm(pessoa, numero, grupo_jid_dm, grupo_nome_dm, 
     # legenda vem pronta do próprio Torres - aqui não veio dele, então confirma sempre).
     if pede_sugestao_legenda:
         legenda_sugerida = ""
-        if mime_type and mime_type.startswith("image/"):
-            imagem_b64_sugestao = base64.b64encode(conteudo_bytes).decode()
-            legenda_sugerida = _sugerir_legenda_metricool(imagem_b64_sugestao, mime_type, cliente_nome, tipo_instagram, texto)
+        primeira_midia = midias[0]
+        if primeira_midia["mime_type"] and primeira_midia["mime_type"].startswith("image/"):
+            imagem_b64_sugestao = base64.b64encode(primeira_midia["bytes"]).decode()
+            contexto_pedido = texto
+            if eh_carrossel:
+                # Só a primeira imagem é analisada de verdade (vision só aceita 1 imagem por
+                # chamada aqui) - avisa isso no próprio contexto pra Cintia não inventar
+                # conteúdo das outras imagens que ela não viu.
+                contexto_pedido += f" [carrossel com {len(midias)} imagens - a imagem mostrada é só a capa/primeira, as outras eu não vi]"
+            legenda_sugerida = _sugerir_legenda_metricool(imagem_b64_sugestao, primeira_midia["mime_type"], cliente_nome, tipo_instagram, contexto_pedido)
         if not legenda_sugerida:
             enviar_texto(
                 numero,
@@ -8499,7 +8585,7 @@ def _processar_pedido_metricool_dm(pessoa, numero, grupo_jid_dm, grupo_nome_dm, 
             "metricool_blog_id": blog_id,
             "metricool_cliente_nome": cliente_nome,
             "metricool_tipo_instagram": tipo_instagram,
-            "metricool_media_urls": [media_url_publica],
+            "metricool_media_urls": media_urls_publicas,
             "metricool_texto": legenda_sugerida,
             "metricool_draft": eh_rascunho,
             "metricool_grupo_jid_dm": grupo_jid_dm,
@@ -8508,7 +8594,7 @@ def _processar_pedido_metricool_dm(pessoa, numero, grupo_jid_dm, grupo_nome_dm, 
         acao_pendente = "deixar em rascunho" if eh_rascunho else "publicar"
         enviar_texto(
             numero,
-            f'Legenda sugerida pro {rotulo_tipo} do {cliente_nome}:\n\n"{legenda_sugerida}"\n\n'
+            f'Legenda sugerida pro {rotulo_tipo} do {cliente_nome}{aviso_midias}:\n\n"{legenda_sugerida}"\n\n'
             f"Posso {acao_pendente} com essa legenda? Confirma (sim/não), ou me manda a legenda que você preferir.",
         )
         registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", f"[sugeriu legenda pro Metricool, aguardando aprovação: {rotulo_tipo} do {cliente_nome}]", False)
@@ -8517,14 +8603,14 @@ def _processar_pedido_metricool_dm(pessoa, numero, grupo_jid_dm, grupo_nome_dm, 
     legenda = _extrair_legenda_metricool(texto)
 
     if eh_rascunho:
-        resultado, erro = _metricool_criar_post(blog_id, tipo_instagram, [media_url_publica], legenda, draft=True)
+        resultado, erro = _metricool_criar_post(blog_id, tipo_instagram, media_urls_publicas, legenda, draft=True)
         if erro:
             print(f"[_processar_pedido_metricool_dm] falhou (rascunho): {erro}", flush=True)
             enviar_texto(numero, f"Tentei deixar em rascunho no Metricool mas deu erro: {erro}")
             registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", f"[tentou deixar em rascunho no Metricool, falhou: {erro}]", False)
             return {"metricool_erro": erro}
         aviso_legenda = "" if legenda else " (sem legenda - só o texto do link e do comando, então deixei sem, você pode completar direto no Metricool)"
-        enviar_texto(numero, f"Prontinho! Deixei em rascunho no Metricool, no {rotulo_tipo} do {cliente_nome}{aviso_legenda} - dá uma conferida por lá antes de publicar 👍")
+        enviar_texto(numero, f"Prontinho! Deixei em rascunho no Metricool, no {rotulo_tipo} do {cliente_nome}{aviso_legenda}{aviso_midias} - dá uma conferida por lá antes de publicar 👍")
         registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", f"[deixou em rascunho no Metricool: {rotulo_tipo} do {cliente_nome}]", False)
         return {"metricool_rascunho_ok": True}
 
@@ -8535,13 +8621,13 @@ def _processar_pedido_metricool_dm(pessoa, numero, grupo_jid_dm, grupo_nome_dm, 
         "metricool_blog_id": blog_id,
         "metricool_cliente_nome": cliente_nome,
         "metricool_tipo_instagram": tipo_instagram,
-        "metricool_media_urls": [media_url_publica],
+        "metricool_media_urls": media_urls_publicas,
         "metricool_texto": legenda,
         "metricool_grupo_jid_dm": grupo_jid_dm,
         "metricool_grupo_nome_dm": grupo_nome_dm,
     }
     resumo_legenda = f' com a legenda "{legenda}"' if legenda else " sem legenda nenhuma (não achei nenhum texto próprio na sua mensagem)"
-    enviar_texto(numero, f"Posso publicar isso agora no {rotulo_tipo} do {cliente_nome}{resumo_legenda}? Confirma?")
+    enviar_texto(numero, f"Posso publicar isso agora no {rotulo_tipo} do {cliente_nome}{resumo_legenda}{aviso_midias}? Confirma?")
     registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", f"[aguardando confirmação pra publicar no Metricool: {rotulo_tipo} do {cliente_nome}]", False)
     return {"metricool_aguardando_confirmacao": True}
 
