@@ -41,10 +41,11 @@ import tempfile
 import time
 import threading
 import unicodedata
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, date, timezone, timedelta
 
-from flask import Flask, request, jsonify, redirect
+from flask import Flask, request, jsonify, redirect, Response
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -6919,6 +6920,14 @@ def processar_dm(remote_jid, key, data):
             # de texto/áudio) - não registra de novo aqui, só executa a edição.
             return _realizar_edicao_imagem_dm(numero, grupo_jid_dm, grupo_nome_dm, instrucao_edicao)
 
+    # Round 27 parte 30: pedido de POSTAGEM NO METRICOOL (link + cliente + feed/story, ex:
+    # "posta no story do Zurca: <link>") - filtro barato primeiro (precisa ter uma URL de
+    # verdade e uma palavra de gatilho), só then processa de verdade.
+    if _pode_ser_pedido_metricool(texto):
+        resultado_metricool = _processar_pedido_metricool_dm(pessoa, numero, grupo_jid_dm, grupo_nome_dm, texto)
+        if resultado_metricool is not None:
+            return resultado_metricool
+
     # Pedido de conferência de arte/informação em TEXTO solto ("está certo?", "confere
     # isso", etc) - reconfere a ÚLTIMA arte enviada nesse privado (imagem/PDF), sem precisar
     # reenviar a peça. Mesmo gatilho que existe no grupo Tripa e no Gestão (pedido explícito
@@ -7004,6 +7013,22 @@ def processar_dm(remote_jid, key, data):
             _comandos_pendentes.pop(pessoa, None)
             responder(f"Show, repassei pro {pendente['nome_destino_repasse']}! ✅")
             return {"repasse_pessoa_confirmado": True, "destino": pendente["nome_destino_repasse"]}
+        elif confirma is True and pendente.get("eh_postagem_metricool"):
+            # Round 27 parte 30: só chega aqui depois do "sim" - publica de verdade no Metricool
+            # (a pergunta de confirmação já foi mandada em _processar_pedido_metricool_dm).
+            cliente_nome_mc = pendente["metricool_cliente_nome"]
+            rotulo_tipo_mc = "feed" if pendente["metricool_tipo_instagram"] == "POST" else "story"
+            resultado_mc, erro_mc = _metricool_criar_post(
+                pendente["metricool_blog_id"], pendente["metricool_tipo_instagram"],
+                pendente["metricool_media_urls"], pendente["metricool_texto"], draft=False,
+            )
+            _comandos_pendentes.pop(pessoa, None)
+            if erro_mc:
+                print(f"[processar_dm] falhou ao publicar no Metricool: {erro_mc}", flush=True)
+                responder(f"Tentei publicar no {rotulo_tipo_mc} do {cliente_nome_mc} mas deu erro: {erro_mc}. Não foi publicado nada.")
+                return {"metricool_publicacao_falhou": erro_mc}
+            responder(f"Prontinho, publiquei no {rotulo_tipo_mc} do {cliente_nome_mc}! ✅")
+            return {"metricool_publicacao_confirmada": True, "cliente": cliente_nome_mc}
         elif confirma is True:
             enviar_texto(TRIPA_DESIGNER_JID, pendente["mensagem_tripa"])
             aviso_cobranca = ""
@@ -8080,6 +8105,293 @@ def debug_testar_edicao_imagem():
 
     imagem_editada_b64, mime_saida = resultado
     return jsonify({"ok": True, "imagem_base64": imagem_editada_b64, "mime_type": mime_saida})
+
+
+# --------------------------------------------------------------------------
+# Postagem no Metricool via WhatsApp (Round 27 parte 30) - Torres pediu pra conseguir mandar um
+# link (Google Drive ou link público) pra Cintia no privado e ela postar no Instagram (feed ou
+# story) de um cliente através do Metricool, dizendo o nome do cliente e feed/story na própria
+# mensagem. Combinado com ele: ela SEMPRE pergunta antes de publicar de verdade (nunca publica
+# sozinha sem confirmação); só quando ele pedir EXPLICITAMENTE pra "deixar em rascunho" ela pode
+# fazer isso direto, sem perguntar (rascunho não é público, não tem risco).
+#
+# Importante: essa é uma chamada HTTP direta pra API pública do Metricool
+# (https://app.metricool.com/api/v2/scheduler/posts, autenticada com X-Mc-Auth) - não é a mesma
+# conexão de Metricool usada na conversa de desenvolvimento (aquela é uma sessão MCP separada,
+# ligada à minha conta ali, não à Cintia). Torres gerou um token dedicado em Configurações da
+# conta > API no Metricool e configurou como variável de ambiente no Railway.
+METRICOOL_API_TOKEN = os.environ.get("METRICOOL_API_TOKEN", "")
+METRICOOL_USER_ID = os.environ.get("METRICOOL_USER_ID", "4956967")
+
+# blogId de cada marca no Metricool (obtido direto da conta do Torres) - nome canônico usado
+# pra identificar o cliente na mensagem, do mesmo jeito que GRUPOS já faz pra outras funções.
+METRICOOL_BLOG_IDS = {
+    "House and Co": "6461843",
+    "Latidos e miados": "6461881",
+    "Zurca": "6461929",
+    "Dr. Fellipe Barbosa": "6461995",
+    "Chicafe": "6462020",
+    "Asas do Brasil": "6462025",
+    "Novo Mix": "6462601",
+    "Torres": "6497830",
+    "Terapia": "6511386",
+    "Luan Menezes": "6658785",
+    "Olegario": "6679288",
+    "Banjo Novo": "6787323",
+    "Z5 Montagens": "6983307",
+}
+
+# Domínio público da própria Cintia (Railway) - usado pra hospedar temporariamente a mídia
+# baixada de um link do Drive/etc, já que o Metricool precisa de uma URL pública que ELE consiga
+# baixar sozinho (não aceita um link privado de Drive sem a integração de Drive dele mesmo
+# configurada, que não sabemos se o Torres tem). Assim a Cintia nunca depende disso: ela baixa a
+# mídia, hospeda um link público próprio (curto prazo, só o suficiente pro Metricool buscar) e
+# manda esse link pro Metricool, funcionando igual não importa a origem do link original.
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL") or (
+    f"https://{os.environ['RAILWAY_PUBLIC_DOMAIN']}" if os.environ.get("RAILWAY_PUBLIC_DOMAIN")
+    else "https://kingkongfilmes-production.up.railway.app"
+)
+
+_REGEX_URL_QUALQUER = re.compile(r"https?://[^\s<>\"']+")
+
+_midias_publicas_temp = {}
+_midias_publicas_lock = threading.Lock()
+_MIDIA_PUBLICA_TTL = 24 * 60 * 60  # 24h - tempo de sobra pro Metricool buscar a mídia; depois
+                                    # disso ela some (é só uma ponte temporária, não um backup)
+
+_EXTENSAO_POR_MIME_PUBLICA = {
+    "image/jpeg": "jpg", "image/jpg": "jpg", "image/png": "png", "image/webp": "webp",
+    "image/gif": "gif", "video/mp4": "mp4", "video/quicktime": "mov",
+}
+
+
+def _publicar_midia_temporaria(conteudo_bytes, mime_type):
+    """Guarda o conteúdo (bytes) em memória e devolve uma URL pública própria da Cintia
+    (Railway) de onde o Metricool consegue baixar - ponte temporária, não um backup permanente
+    (isso já existe em outro lugar, via Google Drive)."""
+    midia_id = uuid.uuid4().hex
+    with _midias_publicas_lock:
+        _midias_publicas_temp[midia_id] = {
+            "bytes": conteudo_bytes, "mime_type": mime_type or "application/octet-stream", "criado_em": time.time(),
+        }
+    extensao = _EXTENSAO_POR_MIME_PUBLICA.get(mime_type, "bin")
+    return f"{PUBLIC_BASE_URL}/midia-publica/{midia_id}.{extensao}"
+
+
+@app.route("/midia-publica/<midia_id>")
+def midia_publica(midia_id):
+    """Serve a mídia hospedada temporariamente por _publicar_midia_temporaria - só existe pra
+    dar ao Metricool (ou qualquer outro serviço externo) uma URL pública de verdade a partir de
+    um link privado (ex: Drive) que a Cintia já baixou. 404 se nunca existiu ou já expirou."""
+    midia_id_limpo = midia_id.split(".")[0]
+    with _midias_publicas_lock:
+        info = _midias_publicas_temp.get(midia_id_limpo)
+    if not info or (time.time() - info["criado_em"] > _MIDIA_PUBLICA_TTL):
+        return "", 404
+    return Response(info["bytes"], mimetype=info["mime_type"])
+
+
+def _baixar_midia_de_link_metricool(link):
+    """Baixa a mídia (imagem/vídeo) de um link pra poder republicar no Metricool - link do
+    Google Drive (pela conta de serviço da Cintia, mesma regra de sempre: precisa estar
+    compartilhado com ela) ou qualquer outro link público direto. Devolve
+    (conteudo_bytes, mime_type, erro) - erro None em caso de sucesso, nunca lança exceção."""
+    arquivo_id_drive = _extrair_arquivo_id_drive(link)
+    if arquivo_id_drive:
+        conteudo_b64, mimetype, _nome = _baixar_arquivo_drive_por_id(arquivo_id_drive)
+        if not conteudo_b64:
+            if mimetype and mimetype.startswith("application/vnd.google-apps"):
+                return None, None, "esse link do Drive é de um documento do Google (Docs/Sheets/Slides), não uma imagem/vídeo de verdade"
+            return None, None, "não consegui acessar esse arquivo do Drive (confere se está compartilhado com a Cintia, ou se o link está certo)"
+        return base64.b64decode(conteudo_b64), mimetype, None
+    try:
+        resp = requests.get(link, timeout=30)
+    except Exception as e:
+        return None, None, f"erro de rede baixando o link: {e}"
+    if resp.status_code != 200:
+        return None, None, f"o link respondeu HTTP {resp.status_code}"
+    mime_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip() or "application/octet-stream"
+    return resp.content, mime_type, None
+
+
+def _identificar_clientes_metricool_candidatos(texto):
+    """Mesma lógica de identificar_grupos_candidatos, mas contra a lista de marcas do
+    Metricool (que inclui contas sem grupo de WhatsApp próprio, como o perfil pessoal do
+    Torres) - devolve TODOS os nomes que batem no texto, nunca escolhe um sozinho quando há
+    mais de um (ambiguidade real vira pergunta, nunca chute)."""
+    texto_norm = normalizar_texto(texto)
+    candidatos = []
+    for nome, blog_id in METRICOOL_BLOG_IDS.items():
+        nome_norm = normalizar_texto(nome)
+        if nome_norm and nome_norm in texto_norm:
+            candidatos.append((blog_id, nome))
+    return candidatos
+
+
+def _detectar_tipo_conteudo_metricool(texto):
+    """Feed ou Stories - decidido por palavra-chave (por código, sem gastar IA), exatamente
+    como Torres disse que vai indicar: 'story'/'stories' pra Stories, 'feed'/'post' pra feed.
+    Devolve 'STORY', 'POST' ou None se não ficou claro (nesse caso, pergunta em vez de chutar)."""
+    texto_norm = normalizar_texto(texto)
+    tem_story = "story" in texto_norm or "stories" in texto_norm
+    tem_feed = "feed" in texto_norm or " post " in f" {texto_norm} "
+    if tem_story and not tem_feed:
+        return "STORY"
+    if tem_feed and not tem_story:
+        return "POST"
+    return None
+
+
+_PALAVRAS_GATILHO_METRICOOL = [
+    "posta", "poste", "postar", "publica", "publique", "publicar",
+    "agenda isso", "agende isso", "rascunho", "draft", "metricool",
+]
+
+
+def _pode_ser_pedido_metricool(texto):
+    """Filtro barato (sem IA): só vale a pena tratar como pedido de postagem no Metricool
+    quando a mensagem tem uma URL de verdade E pelo menos uma palavra de gatilho - sem os
+    dois, nem chega a considerar (evita falso positivo numa mensagem comum que por acaso
+    cita um link, ex: mandando uma referência)."""
+    if not texto or not _REGEX_URL_QUALQUER.search(texto):
+        return False
+    texto_norm = normalizar_texto(texto)
+    return any(p in texto_norm for p in _PALAVRAS_GATILHO_METRICOOL)
+
+
+SYSTEM_PROMPT_EXTRAIR_LEGENDA_METRICOOL = """Você recebe uma mensagem que Torres mandou pra Cintia
+pedindo pra postar uma imagem/vídeo no Instagram (via Metricool), junto com um link e instruções
+tipo qual cliente, feed ou story, rascunho ou não. Extraia SÓ o texto que deve virar a LEGENDA
+publicada junto com a mídia no Instagram - nunca inclua o link, o nome do cliente, nem instruções
+de comando (ex: "posta no feed do Zurca", "deixa em rascunho", "publica isso").
+
+Exemplo: "Posta no feed do Zurca: vem pro happy hour hoje às 18h! https://... " -> legenda "vem
+pro happy hour hoje às 18h!".
+Se a mensagem não tiver nenhum texto que pareça ser de verdade pra virar legenda (só o link e o
+comando, sem nenhuma frase própria pro post), devolva "" (vazio) - nunca invente uma legenda que
+a pessoa não escreveu.
+
+Responda SEMPRE E APENAS em JSON válido, sem bloco de código markdown:
+{"legenda": "o texto da legenda extraído literalmente da mensagem, ou string vazia"}
+"""
+
+
+def _extrair_legenda_metricool(texto):
+    try:
+        resultado = chamar_claude(SYSTEM_PROMPT_EXTRAIR_LEGENDA_METRICOOL, texto, max_tokens=300, timeout=20)
+        return (resultado.get("legenda") or "").strip()
+    except Exception as e:
+        print(f"[_extrair_legenda_metricool] erro: {e}", flush=True)
+        return ""
+
+
+def _metricool_criar_post(blog_id, tipo_instagram, media_urls, texto, draft):
+    """Cria um post/story no Instagram através da API pública do Metricool
+    (https://app.metricool.com/api/v2/scheduler/posts). Retorna (resposta_json, None) em
+    sucesso, ou (None, "motivo do erro em texto") em falha - nunca inventa sucesso nem lança
+    exceção pra quem chamou."""
+    if not METRICOOL_API_TOKEN:
+        return None, "METRICOOL_API_TOKEN não configurado nas variáveis de ambiente do Railway"
+    agora = horario_bahia_agora()
+    data_publicacao = agora + timedelta(minutes=2)  # o Metricool não aceita data no passado
+    corpo = {
+        "publicationDate": {
+            "dateTime": data_publicacao.strftime("%Y-%m-%dT%H:%M:%S"),
+            "timezone": "America/Bahia",
+        },
+        "text": texto or "",
+        "providers": [{"network": "instagram"}],
+        "instagramData": {"type": tipo_instagram},
+        "media": media_urls,
+        "autoPublish": True,
+        "draft": bool(draft),
+    }
+    try:
+        resp = requests.post(
+            "https://app.metricool.com/api/v2/scheduler/posts",
+            params={"blogId": blog_id, "userId": METRICOOL_USER_ID},
+            headers={"X-Mc-Auth": METRICOOL_API_TOKEN, "Content-Type": "application/json"},
+            json=corpo,
+            timeout=60,
+        )
+    except Exception as e:
+        return None, f"erro de rede chamando a API do Metricool: {e}"
+    if resp.status_code not in (200, 201):
+        return None, f"Metricool respondeu HTTP {resp.status_code}: {resp.text[:1500]}"
+    try:
+        return resp.json(), None
+    except Exception:
+        return {}, None
+
+
+def _processar_pedido_metricool_dm(pessoa, numero, grupo_jid_dm, grupo_nome_dm, texto):
+    """Ponto de entrada do pedido de postagem no Metricool em texto solto no privado (Torres
+    manda um link + cliente + feed/story, ex: 'posta no story do Zurca: <link>'). Nunca publica
+    de verdade sem confirmação - só guarda um comando pendente (mesmo mecanismo já usado pra
+    Tripa/áudio/repasse) e espera o 'sim', EXCETO quando a própria mensagem já pede
+    explicitamente pra deixar em rascunho, caso em que cria direto (rascunho não é público)."""
+    link = _REGEX_URL_QUALQUER.search(texto)
+    link = link.group(0) if link else None
+    if not link:
+        return None  # sem link nenhum, nem é esse fluxo - segue o processamento normal
+
+    candidatos = _identificar_clientes_metricool_candidatos(texto)
+    if len(candidatos) != 1:
+        if not candidatos:
+            enviar_texto(numero, "Entendi que é pra postar algo no Metricool, mas não consegui identificar de qual cliente/perfil é - pode confirmar o nome?")
+        else:
+            nomes = ", ".join(nome for _bid, nome in candidatos)
+            enviar_texto(numero, f"Achei mais de um nome que bate ({nomes}) - qual desses é o cliente certo?")
+        registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", "[pedido de postagem no Metricool sem cliente identificado com certeza]", False)
+        return {"metricool_cliente_ambiguo_ou_nao_encontrado": True}
+    blog_id, cliente_nome = candidatos[0]
+
+    tipo_instagram = _detectar_tipo_conteudo_metricool(texto)
+    if not tipo_instagram:
+        enviar_texto(numero, f"Entendi que é pra postar no Metricool pro {cliente_nome}, mas não ficou claro se é FEED ou STORY - pode confirmar?")
+        registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", "[pedido de postagem no Metricool sem feed/story identificado]", False)
+        return {"metricool_tipo_ambiguo": True}
+
+    eh_rascunho = "rascunho" in normalizar_texto(texto) or "draft" in normalizar_texto(texto)
+    legenda = _extrair_legenda_metricool(texto)
+
+    conteudo_bytes, mime_type, erro_download = _baixar_midia_de_link_metricool(link)
+    if erro_download:
+        enviar_texto(numero, f"Não consegui baixar essa mídia pra postar: {erro_download}")
+        registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", f"[pedido de postagem no Metricool falhou ao baixar a mídia: {erro_download}]", False)
+        return {"metricool_erro_download": erro_download}
+
+    media_url_publica = _publicar_midia_temporaria(conteudo_bytes, mime_type)
+    rotulo_tipo = "feed" if tipo_instagram == "POST" else "story"
+
+    if eh_rascunho:
+        resultado, erro = _metricool_criar_post(blog_id, tipo_instagram, [media_url_publica], legenda, draft=True)
+        if erro:
+            print(f"[_processar_pedido_metricool_dm] falhou (rascunho): {erro}", flush=True)
+            enviar_texto(numero, f"Tentei deixar em rascunho no Metricool mas deu erro: {erro}")
+            registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", f"[tentou deixar em rascunho no Metricool, falhou: {erro}]", False)
+            return {"metricool_erro": erro}
+        aviso_legenda = "" if legenda else " (sem legenda - só o texto do link e do comando, então deixei sem, você pode completar direto no Metricool)"
+        enviar_texto(numero, f"Prontinho! Deixei em rascunho no Metricool, no {rotulo_tipo} do {cliente_nome}{aviso_legenda} - dá uma conferida por lá antes de publicar 👍")
+        registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", f"[deixou em rascunho no Metricool: {rotulo_tipo} do {cliente_nome}]", False)
+        return {"metricool_rascunho_ok": True}
+
+    # Não é rascunho - SEMPRE confirma antes de publicar de verdade (combinado com o Torres).
+    _comandos_pendentes[pessoa] = {
+        "criado_em": time.time(),
+        "eh_postagem_metricool": True,
+        "metricool_blog_id": blog_id,
+        "metricool_cliente_nome": cliente_nome,
+        "metricool_tipo_instagram": tipo_instagram,
+        "metricool_media_urls": [media_url_publica],
+        "metricool_texto": legenda,
+        "metricool_grupo_jid_dm": grupo_jid_dm,
+        "metricool_grupo_nome_dm": grupo_nome_dm,
+    }
+    resumo_legenda = f' com a legenda "{legenda}"' if legenda else " sem legenda nenhuma (não achei nenhum texto próprio na sua mensagem)"
+    enviar_texto(numero, f"Posso publicar isso agora no {rotulo_tipo} do {cliente_nome}{resumo_legenda}? Confirma?")
+    registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", f"[aguardando confirmação pra publicar no Metricool: {rotulo_tipo} do {cliente_nome}]", False)
+    return {"metricool_aguardando_confirmacao": True}
 
 
 # Round 27 parte 21: re-arma no scheduler todo lembrete que ainda não disparou, salvo antes de
