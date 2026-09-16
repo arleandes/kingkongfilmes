@@ -7078,6 +7078,12 @@ def processar_dm(remote_jid, key, data):
             # (a pergunta de confirmação já foi mandada em _processar_pedido_metricool_dm).
             cliente_nome_mc = pendente["metricool_cliente_nome"]
             rotulo_tipo_mc = "feed" if pendente["metricool_tipo_instagram"] == "POST" else "story"
+            handle_mc = _metricool_handle_instagram(cliente_nome_mc)
+            if not _metricool_validar_destino(cliente_nome_mc, pendente["metricool_blog_id"]):
+                print(f"[processar_dm] BLOQUEADO por segurança: blog_id da pendência não bate com o cliente '{cliente_nome_mc}' - nada foi publicado", flush=True)
+                _comandos_pendentes.pop(pessoa, None)
+                responder(f"Encontrei uma inconsistência nos dados dessa publicação (o perfil não bateu com o cliente '{cliente_nome_mc}') e travei por segurança - NÃO publiquei nada. Me manda o pedido de novo, por favor.")
+                return {"metricool_bloqueado_seguranca": True}
             resultado_mc, erro_mc = _metricool_criar_post(
                 pendente["metricool_blog_id"], pendente["metricool_tipo_instagram"],
                 pendente["metricool_media_urls"], pendente["metricool_texto"], draft=False,
@@ -7085,9 +7091,11 @@ def processar_dm(remote_jid, key, data):
             _comandos_pendentes.pop(pessoa, None)
             if erro_mc:
                 print(f"[processar_dm] falhou ao publicar no Metricool: {erro_mc}", flush=True)
-                responder(f"Tentei publicar no {rotulo_tipo_mc} do {cliente_nome_mc} mas deu erro: {erro_mc}. Não foi publicado nada.")
+                responder(f"Tentei publicar no {rotulo_tipo_mc} do {cliente_nome_mc} ({handle_mc}) mas deu erro: {erro_mc}. Não foi publicado nada.")
                 return {"metricool_publicacao_falhou": erro_mc}
-            responder(f"Prontinho, publiquei no {rotulo_tipo_mc} do {cliente_nome_mc}! ✅")
+            ordem_mc = _formatar_ordem_midias([{"nome": n} for n in pendente.get("metricool_nomes_midias") or []])
+            ordem_mc_txt = f"\n\nOrdem publicada:\n{ordem_mc}" if ordem_mc else ""
+            responder(f"Prontinho, publiquei no {rotulo_tipo_mc} do {cliente_nome_mc} - perfil {handle_mc} no Instagram! ✅{ordem_mc_txt}")
             return {"metricool_publicacao_confirmada": True, "cliente": cliente_nome_mc}
         elif confirma is True and pendente.get("eh_legenda_sugerida_metricool"):
             # Round 27 parte 31: legenda foi CRIADA pela Cintia (não escrita pelo Torres), então
@@ -7096,6 +7104,12 @@ def processar_dm(remote_jid, key, data):
             cliente_nome_mc = pendente["metricool_cliente_nome"]
             rotulo_tipo_mc = "feed" if pendente["metricool_tipo_instagram"] == "POST" else "story"
             eh_rascunho_mc = pendente.get("metricool_draft", False)
+            handle_mc = _metricool_handle_instagram(cliente_nome_mc)
+            if not _metricool_validar_destino(cliente_nome_mc, pendente["metricool_blog_id"]):
+                print(f"[processar_dm] BLOQUEADO por segurança: blog_id da pendência não bate com o cliente '{cliente_nome_mc}' (legenda sugerida) - nada foi feito", flush=True)
+                _comandos_pendentes.pop(pessoa, None)
+                responder(f"Encontrei uma inconsistência nos dados dessa publicação (o perfil não bateu com o cliente '{cliente_nome_mc}') e travei por segurança - NÃO fiz nada. Me manda o pedido de novo, por favor.")
+                return {"metricool_bloqueado_seguranca": True}
             resultado_mc, erro_mc = _metricool_criar_post(
                 pendente["metricool_blog_id"], pendente["metricool_tipo_instagram"],
                 pendente["metricool_media_urls"], pendente["metricool_texto"], draft=eh_rascunho_mc,
@@ -7104,12 +7118,14 @@ def processar_dm(remote_jid, key, data):
             if erro_mc:
                 acao_falhou = "deixar em rascunho" if eh_rascunho_mc else "publicar"
                 print(f"[processar_dm] falhou ao {acao_falhou} no Metricool (legenda sugerida): {erro_mc}", flush=True)
-                responder(f"Tentei {acao_falhou} no {rotulo_tipo_mc} do {cliente_nome_mc} com a legenda sugerida mas deu erro: {erro_mc}. Não foi feito nada.")
+                responder(f"Tentei {acao_falhou} no {rotulo_tipo_mc} do {cliente_nome_mc} ({handle_mc}) com a legenda sugerida mas deu erro: {erro_mc}. Não foi feito nada.")
                 return {"metricool_legenda_sugerida_falhou": erro_mc}
+            ordem_mc_leg = _formatar_ordem_midias([{"nome": n} for n in pendente.get("metricool_nomes_midias") or []])
+            ordem_mc_leg_txt = f"\n\nOrdem publicada:\n{ordem_mc_leg}" if ordem_mc_leg else ""
             if eh_rascunho_mc:
-                responder(f"Prontinho, deixei em rascunho no {rotulo_tipo_mc} do {cliente_nome_mc} com a legenda sugerida! 👍")
+                responder(f"Prontinho, deixei em rascunho no {rotulo_tipo_mc} do {cliente_nome_mc} - perfil {handle_mc} no Instagram - com a legenda sugerida! 👍{ordem_mc_leg_txt}")
             else:
-                responder(f"Prontinho, publiquei no {rotulo_tipo_mc} do {cliente_nome_mc} com a legenda sugerida! ✅")
+                responder(f"Prontinho, publiquei no {rotulo_tipo_mc} do {cliente_nome_mc} - perfil {handle_mc} no Instagram - com a legenda sugerida! ✅{ordem_mc_leg_txt}")
             return {"metricool_legenda_sugerida_confirmada": True, "cliente": cliente_nome_mc}
         elif confirma is True:
             enviar_texto(TRIPA_DESIGNER_JID, pendente["mensagem_tripa"])
@@ -7156,10 +7172,11 @@ def processar_dm(remote_jid, key, data):
                 pendente["criado_em"] = time.time()
                 rotulo_tipo_ajuste = "feed" if pendente["metricool_tipo_instagram"] == "POST" else "story"
                 acao_ajuste = "deixar em rascunho" if pendente.get("metricool_draft") else "publicar"
+                handle_ajuste = _metricool_handle_instagram(pendente["metricool_cliente_nome"])
                 responder(
                     f'Segue a sugestão com esse ajuste:\n\n"{nova_legenda}"\n\n'
-                    f"Posso {acao_ajuste} com essa legenda no {rotulo_tipo_ajuste} do {pendente['metricool_cliente_nome']}? "
-                    "Confirma (sim/não), ou me manda outro ajuste."
+                    f"Posso {acao_ajuste} com essa legenda no {rotulo_tipo_ajuste} do {pendente['metricool_cliente_nome']} "
+                    f"({handle_ajuste})? Confirma (sim/não), ou me manda outro ajuste."
                 )
                 registrar_mensagem_grupo(
                     pendente["metricool_grupo_jid_dm"], pendente["metricool_grupo_nome_dm"], "Cintia",
@@ -7178,8 +7195,9 @@ def processar_dm(remote_jid, key, data):
                 pendente["metricool_texto"] = nova_legenda_normal
                 pendente["criado_em"] = time.time()
                 rotulo_tipo_ajuste_normal = "feed" if pendente["metricool_tipo_instagram"] == "POST" else "story"
+                handle_ajuste_normal = _metricool_handle_instagram(pendente["metricool_cliente_nome"])
                 responder(
-                    f'Legenda atualizada pro {rotulo_tipo_ajuste_normal} do {pendente["metricool_cliente_nome"]}:\n\n'
+                    f'Legenda atualizada pro {rotulo_tipo_ajuste_normal} do {pendente["metricool_cliente_nome"]} ({handle_ajuste_normal}):\n\n'
                     f'"{nova_legenda_normal}"\n\nPosso publicar assim? Confirma (sim/não), ou me manda outro ajuste.'
                 )
                 registrar_mensagem_grupo(
@@ -8267,6 +8285,47 @@ METRICOOL_BLOG_IDS = {
     "Z5 Montagens": "6983307",
 }
 
+# Round 27 parte 35: blindagem pedida pelo Torres depois de um susto real (achou que tinha
+# publicado em perfil errado - não publicou nada de verdade, mas a confirmação alucinada não
+# disse ONDE, então não dava pra conferir de cara). Handle de Instagram de cada cliente (sem @),
+# pra toda mensagem que fala de uma publicação de VERDADE (ou pergunta de confirmação antes
+# dela) sempre mostrar o @ exato, nunca só o nome interno do cliente - assim Torres consegue
+# checar na hora se bateu com o perfil certo, sem precisar abrir o Metricool.
+METRICOOL_INSTAGRAM_HANDLES = {
+    "House and Co": "houseandco",
+    "Latidos e miados": "latidosemiadosvet_oficial",
+    "Zurca": "zurcaboteco",
+    "Dr. Fellipe Barbosa": "dr.fellipebarbosa",
+    "Chicafe": "dinao.chicafe",
+    "Asas do Brasil": "oficialasasdobrasil",
+    "Novo Mix": "novomixsupermercados",
+    "Torres": "eu_soutorres",
+    "Terapia": "terapiabeach_",
+    "Luan Menezes": "luan_menezes",
+    "Olegario": "olegarioboteco",
+    "Banjo Novo": "banjo_novo",
+    "Z5 Montagens": "z5montagens",
+}
+
+
+def _metricool_handle_instagram(cliente_nome):
+    """@ do Instagram do cliente pra aparecer em toda mensagem que fala de publicação de
+    verdade no Metricool - nunca deixa isso silencioso mesmo se o cadastro tiver buraco."""
+    handle = METRICOOL_INSTAGRAM_HANDLES.get(cliente_nome)
+    return f"@{handle}" if handle else "(@ não cadastrado - confere o perfil certo direto no Metricool antes de confirmar)"
+
+
+def _metricool_validar_destino(cliente_nome, blog_id):
+    """Segunda trava, barata e independente, antes de QUALQUER chamada de verdade à API do
+    Metricool: confere que o blog_id que está prestes a ser usado é EXATAMENTE o cadastrado
+    pra esse nome de cliente em METRICOOL_BLOG_IDS - nunca confia cegamente no blog_id só
+    porque ele já está guardado na pendência. Isso nunca deveria falhar (o blog_id sempre vem
+    de METRICOOL_BLOG_IDS pra começar), mas é a garantia de que um bug futuro no código - ou
+    um dado corrompido na pendência - nunca consiga publicar num perfil que não seja o pedido.
+    Pedido explícito do Torres depois de um susto real: "isso não pode acontecer de forma
+    nenhuma"."""
+    return bool(blog_id) and METRICOOL_BLOG_IDS.get(cliente_nome) == blog_id
+
 # Domínio público da própria Cintia (Railway) - usado pra hospedar temporariamente a mídia
 # baixada de um link do Drive/etc, já que o Metricool precisa de uma URL pública que ELE consiga
 # baixar sozinho (não aceita um link privado de Drive sem a integração de Drive dele mesmo
@@ -8321,23 +8380,28 @@ def _baixar_midia_de_link_metricool(link):
     """Baixa a mídia (imagem/vídeo) de um link pra poder republicar no Metricool - link do
     Google Drive (pela conta de serviço da Cintia, mesma regra de sempre: precisa estar
     compartilhado com ela) ou qualquer outro link público direto. Devolve
-    (conteudo_bytes, mime_type, erro) - erro None em caso de sucesso, nunca lança exceção."""
+    (conteudo_bytes, mime_type, nome, erro) - erro None em caso de sucesso, nunca lança exceção.
+    O nome do arquivo (Round 27 parte 36, pedido do Torres) é pra mostrar a sequência real de
+    arquivos antes de postar - vem do metadado do Drive quando dá, ou é extraído do próprio link
+    como último recurso pra nunca deixar o item sem identificação nenhuma."""
     arquivo_id_drive = _extrair_arquivo_id_drive(link)
     if arquivo_id_drive:
-        conteudo_b64, mimetype, _nome = _baixar_arquivo_drive_por_id(arquivo_id_drive)
+        conteudo_b64, mimetype, nome = _baixar_arquivo_drive_por_id(arquivo_id_drive)
         if not conteudo_b64:
             if mimetype and mimetype.startswith("application/vnd.google-apps"):
-                return None, None, "esse link do Drive é de um documento do Google (Docs/Sheets/Slides), não uma imagem/vídeo de verdade"
-            return None, None, "não consegui acessar esse arquivo do Drive (confere se está compartilhado com a Cintia, ou se o link está certo)"
-        return base64.b64decode(conteudo_b64), mimetype, None
+                return None, None, None, "esse link do Drive é de um documento do Google (Docs/Sheets/Slides), não uma imagem/vídeo de verdade"
+            return None, None, None, "não consegui acessar esse arquivo do Drive (confere se está compartilhado com a Cintia, ou se o link está certo)"
+        return base64.b64decode(conteudo_b64), mimetype, nome, None
     try:
         resp = requests.get(link, timeout=30)
     except Exception as e:
-        return None, None, f"erro de rede baixando o link: {e}"
+        return None, None, None, f"erro de rede baixando o link: {e}"
     if resp.status_code != 200:
-        return None, None, f"o link respondeu HTTP {resp.status_code}"
+        return None, None, None, f"o link respondeu HTTP {resp.status_code}"
     mime_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip() or "application/octet-stream"
-    return resp.content, mime_type, None
+    from urllib.parse import urlparse as _urlparse_metricool
+    nome_pelo_link = os.path.basename(_urlparse_metricool(link).path) or "arquivo (nome não identificado no link)"
+    return resp.content, mime_type, nome_pelo_link, None
 
 
 # Round 27 parte 32: bug real reportado pelo Torres - mandou uma PASTA do Drive (carrossel, várias
@@ -8398,9 +8462,13 @@ def _baixar_midias_de_link_metricool(link):
         arquivos_usados = arquivos_encontrados[:_LIMITE_IMAGENS_CARROSSEL]
         midias = []
         for arquivo in arquivos_usados:
-            conteudo_b64, mimetype, _nome = _baixar_arquivo_drive_por_id(arquivo["id"])
+            conteudo_b64, mimetype, nome_drive = _baixar_arquivo_drive_por_id(arquivo["id"])
             if conteudo_b64:
-                midias.append({"bytes": base64.b64decode(conteudo_b64), "mime_type": mimetype})
+                # Usa o nome já visto na listagem da pasta (arquivo["name"]) como preferência -
+                # é o mesmo nome que definiu a ORDEM alfabética usada aqui, então bate certinho
+                # com a sequência mostrada pro Torres antes de postar (Round 27 parte 36).
+                nome_midia = arquivo.get("name") or nome_drive or f"arquivo sem nome ({arquivo.get('id', '?')})"
+                midias.append({"bytes": base64.b64decode(conteudo_b64), "mime_type": mimetype, "nome": nome_midia})
         if not midias:
             return None, "encontrei a pasta mas não consegui baixar nenhum arquivo de dentro dela", ""
         aviso = ""
@@ -8409,10 +8477,22 @@ def _baixar_midias_de_link_metricool(link):
         elif len(midias) < len(arquivos_usados):
             aviso = f" ({len(arquivos_usados) - len(midias)} arquivo(s) da pasta eu não consegui baixar, segui só com os que deram certo)"
         return midias, None, aviso
-    conteudo_bytes, mime_type, erro = _baixar_midia_de_link_metricool(link)
+    conteudo_bytes, mime_type, nome_unico, erro = _baixar_midia_de_link_metricool(link)
     if erro:
         return None, erro, ""
-    return [{"bytes": conteudo_bytes, "mime_type": mime_type}], None, ""
+    return [{"bytes": conteudo_bytes, "mime_type": mime_type, "nome": nome_unico}], None, ""
+
+
+def _formatar_ordem_midias(midias):
+    """Monta a lista numerada, na ORDEM EXATA que vai pro Metricool, com o nome de cada arquivo
+    - pedido do Torres (Round 27 parte 36) pra sempre poder conferir a sequência antes de
+    confirmar (feed em carrossel, story, ou até arquivo único) em vez de descobrir só depois de
+    publicado. Nunca deixa um item sem alguma identificação, mesmo que o nome não tenha vindo."""
+    linhas = []
+    for i, midia in enumerate(midias, start=1):
+        nome = midia.get("nome") or f"arquivo {i} (sem nome identificado)"
+        linhas.append(f"{i}. {nome}")
+    return "\n".join(linhas)
 
 
 def _identificar_clientes_metricool_candidatos(texto):
@@ -8656,6 +8736,11 @@ def _processar_pedido_metricool_dm(pessoa, numero, grupo_jid_dm, grupo_nome_dm, 
     media_urls_publicas = [_publicar_midia_temporaria(m["bytes"], m["mime_type"]) for m in midias]
     eh_carrossel = len(midias) > 1
     rotulo_tipo = "feed" if tipo_instagram == "POST" else "story"
+    # Round 27 parte 36, pedido do Torres: mostrar SEMPRE a ordem/sequência real dos arquivos
+    # (com nome) antes de qualquer ação no Metricool - carrossel, story ou arquivo único - pra
+    # ele poder conferir que é exatamente o que ele mandou, na ordem certa, antes de confirmar.
+    ordem_midias_txt = f"\n\nOrdem dos arquivos:\n{_formatar_ordem_midias(midias)}"
+    nomes_midias = [m.get("nome") for m in midias]
 
     # Round 27 parte 31: pedido explícito de SUGESTÃO de legenda (Torres pede pra Cintia olhar
     # o conteúdo e criar uma opção, em vez de só extrair uma legenda que ele já escreveu) - a
@@ -8690,31 +8775,42 @@ def _processar_pedido_metricool_dm(pessoa, numero, grupo_jid_dm, grupo_nome_dm, 
             "metricool_cliente_nome": cliente_nome,
             "metricool_tipo_instagram": tipo_instagram,
             "metricool_media_urls": media_urls_publicas,
+            "metricool_nomes_midias": nomes_midias,
             "metricool_texto": legenda_sugerida,
             "metricool_draft": eh_rascunho,
             "metricool_grupo_jid_dm": grupo_jid_dm,
             "metricool_grupo_nome_dm": grupo_nome_dm,
         }
         acao_pendente = "deixar em rascunho" if eh_rascunho else "publicar"
+        handle_sugestao = _metricool_handle_instagram(cliente_nome)
         enviar_texto(
             numero,
-            f'Legenda sugerida pro {rotulo_tipo} do {cliente_nome}{aviso_midias}:\n\n"{legenda_sugerida}"\n\n'
-            f"Posso {acao_pendente} com essa legenda? Confirma (sim/não), ou me manda a legenda que você preferir.",
+            f'Legenda sugerida pro {rotulo_tipo} do {cliente_nome} ({handle_sugestao}){aviso_midias}:\n\n"{legenda_sugerida}"{ordem_midias_txt}\n\n'
+            f"Posso {acao_pendente} com essa legenda nesse perfil? Confirma (sim/não), ou me manda a legenda que você preferir.",
         )
         registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", f"[sugeriu legenda pro Metricool, aguardando aprovação: {rotulo_tipo} do {cliente_nome}]", False)
         return {"metricool_legenda_sugerida_aguardando_confirmacao": True}
 
     legenda = _extrair_legenda_metricool(texto)
+    handle_dm = _metricool_handle_instagram(cliente_nome)
 
     if eh_rascunho:
+        # Blindagem (Round 27 parte 35): rascunho é a ÚNICA ação de verdade no Metricool que
+        # acontece SEM confirmação prévia - por isso a segunda trava de destino é ainda mais
+        # importante aqui do que nos fluxos que passam por "sim".
+        if not _metricool_validar_destino(cliente_nome, blog_id):
+            print(f"[_processar_pedido_metricool_dm] BLOQUEADO por segurança: blog_id não bate com o cliente '{cliente_nome}' - nada foi feito", flush=True)
+            enviar_texto(numero, f"Encontrei uma inconsistência nos dados dessa publicação (o perfil não bateu com o cliente '{cliente_nome}') e travei por segurança - NÃO fiz nada. Me manda o pedido de novo, por favor.")
+            registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", f"[bloqueou rascunho no Metricool por inconsistência de destino: {cliente_nome}]", False)
+            return {"metricool_bloqueado_seguranca": True}
         resultado, erro = _metricool_criar_post(blog_id, tipo_instagram, media_urls_publicas, legenda, draft=True)
         if erro:
             print(f"[_processar_pedido_metricool_dm] falhou (rascunho): {erro}", flush=True)
-            enviar_texto(numero, f"Tentei deixar em rascunho no Metricool mas deu erro: {erro}")
+            enviar_texto(numero, f"Tentei deixar em rascunho no Metricool (perfil {handle_dm}) mas deu erro: {erro}")
             registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", f"[tentou deixar em rascunho no Metricool, falhou: {erro}]", False)
             return {"metricool_erro": erro}
         aviso_legenda = "" if legenda else " (sem legenda - só o texto do link e do comando, então deixei sem, você pode completar direto no Metricool)"
-        enviar_texto(numero, f"Prontinho! Deixei em rascunho no Metricool, no {rotulo_tipo} do {cliente_nome}{aviso_legenda}{aviso_midias} - dá uma conferida por lá antes de publicar 👍")
+        enviar_texto(numero, f"Prontinho! Deixei em rascunho no Metricool, no {rotulo_tipo} do {cliente_nome} - perfil {handle_dm} no Instagram{aviso_legenda}{aviso_midias} - dá uma conferida por lá antes de publicar 👍{ordem_midias_txt}")
         registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", f"[deixou em rascunho no Metricool: {rotulo_tipo} do {cliente_nome}]", False)
         return {"metricool_rascunho_ok": True}
 
@@ -8726,12 +8822,13 @@ def _processar_pedido_metricool_dm(pessoa, numero, grupo_jid_dm, grupo_nome_dm, 
         "metricool_cliente_nome": cliente_nome,
         "metricool_tipo_instagram": tipo_instagram,
         "metricool_media_urls": media_urls_publicas,
+        "metricool_nomes_midias": nomes_midias,
         "metricool_texto": legenda,
         "metricool_grupo_jid_dm": grupo_jid_dm,
         "metricool_grupo_nome_dm": grupo_nome_dm,
     }
     resumo_legenda = f' com a legenda "{legenda}"' if legenda else " sem legenda nenhuma (não achei nenhum texto próprio na sua mensagem)"
-    enviar_texto(numero, f"Posso publicar isso agora no {rotulo_tipo} do {cliente_nome}{resumo_legenda}{aviso_midias}? Confirma?")
+    enviar_texto(numero, f"Posso publicar isso agora no {rotulo_tipo} do {cliente_nome} ({handle_dm}){resumo_legenda}{aviso_midias}?{ordem_midias_txt}\n\nConfirma?")
     registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", f"[aguardando confirmação pra publicar no Metricool: {rotulo_tipo} do {cliente_nome}]", False)
     return {"metricool_aguardando_confirmacao": True}
 
