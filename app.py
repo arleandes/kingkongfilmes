@@ -6192,6 +6192,51 @@ def tentar_ajustar_briefing_pendente(mensagem_atual, instrucao_texto):
         return {"eh_ajuste": False, "briefing_atualizado": ""}
 
 
+# Round 27 parte 33: bug real e grave reportado pelo Torres (categoria já reportada muitas vezes
+# antes, segundo ele - o mesmo padrão do ajuste de briefing acima, só que faltava pro Metricool) -
+# print mostrando ele pedir um AJUSTE de tom na legenda sugerida ("queria uma legenda com humor...
+# lagobada") em vez de responder sim/não. Como não havia tratamento pra isso nesse pendente
+# específico, a mensagem caía direto na conversa livre (catch-all) - a Cintia respondeu de forma
+# solta, fora do formato de confirmação, e o comando pendente ficava PARADO com a legenda ANTIGA:
+# se Torres tivesse respondido só "sim" depois, ela teria publicado a legenda ERRADA. Mesmo padrão
+# de tentar_ajustar_briefing_pendente, adaptado pra legenda (aqui pode reescrever livremente, ao
+# contrário do briefing que preserva tudo - o pedido geralmente é de tom/ângulo, não de um dado
+# pontual a trocar).
+SYSTEM_PROMPT_AJUSTE_LEGENDA_METRICOOL = """Você é a Cintia, redatora de legendas de Instagram da
+KingKong Filmes/Correria. Você tinha uma legenda pronta, esperando a confirmação de Torres antes
+de publicar/deixar em rascunho no Metricool. A resposta dele NÃO foi um "sim"/"não" direto.
+
+Decida: essa mensagem é um PEDIDO DE AJUSTE nessa legenda específica (ex: "mais humor", "troca X
+por Y", "menciona a promoção", "deixa mais curta", "usa um ângulo diferente"), ou é outra coisa
+(mensagem nova sem relação com ajustar essa legenda)?
+
+SE FOR UM AJUSTE: reescreva a legenda INTEIRA já incorporando o que foi pedido (pode reescrever
+livremente pra atender o pedido, diferente de uma correção pontual). Siga sempre as mesmas
+regras: nunca travessão (em-dash, "—"), nunca clichê de IA ("no cenário atual", "vale ressaltar",
+frase de coach), tom combinando com o cliente, detalhe específico em vez de generalidade.
+SE NÃO FOR UM AJUSTE a essa legenda: marque "eh_ajuste" como false e não invente nada.
+
+Legenda atual:
+{legenda_atual}
+
+Responda SEMPRE E APENAS em JSON válido, sem bloco de código markdown:
+{"eh_ajuste": true ou false, "legenda_atualizada": "a legenda inteira já com o ajuste aplicado, ou string vazia se eh_ajuste for false"}
+"""
+
+
+def _tentar_ajustar_legenda_metricool_pendente(legenda_atual, instrucao_texto):
+    """Mesmo padrão de tentar_ajustar_briefing_pendente, pra legenda pendente de confirmação no
+    Metricool (sugerida pela Cintia OU escrita por Torres) - decide se uma resposta que não foi
+    sim/não é um pedido de AJUSTE de tom/conteúdo na legenda, evitando que ela caia na conversa
+    solta e deixe o comando pendente preso com a legenda antiga."""
+    prompt_sistema = SYSTEM_PROMPT_AJUSTE_LEGENDA_METRICOOL.replace("{legenda_atual}", legenda_atual or "(sem legenda)")
+    try:
+        return chamar_claude(prompt_sistema, instrucao_texto, max_tokens=500, timeout=20)
+    except Exception as e:
+        print(f"[_tentar_ajustar_legenda_metricool_pendente] erro: {e}", flush=True)
+        return {"eh_ajuste": False, "legenda_atualizada": ""}
+
+
 SYSTEM_PROMPT_ATIVIDADE_GERAL = """Você é a Cintia, assistente virtual da Correria. {pessoa_nome}
 fez essa pergunta sobre os grupos hoje: "{pergunta}"
 
@@ -7084,7 +7129,51 @@ def processar_dm(remote_jid, key, data):
                 return {"briefing_ajustado": True}
             # Nao pareceu um ajuste a esse briefing - segue o fluxo normal (mensagem nova; o
             # pendente antigo so expira pelo TTL ou e substituido se virar um novo comando).
-        # confirma is None (e nao era ajuste de briefing pendente): nao pareceu sim/nem nao,
+        elif pendente.get("eh_legenda_sugerida_metricool"):
+            # Round 27 parte 33: mesmo padrão acima, pra legenda SUGERIDA pendente no Metricool -
+            # bug real reportado (Torres pediu ajuste de tom "queria uma legenda com humor... e
+            # a Cintia mesma respondia como bate-papo comum, sem re-perguntar sim/não, deixando o
+            # pendente preso com a legenda ANTIGA).
+            ajuste_legenda = _tentar_ajustar_legenda_metricool_pendente(pendente.get("metricool_texto", ""), texto)
+            if ajuste_legenda.get("eh_ajuste") and ajuste_legenda.get("legenda_atualizada"):
+                nova_legenda = ajuste_legenda["legenda_atualizada"]
+                pendente["metricool_texto"] = nova_legenda
+                pendente["criado_em"] = time.time()
+                rotulo_tipo_ajuste = "feed" if pendente["metricool_tipo_instagram"] == "POST" else "story"
+                acao_ajuste = "deixar em rascunho" if pendente.get("metricool_draft") else "publicar"
+                responder(
+                    f'Segue a sugestão com esse ajuste:\n\n"{nova_legenda}"\n\n'
+                    f"Posso {acao_ajuste} com essa legenda no {rotulo_tipo_ajuste} do {pendente['metricool_cliente_nome']}? "
+                    "Confirma (sim/não), ou me manda outro ajuste."
+                )
+                registrar_mensagem_grupo(
+                    pendente["metricool_grupo_jid_dm"], pendente["metricool_grupo_nome_dm"], "Cintia",
+                    "[ajustou legenda sugerida pro Metricool, aguardando aprovação de novo]", False,
+                )
+                return {"metricool_legenda_sugerida_ajustada": True}
+            # Nao pareceu ajuste a essa legenda - segue o fluxo normal (pendente so expira pelo
+            # TTL, ou e substituido se essa mensagem virar um novo comando).
+        elif pendente.get("eh_postagem_metricool"):
+            # Mesma correção pro caso da legenda ser a que o próprio Torres escreveu (não
+            # sugerida) - mesmo risco de ficar presa com o texto antigo se ele pedir um ajuste
+            # em vez de responder sim/não.
+            ajuste_legenda_normal = _tentar_ajustar_legenda_metricool_pendente(pendente.get("metricool_texto", ""), texto)
+            if ajuste_legenda_normal.get("eh_ajuste") and ajuste_legenda_normal.get("legenda_atualizada"):
+                nova_legenda_normal = ajuste_legenda_normal["legenda_atualizada"]
+                pendente["metricool_texto"] = nova_legenda_normal
+                pendente["criado_em"] = time.time()
+                rotulo_tipo_ajuste_normal = "feed" if pendente["metricool_tipo_instagram"] == "POST" else "story"
+                responder(
+                    f'Legenda atualizada pro {rotulo_tipo_ajuste_normal} do {pendente["metricool_cliente_nome"]}:\n\n'
+                    f'"{nova_legenda_normal}"\n\nPosso publicar assim? Confirma (sim/não), ou me manda outro ajuste.'
+                )
+                registrar_mensagem_grupo(
+                    pendente["metricool_grupo_jid_dm"], pendente["metricool_grupo_nome_dm"], "Cintia",
+                    "[ajustou legenda pendente no Metricool, aguardando confirmação de novo]", False,
+                )
+                return {"metricool_postagem_ajustada": True}
+            # Nao pareceu ajuste - segue o fluxo normal.
+        # confirma is None (e nao era ajuste de briefing/legenda pendente): nao pareceu sim/nem nao,
         # segue o fluxo normal (pode ser uma mensagem nova, ou uma correcao ao comando pendente -
         # nesse caso o comando antigo so expira depois do TTL, ou e substituido se essa mensagem
         # virar um novo comando).
