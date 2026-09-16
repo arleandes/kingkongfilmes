@@ -3869,12 +3869,27 @@ def parece_confirmacao(texto: str):
     # aparecem, ou nenhuma) continua devolvendo None, mesmo critério de sempre.
     # re.findall (nao so t.split()) pra pontuacao colada na palavra ("nao," "sim!") nao
     # atrapalhar o casamento - mesma abordagem ja usada em _extrair_palavras_chave.
+    #
+    # Round 27 parte 34, bug grave reportado pelo Torres ("Cintia ficou doida ela atrapalhou
+    # toda a conversa"): ele pediu um AJUSTE numa legenda pendente do Metricool - "troca desse
+    # perrengue para dessa lagobada" - e isso foi lido como CANCELAMENTO (confirma=False,
+    # "Beleza, não mandei nada"), apagando a pendência de verdade. As mensagens seguintes dele
+    # (mandando a legenda final e depois "sim") não acharam mais nenhuma pendência, caíram no
+    # classificador geral, e a Cintia alucinou uma confirmação de publicação inteira em texto
+    # solto - sem nunca chamar a API do Metricool de fato. Causa raiz: "para" está no set de
+    # palavras negativas (pensado pro sentido de "para!" = pare), mas "para" é também uma das
+    # preposições mais comuns do português ("troca X PARA Y", "isso é PARA o cliente") - então
+    # qualquer ajuste ou frase nova de poucas palavras contendo essa preposição virava
+    # cancelamento por engano. Continua reconhecendo "para" como cancelamento quando é a
+    # mensagem INTEIRA (`t in negativos` acima), só não mais quando aparece isolada dentro de
+    # uma frase maior.
     palavras = re.findall(r"[a-z0-9]+", t)
     if 1 < len(palavras) <= 6:
-        palavras_unicas = {p for p in (afirmativos | negativos) if " " not in p}
+        negativos_isolados = negativos - {"para"}
+        palavras_unicas = {p for p in (afirmativos | negativos_isolados) if " " not in p}
         achados = palavras_unicas & set(palavras)
         achados_afirmativos = achados & afirmativos
-        achados_negativos = achados & negativos
+        achados_negativos = achados & negativos_isolados
         if achados_afirmativos and not achados_negativos:
             return True
         if achados_negativos and not achados_afirmativos:
