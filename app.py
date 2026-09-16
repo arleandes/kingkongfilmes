@@ -7029,6 +7029,28 @@ def processar_dm(remote_jid, key, data):
                 return {"metricool_publicacao_falhou": erro_mc}
             responder(f"Prontinho, publiquei no {rotulo_tipo_mc} do {cliente_nome_mc}! ✅")
             return {"metricool_publicacao_confirmada": True, "cliente": cliente_nome_mc}
+        elif confirma is True and pendente.get("eh_legenda_sugerida_metricool"):
+            # Round 27 parte 31: legenda foi CRIADA pela Cintia (não escrita pelo Torres), então
+            # sempre exige aprovação antes de qualquer ação - inclusive rascunho, que no fluxo
+            # normal (legenda do próprio Torres) pula direto sem perguntar.
+            cliente_nome_mc = pendente["metricool_cliente_nome"]
+            rotulo_tipo_mc = "feed" if pendente["metricool_tipo_instagram"] == "POST" else "story"
+            eh_rascunho_mc = pendente.get("metricool_draft", False)
+            resultado_mc, erro_mc = _metricool_criar_post(
+                pendente["metricool_blog_id"], pendente["metricool_tipo_instagram"],
+                pendente["metricool_media_urls"], pendente["metricool_texto"], draft=eh_rascunho_mc,
+            )
+            _comandos_pendentes.pop(pessoa, None)
+            if erro_mc:
+                acao_falhou = "deixar em rascunho" if eh_rascunho_mc else "publicar"
+                print(f"[processar_dm] falhou ao {acao_falhou} no Metricool (legenda sugerida): {erro_mc}", flush=True)
+                responder(f"Tentei {acao_falhou} no {rotulo_tipo_mc} do {cliente_nome_mc} com a legenda sugerida mas deu erro: {erro_mc}. Não foi feito nada.")
+                return {"metricool_legenda_sugerida_falhou": erro_mc}
+            if eh_rascunho_mc:
+                responder(f"Prontinho, deixei em rascunho no {rotulo_tipo_mc} do {cliente_nome_mc} com a legenda sugerida! 👍")
+            else:
+                responder(f"Prontinho, publiquei no {rotulo_tipo_mc} do {cliente_nome_mc} com a legenda sugerida! ✅")
+            return {"metricool_legenda_sugerida_confirmada": True, "cliente": cliente_nome_mc}
         elif confirma is True:
             enviar_texto(TRIPA_DESIGNER_JID, pendente["mensagem_tripa"])
             aviso_cobranca = ""
@@ -8244,7 +8266,7 @@ def _detectar_tipo_conteudo_metricool(texto):
 
 _PALAVRAS_GATILHO_METRICOOL = [
     "posta", "poste", "postar", "publica", "publique", "publicar",
-    "agenda isso", "agende isso", "rascunho", "draft", "metricool",
+    "agenda isso", "agende isso", "rascunho", "draft", "metricool", "legenda",
 ]
 
 
@@ -8282,6 +8304,94 @@ def _extrair_legenda_metricool(texto):
         return (resultado.get("legenda") or "").strip()
     except Exception as e:
         print(f"[_extrair_legenda_metricool] erro: {e}", flush=True)
+        return ""
+
+
+# Round 27 parte 31: pedido de SUGESTÃO de legenda (Torres pede pra Cintia CRIAR a legenda
+# olhando o conteúdo, em vez de só extrair uma legenda que ele já escreveu na mensagem) -
+# decidido por palavra-chave, sem gastar IA, mesmo padrão de _pode_ser_pedido_metricool.
+_PALAVRAS_GATILHO_SUGESTAO_LEGENDA = [
+    "sugere", "sugestao", "sugestão", "sugerir", "sugira",
+    "cria uma legenda", "cria a legenda", "escreve uma legenda", "escreve a legenda",
+    "qual legenda", "que legenda",
+]
+
+
+def _pede_sugestao_legenda_metricool(texto):
+    texto_norm = normalizar_texto(texto)
+    return any(p in texto_norm for p in _PALAVRAS_GATILHO_SUGESTAO_LEGENDA)
+
+
+# Prompt de sugestão de legenda - incorpora o MESMO estilo/regras que o Torres já usa nos
+# roteiros de redes sociais (skills roteirista-social e roteiros-ihc-eusoutorres): lista
+# anti-IA de expressões proibidas, nunca travessão, voz por cliente (perfil pessoal dele usa
+# humor/IHC, clientes médicos nunca prometem resultado, pet usa diminutivo carinhoso etc).
+# Diferente da extração (SYSTEM_PROMPT_EXTRAIR_LEGENDA_METRICOOL), aqui a legenda É PRA SER
+# CRIADA olhando a imagem de verdade - só dispara quando Torres pede a sugestão explicitamente
+# (nunca substitui a legenda dele por conta própria).
+SYSTEM_PROMPT_SUGERIR_LEGENDA_METRICOOL = """Você é a Cintia, redatora de legendas de Instagram da
+KingKong Filmes/Correria (Salvador, Bahia). Vai receber uma imagem (arte, foto ou capa de post)
+que vai ser publicada no Instagram de um cliente específico, e deve escrever UMA sugestão de
+legenda pronta pra usar - olhando de verdade o que aparece na imagem (evento, produto, promoção,
+data, texto da própria arte) pra legenda fazer sentido com o conteúdo, nunca genérica.
+
+Cliente: {cliente_nome}
+Formato: {rotulo_tipo} do Instagram
+{contexto_extra}
+
+Regras de voz por cliente (use a que bater com o nome acima; se não estiver na lista, tom
+comercial simpático e direto, sem exagero):
+- Torres / @eu_soutorres (perfil pessoal): humor, direto, oral, baianês quando cabe naturalmente,
+  nunca tom de guru nem frase de coach. Sem venda direta a não ser que a imagem seja claramente
+  uma oferta.
+- Latidos e Miados: diminutivos carinhosos (cãozinho, gatinho, petzinho, companheirinho).
+  Conteúdo clínico nunca fala em nome próprio de veterinário sem isso estar na imagem/pedido.
+- Dr. Fellipe Barbosa (cirurgião plástico): nunca prometa resultado, nunca use antes/depois, CTA
+  só de agendamento, tom sério e profissional (CFM 2.336/2023).
+- Terapia Beach: tom de bar de praia, descontraído, esquete leve; sempre consumo responsável se
+  a imagem mencionar bebida alcoólica.
+- Novo Mix Supermercados: tom popular e festivo.
+- Zurca, Chicafe, Asas do Brasil, Banjo Novo, Olegario, Z5 Montagens, Luan Menezes: tom comercial
+  simpático, direto, sem forçar humor que não combine com o negócio.
+
+Regras gerais (sempre):
+- NUNCA use travessão (em-dash, "—") - só ponto, vírgula ou dois pontos.
+- NUNCA use expressões tipo: "no mundo dinâmico de hoje", "no cenário atual", "em resumo", "vale
+  ressaltar", "é importante destacar", "descubra o segredo", "eleve seu", "transforme sua vida",
+  "não é só X, é Y", "bora lá" como abertura vazia, trio de adjetivos, frase de coach, emoji em
+  excesso (no máximo 1 ou 2, só se combinar com o tom do cliente).
+- Frase curta, verbo concreto, detalhe específico da imagem (o que está escrito nela, o produto,
+  a data, o horário) em vez de generalidade.
+- CTA específico no fim quando fizer sentido pro tipo de conteúdo (não force CTA em toda legenda).
+- Devolva a legenda pronta pra publicar direto, sem aspas ao redor, sem comentar sobre a própria
+  legenda.
+
+Responda SEMPRE E APENAS em JSON válido, sem bloco de código markdown:
+{"legenda_sugerida": "o texto completo da legenda sugerida"}
+"""
+
+
+def _sugerir_legenda_metricool(imagem_base64, imagem_media_type, cliente_nome, tipo_instagram, texto_pedido):
+    rotulo_tipo = "feed" if tipo_instagram == "POST" else "story"
+    contexto_extra = (
+        f'Pedido de Torres (pode ter direção extra pra legenda - ex: "engraçada", "mencionar a '
+        f'promoção" - ignore o que for só comando/nome de cliente/link): "{texto_pedido}"'
+    )
+    prompt_sistema = (
+        SYSTEM_PROMPT_SUGERIR_LEGENDA_METRICOOL
+        .replace("{cliente_nome}", cliente_nome)
+        .replace("{rotulo_tipo}", rotulo_tipo)
+        .replace("{contexto_extra}", contexto_extra)
+    )
+    try:
+        resultado = chamar_claude(
+            prompt_sistema, "Sugira a legenda pra essa imagem.",
+            imagem_base64=imagem_base64, imagem_media_type=imagem_media_type,
+            max_tokens=500, timeout=30,
+        )
+        return (resultado.get("legenda_sugerida") or "").strip()
+    except Exception as e:
+        print(f"[_sugerir_legenda_metricool] erro: {e}", flush=True)
         return ""
 
 
@@ -8353,7 +8463,7 @@ def _processar_pedido_metricool_dm(pessoa, numero, grupo_jid_dm, grupo_nome_dm, 
         return {"metricool_tipo_ambiguo": True}
 
     eh_rascunho = "rascunho" in normalizar_texto(texto) or "draft" in normalizar_texto(texto)
-    legenda = _extrair_legenda_metricool(texto)
+    pede_sugestao_legenda = _pede_sugestao_legenda_metricool(texto)
 
     conteudo_bytes, mime_type, erro_download = _baixar_midia_de_link_metricool(link)
     if erro_download:
@@ -8363,6 +8473,48 @@ def _processar_pedido_metricool_dm(pessoa, numero, grupo_jid_dm, grupo_nome_dm, 
 
     media_url_publica = _publicar_midia_temporaria(conteudo_bytes, mime_type)
     rotulo_tipo = "feed" if tipo_instagram == "POST" else "story"
+
+    # Round 27 parte 31: pedido explícito de SUGESTÃO de legenda (Torres pede pra Cintia olhar
+    # o conteúdo e criar uma opção, em vez de só extrair uma legenda que ele já escreveu) - a
+    # legenda sugerida SEMPRE passa por aprovação antes de virar rascunho ou publicação, mesmo
+    # quando a própria mensagem já pede "rascunho" (que normalmente pula a confirmação quando a
+    # legenda vem pronta do próprio Torres - aqui não veio dele, então confirma sempre).
+    if pede_sugestao_legenda:
+        legenda_sugerida = ""
+        if mime_type and mime_type.startswith("image/"):
+            imagem_b64_sugestao = base64.b64encode(conteudo_bytes).decode()
+            legenda_sugerida = _sugerir_legenda_metricool(imagem_b64_sugestao, mime_type, cliente_nome, tipo_instagram, texto)
+        if not legenda_sugerida:
+            enviar_texto(
+                numero,
+                f"Não consegui montar uma sugestão de legenda agora pro {rotulo_tipo} do {cliente_nome} "
+                "(a análise da imagem falhou, ou é um vídeo - ainda não consigo analisar vídeo pra sugerir "
+                "legenda) - pode me mandar a legenda que você quer usar?",
+            )
+            registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", f"[pedido de sugestão de legenda no Metricool falhou: {rotulo_tipo} do {cliente_nome}]", False)
+            return {"metricool_sugestao_legenda_falhou": True}
+        _comandos_pendentes[pessoa] = {
+            "criado_em": time.time(),
+            "eh_legenda_sugerida_metricool": True,
+            "metricool_blog_id": blog_id,
+            "metricool_cliente_nome": cliente_nome,
+            "metricool_tipo_instagram": tipo_instagram,
+            "metricool_media_urls": [media_url_publica],
+            "metricool_texto": legenda_sugerida,
+            "metricool_draft": eh_rascunho,
+            "metricool_grupo_jid_dm": grupo_jid_dm,
+            "metricool_grupo_nome_dm": grupo_nome_dm,
+        }
+        acao_pendente = "deixar em rascunho" if eh_rascunho else "publicar"
+        enviar_texto(
+            numero,
+            f'Legenda sugerida pro {rotulo_tipo} do {cliente_nome}:\n\n"{legenda_sugerida}"\n\n'
+            f"Posso {acao_pendente} com essa legenda? Confirma (sim/não), ou me manda a legenda que você preferir.",
+        )
+        registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", f"[sugeriu legenda pro Metricool, aguardando aprovação: {rotulo_tipo} do {cliente_nome}]", False)
+        return {"metricool_legenda_sugerida_aguardando_confirmacao": True}
+
+    legenda = _extrair_legenda_metricool(texto)
 
     if eh_rascunho:
         resultado, erro = _metricool_criar_post(blog_id, tipo_instagram, [media_url_publica], legenda, draft=True)
