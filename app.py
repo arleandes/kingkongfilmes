@@ -3394,7 +3394,11 @@ mais ninguém da equipe - só com {pessoa_nome}, aqui no privado dele. Ele foi c
 não tem mais grupo de cliente, não tem mais Tripa, não tem mais ninguém além dele pra atender. Isso
 NÃO inclui os cuidados básicos de honestidade, que continuam valendo sempre: nunca inventar um
 fato/tarefa que não foi dito; sempre confirmar antes de qualquer ação importante (mandar áudio,
-apagar/concluir algo); nunca dizer que já fez algo que não fez.
+apagar/concluir algo); nunca dizer que já fez algo que não fez. Isso vale também pra LIMITAÇÃO
+TÉCNICA: nunca invente um motivo técnico específico (tipo "não tenho acesso a essa pasta", "o
+Metricool não consegue ver esse link") pra explicar uma falha que você não confirmou de verdade -
+se não tiver certeza real do motivo, diga honestamente que não sabe por que falhou e peça pra
+tentar de novo, em vez de inventar uma explicação plausível que pode estar errada.
 
 PERSONALIDADE (pedido explícito de {pessoa_nome}, baseado num jeito que ele gostou): você tem um
 jeito caloroso, engraçado e expressivo de conversar - nada de soar formal, seca ou como um chatbot
@@ -3411,7 +3415,8 @@ quando for realmente necessário pra entender o pedido, e nesses casos faça uma
 e relevante pro que foi dito, nunca uma pergunta genérica de preencher espaço.
 IMPORTANTE: personalidade nunca muda as regras de honestidade acima - se {pessoa_nome} perguntar
 DIRETAMENTE se você é uma IA/assistente, responda a verdade (pode ser com humor, mas sem negar);
-nunca invente fato/tarefa/compromisso; nunca finja ter feito algo que não fez.
+nunca invente fato/tarefa/compromisso; nunca finja ter feito algo que não fez; nunca invente um
+motivo técnico específico pra uma falha que você não confirmou de verdade.
 
 Você é uma assistente pessoal completa, no estilo "me ajuda com o que eu precisar" - responda
 dúvidas, ajude a pensar/organizar ideias, redija textos, dê sugestões, converse - exatamente como
@@ -7076,26 +7081,34 @@ def processar_dm(remote_jid, key, data):
         elif confirma is True and pendente.get("eh_postagem_metricool"):
             # Round 27 parte 30: só chega aqui depois do "sim" - publica de verdade no Metricool
             # (a pergunta de confirmação já foi mandada em _processar_pedido_metricool_dm).
+            # Round 27 parte 38: agora também cobre RASCUNHO, quando a revisão automática achou
+            # algo e por isso o rascunho deixou de ir direto sem perguntar (metricool_draft=True
+            # nesse caso; ausente/False é o fluxo normal de publicação de sempre).
             cliente_nome_mc = pendente["metricool_cliente_nome"]
             rotulo_tipo_mc = "feed" if pendente["metricool_tipo_instagram"] == "POST" else "story"
+            eh_rascunho_mc = pendente.get("metricool_draft", False)
             handle_mc = _metricool_handle_instagram(cliente_nome_mc)
             if not _metricool_validar_destino(cliente_nome_mc, pendente["metricool_blog_id"]):
-                print(f"[processar_dm] BLOQUEADO por segurança: blog_id da pendência não bate com o cliente '{cliente_nome_mc}' - nada foi publicado", flush=True)
+                print(f"[processar_dm] BLOQUEADO por segurança: blog_id da pendência não bate com o cliente '{cliente_nome_mc}' - nada foi feito", flush=True)
                 _comandos_pendentes.pop(pessoa, None)
-                responder(f"Encontrei uma inconsistência nos dados dessa publicação (o perfil não bateu com o cliente '{cliente_nome_mc}') e travei por segurança - NÃO publiquei nada. Me manda o pedido de novo, por favor.")
+                responder(f"Encontrei uma inconsistência nos dados dessa publicação (o perfil não bateu com o cliente '{cliente_nome_mc}') e travei por segurança - NÃO fiz nada. Me manda o pedido de novo, por favor.")
                 return {"metricool_bloqueado_seguranca": True}
             resultado_mc, erro_mc = _metricool_criar_post(
                 pendente["metricool_blog_id"], pendente["metricool_tipo_instagram"],
-                pendente["metricool_media_urls"], pendente["metricool_texto"], draft=False,
+                pendente["metricool_media_urls"], pendente["metricool_texto"], draft=eh_rascunho_mc,
             )
             _comandos_pendentes.pop(pessoa, None)
             if erro_mc:
-                print(f"[processar_dm] falhou ao publicar no Metricool: {erro_mc}", flush=True)
-                responder(f"Tentei publicar no {rotulo_tipo_mc} do {cliente_nome_mc} ({handle_mc}) mas deu erro: {erro_mc}. Não foi publicado nada.")
+                acao_falhou_mc = "deixar em rascunho" if eh_rascunho_mc else "publicar"
+                print(f"[processar_dm] falhou ao {acao_falhou_mc} no Metricool: {erro_mc}", flush=True)
+                responder(f"Tentei {acao_falhou_mc} no {rotulo_tipo_mc} do {cliente_nome_mc} ({handle_mc}) mas deu erro: {erro_mc}. Não foi feito nada.")
                 return {"metricool_publicacao_falhou": erro_mc}
             ordem_mc = _formatar_ordem_midias([{"nome": n} for n in pendente.get("metricool_nomes_midias") or []])
             ordem_mc_txt = f"\n\nOrdem publicada:\n{ordem_mc}" if ordem_mc else ""
-            responder(f"Prontinho, publiquei no {rotulo_tipo_mc} do {cliente_nome_mc} - perfil {handle_mc} no Instagram! ✅{ordem_mc_txt}")
+            if eh_rascunho_mc:
+                responder(f"Prontinho, deixei em rascunho no {rotulo_tipo_mc} do {cliente_nome_mc} - perfil {handle_mc} no Instagram! 👍{ordem_mc_txt}")
+            else:
+                responder(f"Prontinho, publiquei no {rotulo_tipo_mc} do {cliente_nome_mc} - perfil {handle_mc} no Instagram! ✅{ordem_mc_txt}")
             return {"metricool_publicacao_confirmada": True, "cliente": cliente_nome_mc}
         elif confirma is True and pendente.get("eh_legenda_sugerida_metricool"):
             # Round 27 parte 31: legenda foi CRIADA pela Cintia (não escrita pelo Torres), então
@@ -7213,13 +7226,19 @@ def processar_dm(remote_jid, key, data):
             ajuste_legenda = _tentar_ajustar_legenda_metricool_pendente(pendente.get("metricool_texto", ""), texto)
             if ajuste_legenda.get("eh_ajuste") and ajuste_legenda.get("legenda_atualizada"):
                 nova_legenda = ajuste_legenda["legenda_atualizada"]
+                # Round 27 parte 38: legenda AJUSTADA também passa pela revisão, antes de
+                # mostrar de novo pra aprovação - nunca deixa passar batido só por ter vindo de
+                # um ajuste em vez da sugestão original.
+                resultado_revisao_ajuste = _revisar_legenda_metricool(nova_legenda)
+                nova_legenda = resultado_revisao_ajuste["legenda_final"]
+                bloco_aviso_ajuste = _formatar_aviso_revisao_metricool(resultado_revisao_ajuste["pontos"], [])
                 pendente["metricool_texto"] = nova_legenda
                 pendente["criado_em"] = time.time()
                 rotulo_tipo_ajuste = "feed" if pendente["metricool_tipo_instagram"] == "POST" else "story"
                 acao_ajuste = "deixar em rascunho" if pendente.get("metricool_draft") else "publicar"
                 handle_ajuste = _metricool_handle_instagram(pendente["metricool_cliente_nome"])
                 responder(
-                    f'Segue a sugestão com esse ajuste:\n\n"{nova_legenda}"\n\n'
+                    f'Segue a sugestão com esse ajuste:\n\n"{nova_legenda}"{bloco_aviso_ajuste}\n\n'
                     f"Posso {acao_ajuste} com essa legenda no {rotulo_tipo_ajuste} do {pendente['metricool_cliente_nome']} "
                     f"({handle_ajuste})? Confirma (sim/não), ou me manda outro ajuste."
                 )
@@ -7237,13 +7256,18 @@ def processar_dm(remote_jid, key, data):
             ajuste_legenda_normal = _tentar_ajustar_legenda_metricool_pendente(pendente.get("metricool_texto", ""), texto)
             if ajuste_legenda_normal.get("eh_ajuste") and ajuste_legenda_normal.get("legenda_atualizada"):
                 nova_legenda_normal = ajuste_legenda_normal["legenda_atualizada"]
+                # Round 27 parte 38: mesma revisão automática também na legenda ajustada aqui.
+                resultado_revisao_ajuste_normal = _revisar_legenda_metricool(nova_legenda_normal)
+                nova_legenda_normal = resultado_revisao_ajuste_normal["legenda_final"]
+                bloco_aviso_ajuste_normal = _formatar_aviso_revisao_metricool(resultado_revisao_ajuste_normal["pontos"], [])
                 pendente["metricool_texto"] = nova_legenda_normal
                 pendente["criado_em"] = time.time()
                 rotulo_tipo_ajuste_normal = "feed" if pendente["metricool_tipo_instagram"] == "POST" else "story"
+                acao_ajuste_normal = "deixar em rascunho" if pendente.get("metricool_draft") else "publicar"
                 handle_ajuste_normal = _metricool_handle_instagram(pendente["metricool_cliente_nome"])
                 responder(
                     f'Legenda atualizada pro {rotulo_tipo_ajuste_normal} do {pendente["metricool_cliente_nome"]} ({handle_ajuste_normal}):\n\n'
-                    f'"{nova_legenda_normal}"\n\nPosso publicar assim? Confirma (sim/não), ou me manda outro ajuste.'
+                    f'"{nova_legenda_normal}"{bloco_aviso_ajuste_normal}\n\nPosso {acao_ajuste_normal} assim? Confirma (sim/não), ou me manda outro ajuste.'
                 )
                 registrar_mensagem_grupo(
                     pendente["metricool_grupo_jid_dm"], pendente["metricool_grupo_nome_dm"], "Cintia",
@@ -8476,10 +8500,20 @@ _LIMITE_IMAGENS_CARROSSEL = 10  # limite real do Instagram pra carrossel
 
 def _extrair_pasta_id_drive(texto):
     """Procura um link de PASTA do Google Drive (.../drive/folders/<id>) - diferente de
-    _extrair_arquivo_id_drive, que reconhece só link de ARQUIVO único de propósito."""
+    _extrair_arquivo_id_drive, que reconhece só link de ARQUIVO único de propósito.
+
+    Round 27 parte 39, bug real reportado pelo Torres (a pasta do feed do Zurca foi tratada
+    como se não desse pra abrir, quando na verdade só o link não bateu com o regex): o Google
+    Drive adiciona um segmento "/u/<N>/" no link quando a conta tem mais de um usuário logado
+    (ex: "https://drive.google.com/drive/u/1/folders/<id>", em vez do formato sem esse
+    segmento) - um formato de link real e comum, não uma variação rara. O regex antigo exigia
+    "/drive/folders/" logo em seguida do domínio e não reconhecia esse formato, então a pasta
+    caía no fluxo de link único (tenta baixar a URL da pasta como se fosse um arquivo, recebe a
+    página HTML do Drive de volta, e o mimetype errado faz parecer que "a análise falhou, ou é
+    um vídeo" - uma mensagem tecnicamente verdadeira mas com causa raiz completamente errada)."""
     if not texto:
         return None
-    m = re.search(r"https?://drive\.google\.com/drive/folders/([a-zA-Z0-9_-]+)", texto)
+    m = re.search(r"https?://drive\.google\.com/drive/(?:u/\d+/)?folders/([a-zA-Z0-9_-]+)", texto)
     return m.group(1) if m else None
 
 
@@ -8553,6 +8587,126 @@ def _formatar_ordem_midias(midias):
         nome = midia.get("nome") or f"arquivo {i} (sem nome identificado)"
         linhas.append(f"{i}. {nome}")
     return "\n".join(linhas)
+
+
+SYSTEM_PROMPT_REVISAO_LEGENDA_METRICOOL = """Você é revisor de texto da Cintia (assistente da
+KingKong Filmes/Correria), revisando a LEGENDA de um post ou story antes dele ir ao ar de
+verdade no Instagram via Metricool. Leia a legenda inteira e identifique só erros REAIS de
+ortografia, gramática/concordância, pontuação e digitação (palavra trocada, faltando letra,
+duplicada). NÃO opine sobre estilo, tom, tamanho ou se a legenda está boa - só sobre erro de
+escrita real.
+
+DÚVIDA NÃO É ERRO (mesma regra já usada na revisão de arte): nunca aponte erro só porque uma
+palavra é gíria, hashtag, @ de perfil, nome próprio/comercial, emoji ou expressão informal de
+propósito (ex: "lagobada", "parmegiana", @eu_soutorres) - isso é escolha de estilo, nunca erro.
+Só reporte um erro quando tiver certeza real e conseguir mostrar exatamente qual letra/acento
+está errado e qual é a forma correta.
+
+Se não houver nenhum erro real, devolva a legenda EXATAMENTE IGUAL ao original (nem um espaço
+diferente) e "tem_erro": false. Se houver erro de verdade, devolva a legenda INTEIRA já
+corrigida - só o(s) erro(s) real(is) corrigido(s), preservando 100% o resto (tom, quebras de
+linha, emojis, hashtags e sentido original).
+
+Responda SEMPRE E APENAS em JSON válido, sem bloco de código markdown (nada de ```):
+{
+  "tem_erro": true ou false,
+  "legenda_corrigida": "a legenda inteira (corrigida se havia erro, ou idêntica ao original se não havia)",
+  "erros": [
+    {"trecho_original": "...", "correcao": "...", "explicacao": "..."}
+  ]
+}
+"""
+
+
+def _revisar_legenda_metricool(legenda):
+    """Round 27 parte 38, regra explícita do Torres: NUNCA deixar publicar ou agendar uma
+    legenda com palavra escrita errada sem ele saber - revisa a legenda de verdade (ortografia/
+    gramática/digitação) antes de qualquer ação real no Metricool. Corrige sozinha quando
+    encontra um erro de verdade, mas NUNCA em silêncio - quem chama sempre recebe também os
+    pontos corrigidos ("pontos"), pra mostrar pra Torres antes de publicar. Nunca derruba o
+    fluxo principal: qualquer falha na revisão (IA fora do ar, resposta em formato inesperado)
+    trata como 'sem erro encontrado' e segue com a legenda original, exatamente como já
+    acontecia em _extrair_legenda_metricool."""
+    legenda_original = legenda or ""
+    if not legenda_original.strip():
+        return {"tem_erro": False, "legenda_final": legenda_original, "pontos": []}
+    try:
+        resultado = chamar_claude(
+            SYSTEM_PROMPT_REVISAO_LEGENDA_METRICOOL,
+            f"Revise essa legenda:\n\n{legenda_original}",
+            max_tokens=1500, timeout=30,
+        )
+    except Exception as e:
+        print(f"[_revisar_legenda_metricool] erro: {e}", flush=True)
+        return {"tem_erro": False, "legenda_final": legenda_original, "pontos": []}
+
+    erros_brutos = resultado.get("erros") or []
+    erros_validos = []
+    for e in erros_brutos:
+        if isinstance(e, dict):
+            original = (e.get("trecho_original") or "").strip()
+            correcao = (e.get("correcao") or "").strip()
+            if original and correcao and original.lower() == correcao.lower():
+                # mesma palavra, so mudando caixa alta/baixa - nao e erro nenhum (mesma rede de
+                # seguranca contra contradicao ja usada em revisar_peca).
+                continue
+            erros_validos.append(e)
+        elif e:
+            erros_validos.append(e)
+
+    legenda_corrigida = (resultado.get("legenda_corrigida") or "").strip()
+    tem_erro = bool(erros_validos) and bool(legenda_corrigida) and legenda_corrigida != legenda_original
+    if not tem_erro:
+        return {"tem_erro": False, "legenda_final": legenda_original, "pontos": []}
+    return {
+        "tem_erro": True,
+        "legenda_final": legenda_corrigida,
+        "pontos": _formatar_pontos_ortografia({"erros": erros_validos}),
+    }
+
+
+def _revisar_artes_metricool(midias):
+    """Round 27 parte 38: revisa o texto ESCRITO NA PRÓPRIA ARTE de cada imagem do post/story
+    (reaproveita o MESMO motor de ortografia já validado na conferência de peça com a Tripa/
+    cliente - SYSTEM_PROMPT_REVISAO/revisar_peca - em vez de inventar um novo). Só imagem é
+    revisada (vídeo não dá pra analisar visualmente aqui, mesma limitação já conhecida da
+    sugestão de legenda da parte 31) - e, diferente da legenda, aqui NUNCA corrige sozinha (não
+    dá pra editar pixel de imagem por código), só aponta pra Torres decidir se ajusta a arte
+    antes de publicar. Devolve uma lista [{"nome":..., "pontos": [...]}] só com os arquivos que
+    TÊM erro confirmado - lista vazia quando está tudo certo, quando só há vídeo, ou quando a
+    revisão falha (nunca derruba o fluxo principal por causa disso)."""
+    avisos = []
+    for midia in midias:
+        mime = midia.get("mime_type") or ""
+        if not mime.startswith("image/"):
+            continue
+        try:
+            imagem_b64 = base64.b64encode(midia["bytes"]).decode()
+            tem_erro, _texto_resp, resultado = revisar_peca(imagem_b64, None, "", imagem_media_type=mime)
+        except Exception as e:
+            print(f"[_revisar_artes_metricool] erro ao revisar '{midia.get('nome')}': {e}", flush=True)
+            continue
+        if tem_erro:
+            avisos.append({"nome": midia.get("nome") or "(sem nome)", "pontos": _formatar_pontos_ortografia(resultado)})
+    return avisos
+
+
+def _formatar_aviso_revisao_metricool(pontos_legenda, avisos_arte):
+    """Monta o bloco de aviso da revisão automática (parte 38) pra entrar nas mensagens de
+    confirmação/rascunho/publicação do Metricool - só aparece quando há algo pra avisar de
+    verdade (string vazia quando está tudo certo, nunca polui a mensagem à toa)."""
+    if not pontos_legenda and not avisos_arte:
+        return ""
+    linhas = ["⚠️ Revisão automática de escrita:"]
+    if pontos_legenda:
+        linhas.append("Corrigi isso na legenda antes de te perguntar:")
+        linhas.extend(f"- {p}" for p in pontos_legenda)
+    if avisos_arte:
+        linhas.append("Encontrei isso ESCRITO NA ARTE (não consigo corrigir sozinha - confere antes de publicar):")
+        for item in avisos_arte:
+            linhas.append(f"- {item['nome']}:")
+            linhas.extend(f"  - {p}" for p in item["pontos"])
+    return "\n\n" + "\n".join(linhas)
 
 
 def _identificar_clientes_metricool_candidatos(texto):
@@ -8950,6 +9104,15 @@ def _processar_agendamento_lote_metricool(pessoa, numero, grupo_jid_dm, grupo_no
         return {"metricool_lote_erro_datas": len(com_erro)}
 
     legenda_lote = _extrair_legenda_metricool(texto)
+    # Round 27 parte 38, regra explícita do Torres: revisa a legenda (corrige sozinha, mas
+    # sempre avisa) e o texto escrito em cada arte do lote (só aponta, não corrige - vídeo não
+    # dá pra revisar visualmente) ANTES de mostrar o calendário pra aprovação - nunca deixa
+    # passar despercebido só porque é um agendamento em lote.
+    resultado_revisao_lote = _revisar_legenda_metricool(legenda_lote)
+    legenda_lote = resultado_revisao_lote["legenda_final"]
+    avisos_arte_lote = _revisar_artes_metricool(midias)
+    bloco_aviso_revisao_lote = _formatar_aviso_revisao_metricool(resultado_revisao_lote["pontos"], avisos_arte_lote)
+
     itens_pendentes = []
     linhas_preview = []
     for r in sorted(resolvidos, key=lambda r: r["data"]):
@@ -8983,7 +9146,7 @@ def _processar_agendamento_lote_metricool(pessoa, numero, grupo_jid_dm, grupo_no
     enviar_texto(
         numero,
         f"Programando cada arquivo pro {rotulo_tipo} do {cliente_nome} ({handle_lote}){aviso_legenda_lote}, "
-        f"cada um publicando sozinho no dia certo:\n\n" + "\n".join(linhas_preview) +
+        f"cada um publicando sozinho no dia certo:\n\n" + "\n".join(linhas_preview) + bloco_aviso_revisao_lote +
         "\n\nConfirma que posso programar tudo isso? (sim/não)",
     )
     registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", f"[aguardando confirmação de agendamento em lote no Metricool: {len(itens_pendentes)} arquivo(s) pro {rotulo_tipo} do {cliente_nome}]", False)
@@ -9047,6 +9210,11 @@ def _processar_pedido_metricool_dm(pessoa, numero, grupo_jid_dm, grupo_nome_dm, 
     ordem_midias_txt = f"\n\nOrdem dos arquivos:\n{_formatar_ordem_midias(midias)}"
     nomes_midias = [m.get("nome") for m in midias]
 
+    # Round 27 parte 38, regra explícita do Torres: revisa o texto escrito em cada arte ANTES
+    # de decidir qual dos 3 fluxos abaixo roda (sugestão de legenda, rascunho ou publicação
+    # normal) - calculado uma única vez aqui porque os 3 fluxos usam a mesma lista de mídias.
+    avisos_arte_mc = _revisar_artes_metricool(midias)
+
     # Round 27 parte 31: pedido explícito de SUGESTÃO de legenda (Torres pede pra Cintia olhar
     # o conteúdo e criar uma opção, em vez de só extrair uma legenda que ele já escreveu) - a
     # legenda sugerida SEMPRE passa por aprovação antes de virar rascunho ou publicação, mesmo
@@ -9073,6 +9241,11 @@ def _processar_pedido_metricool_dm(pessoa, numero, grupo_jid_dm, grupo_nome_dm, 
             )
             registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", f"[pedido de sugestão de legenda no Metricool falhou: {rotulo_tipo} do {cliente_nome}]", False)
             return {"metricool_sugestao_legenda_falhou": True}
+        # Round 27 parte 38: mesmo sendo escrita pela própria Cintia, a legenda sugerida também
+        # passa pela revisão - nunca assume que o próprio texto dela sai sempre perfeito.
+        resultado_revisao_sugestao = _revisar_legenda_metricool(legenda_sugerida)
+        legenda_sugerida = resultado_revisao_sugestao["legenda_final"]
+        bloco_aviso_revisao = _formatar_aviso_revisao_metricool(resultado_revisao_sugestao["pontos"], avisos_arte_mc)
         _comandos_pendentes[pessoa] = {
             "criado_em": time.time(),
             "eh_legenda_sugerida_metricool": True,
@@ -9090,19 +9263,52 @@ def _processar_pedido_metricool_dm(pessoa, numero, grupo_jid_dm, grupo_nome_dm, 
         handle_sugestao = _metricool_handle_instagram(cliente_nome)
         enviar_texto(
             numero,
-            f'Legenda sugerida pro {rotulo_tipo} do {cliente_nome} ({handle_sugestao}){aviso_midias}:\n\n"{legenda_sugerida}"{ordem_midias_txt}\n\n'
+            f'Legenda sugerida pro {rotulo_tipo} do {cliente_nome} ({handle_sugestao}){aviso_midias}:\n\n"{legenda_sugerida}"{ordem_midias_txt}{bloco_aviso_revisao}\n\n'
             f"Posso {acao_pendente} com essa legenda nesse perfil? Confirma (sim/não), ou me manda a legenda que você preferir.",
         )
         registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", f"[sugeriu legenda pro Metricool, aguardando aprovação: {rotulo_tipo} do {cliente_nome}]", False)
         return {"metricool_legenda_sugerida_aguardando_confirmacao": True}
 
     legenda = _extrair_legenda_metricool(texto)
+    # Round 27 parte 38, regra explícita do Torres: revisa a legenda (corrige sozinha, mas
+    # sempre avisa) antes de decidir entre rascunho ou publicação normal.
+    resultado_revisao_legenda = _revisar_legenda_metricool(legenda)
+    legenda = resultado_revisao_legenda["legenda_final"]
+    bloco_aviso_revisao = _formatar_aviso_revisao_metricool(resultado_revisao_legenda["pontos"], avisos_arte_mc)
     handle_dm = _metricool_handle_instagram(cliente_nome)
 
     if eh_rascunho:
         # Blindagem (Round 27 parte 35): rascunho é a ÚNICA ação de verdade no Metricool que
         # acontece SEM confirmação prévia - por isso a segunda trava de destino é ainda mais
         # importante aqui do que nos fluxos que passam por "sim".
+        if bloco_aviso_revisao:
+            # Round 27 parte 38: a revisão automática achou algo (corrigiu a legenda e/ou achou
+            # erro escrito na arte) - nesse caso o rascunho DEIXA de ir direto (regra explícita
+            # do Torres: nunca publicar/agendar com erro sem avisar antes, mesmo no único fluxo
+            # que normalmente pula a confirmação). Vira uma pendência igual à publicação normal,
+            # só que marcada como rascunho - a blindagem de destino é reconferida de novo lá na
+            # hora do "sim", pelo mesmo handler que já existe pra eh_postagem_metricool.
+            _comandos_pendentes[pessoa] = {
+                "criado_em": time.time(),
+                "eh_postagem_metricool": True,
+                "metricool_draft": True,
+                "metricool_blog_id": blog_id,
+                "metricool_cliente_nome": cliente_nome,
+                "metricool_tipo_instagram": tipo_instagram,
+                "metricool_media_urls": media_urls_publicas,
+                "metricool_nomes_midias": nomes_midias,
+                "metricool_texto": legenda,
+                "metricool_grupo_jid_dm": grupo_jid_dm,
+                "metricool_grupo_nome_dm": grupo_nome_dm,
+            }
+            aviso_legenda_revisao = "" if legenda else " (sem legenda - só o texto do link e do comando, então deixei sem, você pode completar direto no Metricool)"
+            enviar_texto(
+                numero,
+                f"Antes de deixar em rascunho no {rotulo_tipo} do {cliente_nome} ({handle_dm}){aviso_legenda_revisao}{aviso_midias}, "
+                f"a revisão automática encontrou algo:{bloco_aviso_revisao}{ordem_midias_txt}\n\nPosso deixar em rascunho assim mesmo? Confirma (sim/não).",
+            )
+            registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", f"[revisão automática encontrou algo antes do rascunho no Metricool, aguardando confirmação: {rotulo_tipo} do {cliente_nome}]", False)
+            return {"metricool_rascunho_aguardando_revisao": True}
         if not _metricool_validar_destino(cliente_nome, blog_id):
             print(f"[_processar_pedido_metricool_dm] BLOQUEADO por segurança: blog_id não bate com o cliente '{cliente_nome}' - nada foi feito", flush=True)
             enviar_texto(numero, f"Encontrei uma inconsistência nos dados dessa publicação (o perfil não bateu com o cliente '{cliente_nome}') e travei por segurança - NÃO fiz nada. Me manda o pedido de novo, por favor.")
@@ -9123,6 +9329,7 @@ def _processar_pedido_metricool_dm(pessoa, numero, grupo_jid_dm, grupo_nome_dm, 
     _comandos_pendentes[pessoa] = {
         "criado_em": time.time(),
         "eh_postagem_metricool": True,
+        "metricool_draft": False,
         "metricool_blog_id": blog_id,
         "metricool_cliente_nome": cliente_nome,
         "metricool_tipo_instagram": tipo_instagram,
@@ -9133,7 +9340,7 @@ def _processar_pedido_metricool_dm(pessoa, numero, grupo_jid_dm, grupo_nome_dm, 
         "metricool_grupo_nome_dm": grupo_nome_dm,
     }
     resumo_legenda = f' com a legenda "{legenda}"' if legenda else " sem legenda nenhuma (não achei nenhum texto próprio na sua mensagem)"
-    enviar_texto(numero, f"Posso publicar isso agora no {rotulo_tipo} do {cliente_nome} ({handle_dm}){resumo_legenda}{aviso_midias}?{ordem_midias_txt}\n\nConfirma?")
+    enviar_texto(numero, f"Posso publicar isso agora no {rotulo_tipo} do {cliente_nome} ({handle_dm}){resumo_legenda}{aviso_midias}?{ordem_midias_txt}{bloco_aviso_revisao}\n\nConfirma?")
     registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", f"[aguardando confirmação pra publicar no Metricool: {rotulo_tipo} do {cliente_nome}]", False)
     return {"metricool_aguardando_confirmacao": True}
 
