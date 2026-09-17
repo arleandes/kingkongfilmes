@@ -7127,6 +7127,51 @@ def processar_dm(remote_jid, key, data):
             else:
                 responder(f"Prontinho, publiquei no {rotulo_tipo_mc} do {cliente_nome_mc} - perfil {handle_mc} no Instagram - com a legenda sugerida! ✅{ordem_mc_leg_txt}")
             return {"metricool_legenda_sugerida_confirmada": True, "cliente": cliente_nome_mc}
+        elif confirma is True and pendente.get("eh_agendamento_lote_metricool"):
+            # Round 27 parte 37: só chega aqui depois do "sim" aprovando o LOTE inteiro - cria
+            # um post separado por item, cada um na sua própria data/hora. Mesma blindagem de
+            # destino da parte 35, conferida UMA vez pro lote todo (mesmo blog_id em todos os
+            # itens) antes de criar qualquer um deles.
+            cliente_nome_lote = pendente["metricool_cliente_nome"]
+            rotulo_tipo_lote = "feed" if pendente["metricool_tipo_instagram"] == "POST" else "story"
+            handle_lote_confirma = _metricool_handle_instagram(cliente_nome_lote)
+            itens_lote = pendente.get("metricool_itens_lote") or []
+            if not _metricool_validar_destino(cliente_nome_lote, pendente["metricool_blog_id"]):
+                print(f"[processar_dm] BLOQUEADO por segurança: blog_id do lote não bate com o cliente '{cliente_nome_lote}' - nada foi programado", flush=True)
+                _comandos_pendentes.pop(pessoa, None)
+                responder(f"Encontrei uma inconsistência nos dados desse lote (o perfil não bateu com o cliente '{cliente_nome_lote}') e travei por segurança - NÃO programei nada. Me manda o pedido de novo, por favor.")
+                return {"metricool_bloqueado_seguranca": True}
+            sucessos_lote = []
+            falhas_lote = []
+            for item in itens_lote:
+                data_hora_item = datetime.fromisoformat(item["data_iso"]).replace(
+                    hour=item["hora"], minute=item["minuto"], second=0, microsecond=0,
+                    tzinfo=BAHIA_TZ,
+                )
+                _resultado_item, erro_item = _metricool_criar_post(
+                    pendente["metricool_blog_id"], pendente["metricool_tipo_instagram"],
+                    [item["media_url"]], pendente.get("metricool_texto", ""), draft=False,
+                    data_publicacao=data_hora_item,
+                )
+                rotulo_data_item = f"{item['data_iso']} às {item['hora']:02d}:{item['minuto']:02d}"
+                if erro_item:
+                    print(f"[processar_dm] falhou ao programar item do lote ({item.get('nome')}): {erro_item}", flush=True)
+                    falhas_lote.append(f"- {item.get('nome') or '(sem nome)'} ({rotulo_data_item}): {erro_item}")
+                else:
+                    sucessos_lote.append(f"- {item.get('nome') or '(sem nome)'} -> {rotulo_data_item}")
+            _comandos_pendentes.pop(pessoa, None)
+            partes_resposta = []
+            if sucessos_lote:
+                partes_resposta.append(
+                    f"Programei {len(sucessos_lote)} de {len(itens_lote)} no {rotulo_tipo_lote} do "
+                    f"{cliente_nome_lote} - perfil {handle_lote_confirma} no Instagram! ✅\n\n" + "\n".join(sucessos_lote)
+                )
+            if falhas_lote:
+                partes_resposta.append(
+                    "ATENÇÃO - esses aqui NÃO foram programados, deu erro:\n" + "\n".join(falhas_lote)
+                )
+            responder("\n\n".join(partes_resposta) if partes_resposta else "Não tinha nenhum item nesse lote pra programar.")
+            return {"metricool_lote_confirmado": True, "sucessos": len(sucessos_lote), "falhas": len(falhas_lote)}
         elif confirma is True:
             enviar_texto(TRIPA_DESIGNER_JID, pendente["mensagem_tripa"])
             aviso_cobranca = ""
@@ -7206,6 +7251,21 @@ def processar_dm(remote_jid, key, data):
                 )
                 return {"metricool_postagem_ajustada": True}
             # Nao pareceu ajuste - segue o fluxo normal.
+        elif pendente.get("eh_agendamento_lote_metricool"):
+            # Round 27 parte 37: um lote (vários arquivos, cada um com sua própria data) não
+            # tem um "ajuste pontual" bem definido como uma legenda de texto (tirar 1 arquivo,
+            # trocar só um horário, etc é mais específico) - pra nunca arriscar a MESMA classe
+            # de bug das partes 33/34 (perder a pendência de verdade, ou alucinar confirmação
+            # em bate-papo solto), nunca deixa cair no catch-all: sempre re-mostra o calendário
+            # combinado e pede sim/não de novo, sem inventar um ajuste que não foi confirmado.
+            pendente["criado_em"] = time.time()
+            responder(
+                'Ainda estou com esse lote de agendamento aguardando aprovação. Se quiser mudar algo '
+                '(tirar um arquivo, trocar o horário, trocar uma data), responde "não" que eu descarto '
+                'esse lote - aí você me manda a pasta de novo já do jeito certo. Ou responde "sim" pra '
+                'eu programar exatamente como mostrei antes.'
+            )
+            return {"metricool_lote_pediu_reconfirmacao": True}
         # confirma is None (e nao era ajuste de briefing/legenda pendente): nao pareceu sim/nem nao,
         # segue o fluxo normal (pode ser uma mensagem nova, ou uma correcao ao comando pendente -
         # nesse caso o comando antigo so expira depois do TTL, ou e substituido se essa mensagem
@@ -8526,6 +8586,9 @@ def _detectar_tipo_conteudo_metricool(texto):
 _PALAVRAS_GATILHO_METRICOOL = [
     "posta", "poste", "postar", "publica", "publique", "publicar",
     "agenda isso", "agende isso", "rascunho", "draft", "metricool", "legenda",
+    # Round 27 parte 37: agendamento em LOTE (cada arquivo pro seu próprio dia) - ver
+    # _PALAVRAS_GATILHO_LOTE_METRICOOL logo abaixo, que decide o tipo exato de pedido.
+    "programa", "programe", "programar", "agenda cada", "agendar cada",
 ]
 
 
@@ -8654,15 +8717,22 @@ def _sugerir_legenda_metricool(imagem_base64, imagem_media_type, cliente_nome, t
         return ""
 
 
-def _metricool_criar_post(blog_id, tipo_instagram, media_urls, texto, draft):
+def _metricool_criar_post(blog_id, tipo_instagram, media_urls, texto, draft, data_publicacao=None):
     """Cria um post/story no Instagram através da API pública do Metricool
     (https://app.metricool.com/api/v2/scheduler/posts). Retorna (resposta_json, None) em
     sucesso, ou (None, "motivo do erro em texto") em falha - nunca inventa sucesso nem lança
-    exceção pra quem chamou."""
+    exceção pra quem chamou.
+
+    data_publicacao (Round 27 parte 37, agendamento em lote por dia específico): datetime opcional
+    - quando None (comportamento de sempre), publica "agora" (poucos minutos à frente, só pra
+    satisfazer a regra do Metricool de não aceitar data no passado); quando informado, agenda
+    pra essa data/hora específica em vez de agora (usado pelo agendamento em lote, onde cada
+    arquivo vai pro seu próprio dia)."""
     if not METRICOOL_API_TOKEN:
         return None, "METRICOOL_API_TOKEN não configurado nas variáveis de ambiente do Railway"
-    agora = horario_bahia_agora()
-    data_publicacao = agora + timedelta(minutes=2)  # o Metricool não aceita data no passado
+    if data_publicacao is None:
+        agora = horario_bahia_agora()
+        data_publicacao = agora + timedelta(minutes=2)  # o Metricool não aceita data no passado
     corpo = {
         "publicationDate": {
             "dateTime": data_publicacao.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -8691,6 +8761,233 @@ def _metricool_criar_post(blog_id, tipo_instagram, media_urls, texto, draft):
         return resp.json(), None
     except Exception:
         return {}, None
+
+
+# Round 27 parte 37: Torres pediu pra conseguir mandar uma PASTA do Drive com vários arquivos,
+# cada um com o dia (ou dia da semana) no próprio nome, e a Cintia programar cada um pro seu dia
+# específico daquele mês - "preciso que vc olhe as datas e os dias da semana e programe cada
+# story para o dia especifico nesse mes de setembro". Confirmado com ele: o dia de cada arquivo
+# vem do NOME do arquivo (ex: "quinta_promo.mp4", "25-09_lancamento.mp4"), e antes de programar
+# de verdade ela mostra o calendário inteiro resolvido e espera UM "sim" aprovando o lote todo -
+# mesma filosofia de "nunca inventa, sempre por código" já usada na agenda pessoal
+# (_bloco_proximos_dias_semana) e na agenda de compromissos.
+_PALAVRAS_GATILHO_LOTE_METRICOOL = [
+    "cada story", "cada post", "cada arquivo", "cada imagem", "cada video", "cada vídeo",
+    "cada um pro dia", "cada um para o dia", "cada um no dia", "um pra cada dia",
+    "um para cada dia", "programe cada", "programa cada", "programar cada",
+    "agenda cada", "agendar cada",
+]
+
+
+def _pede_agendamento_lote_metricool(texto):
+    """Decide se o pedido é pra programar CADA arquivo da pasta pro seu próprio dia (lote),
+    diferente do carrossel normal (parte 32, onde todos os arquivos viram UM post só)."""
+    texto_norm = normalizar_texto(texto)
+    return any(p in texto_norm for p in _PALAVRAS_GATILHO_LOTE_METRICOOL)
+
+
+_MESES_PT = {
+    "janeiro": 1, "fevereiro": 2, "marco": 3, "abril": 4, "maio": 5, "junho": 6,
+    "julho": 7, "agosto": 8, "setembro": 9, "outubro": 10, "novembro": 11, "dezembro": 12,
+}
+
+# Índice no estilo date.weekday() (segunda=0 ... domingo=6), com os apelidos/abreviações mais
+# comuns que podem aparecer num nome de arquivo.
+_DIAS_SEMANA_APELIDOS = {
+    "segunda": (0, ["segunda", "segundafeira", "seg"]),
+    "terca": (1, ["terca", "tercafeira", "ter"]),
+    "quarta": (2, ["quarta", "quartafeira", "qua"]),
+    "quinta": (3, ["quinta", "quintafeira", "qui"]),
+    "sexta": (4, ["sexta", "sextafeira", "sex"]),
+    "sabado": (5, ["sabado", "sab"]),
+    "domingo": (6, ["domingo", "dom"]),
+}
+_APELIDO_PARA_DIA_SEMANA = {
+    apelido: (canonico, indice)
+    for canonico, (indice, apelidos) in _DIAS_SEMANA_APELIDOS.items()
+    for apelido in apelidos
+}
+
+
+def _extrair_mes_ano_referencia_lote(texto, agora):
+    """Acha o MÊS de referência citado na própria mensagem (ex: "nesse mes de setembro") - por
+    código, nunca pelo modelo. Sem nenhum mês citado, assume o mês corrente."""
+    texto_norm = normalizar_texto(texto)
+    for nome_mes, numero_mes in _MESES_PT.items():
+        if nome_mes in texto_norm:
+            return numero_mes, agora.year
+    return agora.month, agora.year
+
+
+def _extrair_horario_lote_metricool(texto):
+    """Acha um horário citado na mensagem (ex: "às 18h", "9h30", "20:00") pra aplicar em TODOS
+    os itens do lote. Sem nenhum horário citado, devolve None (quem chama usa um padrão)."""
+    m = re.search(r"\b([01]?\d|2[0-3])[:h](\d{2})?\b", texto.lower())
+    if not m:
+        return None
+    hora = int(m.group(1))
+    minuto = int(m.group(2)) if m.group(2) else 0
+    if 0 <= hora <= 23 and 0 <= minuto <= 59:
+        return hora, minuto
+    return None
+
+
+_HORARIO_PADRAO_LOTE_METRICOOL = (9, 0)  # 09:00 America/Bahia, quando a mensagem não diz horário
+
+
+def _extrair_referencia_dia_do_nome_arquivo(nome_arquivo):
+    """Procura, no NOME do arquivo, uma referência de dia específico (número solto de 1 a 31,
+    "diaNN", ou um par "DD MM" adjacente) ou um dia da semana (nome completo ou abreviação).
+    Nunca adivinha: devolve {"tipo": None} quando não acha nada reconhecível, pra quem chama
+    tratar como erro explícito em vez de chutar uma data."""
+    nome_norm = normalizar_texto(nome_arquivo or "")
+    tokens = re.findall(r"[a-z0-9]+", nome_norm)
+    for token in tokens:
+        if token in _APELIDO_PARA_DIA_SEMANA:
+            canonico, _indice = _APELIDO_PARA_DIA_SEMANA[token]
+            return {"tipo": "dia_semana", "dia_semana": canonico}
+    for token in tokens:
+        m_dia_prefixo = re.match(r"^dia0*(\d{1,2})$", token)
+        if m_dia_prefixo and 1 <= int(m_dia_prefixo.group(1)) <= 31:
+            return {"tipo": "data", "dia": int(m_dia_prefixo.group(1))}
+    for i in range(len(tokens) - 1):
+        if tokens[i].isdigit() and tokens[i + 1].isdigit() and len(tokens[i]) <= 2 and len(tokens[i + 1]) <= 2:
+            dia, mes = int(tokens[i]), int(tokens[i + 1])
+            if 1 <= dia <= 31 and 1 <= mes <= 12:
+                return {"tipo": "data", "dia": dia, "mes": mes}
+    for token in tokens:
+        if token.isdigit() and len(token) <= 2 and 1 <= int(token) <= 31:
+            return {"tipo": "data", "dia": int(token)}
+    return {"tipo": None}
+
+
+def _resolver_datas_lote_metricool(midias, mes_ref, ano_ref, agora):
+    """Resolve a data de publicação de cada mídia do lote a partir do nome do arquivo - por
+    CÓDIGO, nunca pelo modelo (mesma filosofia de _bloco_proximos_dias_semana). Devolve uma
+    lista [{"midia", "data": date|None, "erro": str|None}], na mesma ordem recebida. Dia da
+    semana repetido (ex: duas "quinta") pega ocorrências em sequência, na ordem dos arquivos;
+    data inválida, já usada por outro arquivo do lote, ou já passada vira erro explícito - nunca
+    ignora silenciosamente nem inventa uma data aproximada."""
+    import calendar as _calendar_lote
+
+    total_dias_mes = _calendar_lote.monthrange(ano_ref, mes_ref)[1]
+    todas_datas_mes = [date(ano_ref, mes_ref, d) for d in range(1, total_dias_mes + 1)]
+    datas_por_dia_semana = {}
+    for d in todas_datas_mes:
+        datas_por_dia_semana.setdefault(d.weekday(), []).append(d)
+    proximo_indice_dia_semana = {}
+    datas_usadas = set()
+    hoje = agora.date()
+    resultado = []
+    for midia in midias:
+        ref = _extrair_referencia_dia_do_nome_arquivo(midia.get("nome"))
+        data_resolvida = None
+        erro = None
+        if ref["tipo"] == "dia_semana":
+            canonico = ref["dia_semana"]
+            indice_semana = _DIAS_SEMANA_APELIDOS[canonico][0]
+            candidatas = datas_por_dia_semana.get(indice_semana, [])
+            idx = proximo_indice_dia_semana.get(indice_semana, 0)
+            while idx < len(candidatas) and (candidatas[idx] in datas_usadas or candidatas[idx] < hoje):
+                idx += 1
+            if idx < len(candidatas):
+                data_resolvida = candidatas[idx]
+                proximo_indice_dia_semana[indice_semana] = idx + 1
+            else:
+                erro = f"não sobrou nenhuma {canonico}-feira livre em {mes_ref:02d}/{ano_ref} pra esse arquivo"
+        elif ref["tipo"] == "data":
+            mes_usar = ref.get("mes", mes_ref)
+            dia_usar = ref["dia"]
+            try:
+                data_resolvida = date(ano_ref, mes_usar, dia_usar)
+            except ValueError:
+                erro = f"o dia {dia_usar:02d}/{mes_usar:02d} não existe nesse mês"
+        else:
+            erro = "não consegui identificar nenhum dia ou data no nome desse arquivo"
+        if data_resolvida is not None and data_resolvida in datas_usadas:
+            erro = f"a data {data_resolvida.strftime('%d/%m')} já foi usada por outro arquivo desse lote"
+            data_resolvida = None
+        if data_resolvida is not None and data_resolvida < hoje:
+            erro = f"a data {data_resolvida.strftime('%d/%m')} já passou"
+            data_resolvida = None
+        if data_resolvida is not None:
+            datas_usadas.add(data_resolvida)
+        resultado.append({"midia": midia, "data": data_resolvida, "erro": erro})
+    return resultado
+
+
+_NOMES_DIAS_SEMANA_EXIBICAO = {
+    0: "segunda-feira", 1: "terça-feira", 2: "quarta-feira", 3: "quinta-feira",
+    4: "sexta-feira", 5: "sábado", 6: "domingo",
+}
+
+
+def _processar_agendamento_lote_metricool(pessoa, numero, grupo_jid_dm, grupo_nome_dm, texto, blog_id, cliente_nome, tipo_instagram, midias, rotulo_tipo):
+    """Round 27 parte 37: programa CADA arquivo da pasta pro seu próprio dia (diferente do
+    carrossel normal, onde todos viram UM post só). Sempre mostra o calendário inteiro resolvido
+    e espera um "sim" só, aprovando o lote todo de uma vez - nunca programa nada sem essa
+    aprovação, e nunca programa NADA do lote se sobrar um arquivo sem data resolvida (evita
+    programar metade do combinado e deixar o resto pra trás sem Torres perceber)."""
+    agora = horario_bahia_agora()
+    mes_ref, ano_ref = _extrair_mes_ano_referencia_lote(texto, agora)
+    horario_ref = _extrair_horario_lote_metricool(texto) or _HORARIO_PADRAO_LOTE_METRICOOL
+    hora_ref, minuto_ref = horario_ref
+    handle_lote = _metricool_handle_instagram(cliente_nome)
+
+    resolvidos = _resolver_datas_lote_metricool(midias, mes_ref, ano_ref, agora)
+    com_erro = [r for r in resolvidos if r["erro"]]
+    if com_erro:
+        linhas_erro = "\n".join(
+            f"- {r['midia'].get('nome') or '(sem nome)'}: {r['erro']}" for r in com_erro
+        )
+        enviar_texto(
+            numero,
+            f"Não consegui resolver a data de {len(com_erro)} de {len(resolvidos)} arquivo(s) dessa pasta, "
+            f"então NÃO programei nada ainda (nem os que dariam certo, pra não programar só metade do lote):\n\n"
+            f"{linhas_erro}\n\nCorrige os nomes dos arquivos (ou me fala a data de cada um por mensagem) e manda de novo.",
+        )
+        registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", f"[agendamento em lote no Metricool falhou ao resolver datas: {len(com_erro)} arquivo(s)]", False)
+        return {"metricool_lote_erro_datas": len(com_erro)}
+
+    legenda_lote = _extrair_legenda_metricool(texto)
+    itens_pendentes = []
+    linhas_preview = []
+    for r in sorted(resolvidos, key=lambda r: r["data"]):
+        midia = r["midia"]
+        data_resolvida = r["data"]
+        url_publica = _publicar_midia_temporaria(midia["bytes"], midia["mime_type"])
+        nome_dia_semana = _NOMES_DIAS_SEMANA_EXIBICAO[data_resolvida.weekday()]
+        itens_pendentes.append({
+            "nome": midia.get("nome"),
+            "media_url": url_publica,
+            "data_iso": data_resolvida.isoformat(),
+            "hora": hora_ref,
+            "minuto": minuto_ref,
+        })
+        linhas_preview.append(
+            f"- {midia.get('nome') or '(sem nome)'} -> {nome_dia_semana}, {data_resolvida.strftime('%d/%m')} às {hora_ref:02d}:{minuto_ref:02d}"
+        )
+
+    _comandos_pendentes[pessoa] = {
+        "criado_em": time.time(),
+        "eh_agendamento_lote_metricool": True,
+        "metricool_blog_id": blog_id,
+        "metricool_cliente_nome": cliente_nome,
+        "metricool_tipo_instagram": tipo_instagram,
+        "metricool_texto": legenda_lote,
+        "metricool_itens_lote": itens_pendentes,
+        "metricool_grupo_jid_dm": grupo_jid_dm,
+        "metricool_grupo_nome_dm": grupo_nome_dm,
+    }
+    aviso_legenda_lote = "" if legenda_lote else " (sem legenda - vou publicar cada um sem legenda, dá pra completar depois direto no Metricool)"
+    enviar_texto(
+        numero,
+        f"Programando cada arquivo pro {rotulo_tipo} do {cliente_nome} ({handle_lote}){aviso_legenda_lote}, "
+        f"cada um publicando sozinho no dia certo:\n\n" + "\n".join(linhas_preview) +
+        "\n\nConfirma que posso programar tudo isso? (sim/não)",
+    )
+    registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", f"[aguardando confirmação de agendamento em lote no Metricool: {len(itens_pendentes)} arquivo(s) pro {rotulo_tipo} do {cliente_nome}]", False)
+    return {"metricool_lote_aguardando_confirmacao": True, "total_itens": len(itens_pendentes)}
 
 
 def _processar_pedido_metricool_dm(pessoa, numero, grupo_jid_dm, grupo_nome_dm, texto):
@@ -8733,9 +9030,17 @@ def _processar_pedido_metricool_dm(pessoa, numero, grupo_jid_dm, grupo_nome_dm, 
         registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", f"[pedido de postagem no Metricool falhou ao baixar a mídia: {erro_download}]", False)
         return {"metricool_erro_download": erro_download}
 
+    rotulo_tipo = "feed" if tipo_instagram == "POST" else "story"
+
+    # Round 27 parte 37: pedido de AGENDAMENTO EM LOTE (cada arquivo da pasta pro seu próprio
+    # dia, ex: "programa cada story pro dia certo") - fluxo totalmente diferente do carrossel
+    # normal abaixo (onde todos os arquivos viram UM post só), então é resolvido à parte e
+    # retorna direto, antes de gastar upload/legenda/etc do fluxo de post único.
+    if _pede_agendamento_lote_metricool(texto):
+        return _processar_agendamento_lote_metricool(pessoa, numero, grupo_jid_dm, grupo_nome_dm, texto, blog_id, cliente_nome, tipo_instagram, midias, rotulo_tipo)
+
     media_urls_publicas = [_publicar_midia_temporaria(m["bytes"], m["mime_type"]) for m in midias]
     eh_carrossel = len(midias) > 1
-    rotulo_tipo = "feed" if tipo_instagram == "POST" else "story"
     # Round 27 parte 36, pedido do Torres: mostrar SEMPRE a ordem/sequência real dos arquivos
     # (com nome) antes de qualquer ação no Metricool - carrossel, story ou arquivo único - pra
     # ele poder conferir que é exatamente o que ele mandou, na ordem certa, antes de confirmar.
