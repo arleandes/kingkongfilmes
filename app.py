@@ -7093,9 +7093,11 @@ def processar_dm(remote_jid, key, data):
                 _comandos_pendentes.pop(pessoa, None)
                 responder(f"Encontrei uma inconsistência nos dados dessa publicação (o perfil não bateu com o cliente '{cliente_nome_mc}') e travei por segurança - NÃO fiz nada. Me manda o pedido de novo, por favor.")
                 return {"metricool_bloqueado_seguranca": True}
+            data_publicacao_mc = pendente.get("metricool_data_publicacao")
             resultado_mc, erro_mc = _metricool_criar_post(
                 pendente["metricool_blog_id"], pendente["metricool_tipo_instagram"],
                 pendente["metricool_media_urls"], pendente["metricool_texto"], draft=eh_rascunho_mc,
+                data_publicacao=data_publicacao_mc,
             )
             _comandos_pendentes.pop(pessoa, None)
             if erro_mc:
@@ -7105,8 +7107,11 @@ def processar_dm(remote_jid, key, data):
                 return {"metricool_publicacao_falhou": erro_mc}
             ordem_mc = _formatar_ordem_midias([{"nome": n} for n in pendente.get("metricool_nomes_midias") or []])
             ordem_mc_txt = f"\n\nOrdem publicada:\n{ordem_mc}" if ordem_mc else ""
+            rotulo_mc = _rotulo_data_publicacao_pedida(data_publicacao_mc, horario_bahia_agora())
             if eh_rascunho_mc:
                 responder(f"Prontinho, deixei em rascunho no {rotulo_tipo_mc} do {cliente_nome_mc} - perfil {handle_mc} no Instagram! 👍{ordem_mc_txt}")
+            elif rotulo_mc:
+                responder(f"Prontinho, programei pra sair {rotulo_mc} no {rotulo_tipo_mc} do {cliente_nome_mc} - perfil {handle_mc} no Instagram! ✅{ordem_mc_txt}")
             else:
                 responder(f"Prontinho, publiquei no {rotulo_tipo_mc} do {cliente_nome_mc} - perfil {handle_mc} no Instagram! ✅{ordem_mc_txt}")
             return {"metricool_publicacao_confirmada": True, "cliente": cliente_nome_mc}
@@ -7123,9 +7128,11 @@ def processar_dm(remote_jid, key, data):
                 _comandos_pendentes.pop(pessoa, None)
                 responder(f"Encontrei uma inconsistência nos dados dessa publicação (o perfil não bateu com o cliente '{cliente_nome_mc}') e travei por segurança - NÃO fiz nada. Me manda o pedido de novo, por favor.")
                 return {"metricool_bloqueado_seguranca": True}
+            data_publicacao_mc_leg = pendente.get("metricool_data_publicacao")
             resultado_mc, erro_mc = _metricool_criar_post(
                 pendente["metricool_blog_id"], pendente["metricool_tipo_instagram"],
                 pendente["metricool_media_urls"], pendente["metricool_texto"], draft=eh_rascunho_mc,
+                data_publicacao=data_publicacao_mc_leg,
             )
             _comandos_pendentes.pop(pessoa, None)
             if erro_mc:
@@ -7135,8 +7142,11 @@ def processar_dm(remote_jid, key, data):
                 return {"metricool_legenda_sugerida_falhou": erro_mc}
             ordem_mc_leg = _formatar_ordem_midias([{"nome": n} for n in pendente.get("metricool_nomes_midias") or []])
             ordem_mc_leg_txt = f"\n\nOrdem publicada:\n{ordem_mc_leg}" if ordem_mc_leg else ""
+            rotulo_mc_leg = _rotulo_data_publicacao_pedida(data_publicacao_mc_leg, horario_bahia_agora())
             if eh_rascunho_mc:
                 responder(f"Prontinho, deixei em rascunho no {rotulo_tipo_mc} do {cliente_nome_mc} - perfil {handle_mc} no Instagram - com a legenda sugerida! 👍{ordem_mc_leg_txt}")
+            elif rotulo_mc_leg:
+                responder(f"Prontinho, programei pra sair {rotulo_mc_leg} no {rotulo_tipo_mc} do {cliente_nome_mc} - perfil {handle_mc} no Instagram - com a legenda sugerida! ✅{ordem_mc_leg_txt}")
             else:
                 responder(f"Prontinho, publiquei no {rotulo_tipo_mc} do {cliente_nome_mc} - perfil {handle_mc} no Instagram - com a legenda sugerida! ✅{ordem_mc_leg_txt}")
             return {"metricool_legenda_sugerida_confirmada": True, "cliente": cliente_nome_mc}
@@ -8806,14 +8816,17 @@ def _pede_sugestao_legenda_metricool(texto):
 # CRIADA olhando a imagem de verdade - só dispara quando Torres pede a sugestão explicitamente
 # (nunca substitui a legenda dele por conta própria).
 SYSTEM_PROMPT_SUGERIR_LEGENDA_METRICOOL = """Você é a Cintia, redatora de legendas de Instagram da
-KingKong Filmes/Correria (Salvador, Bahia). Vai receber uma imagem (arte, foto ou capa de post)
-que vai ser publicada no Instagram de um cliente específico, e deve escrever UMA sugestão de
-legenda pronta pra usar - olhando de verdade o que aparece na imagem (evento, produto, promoção,
-data, texto da própria arte) pra legenda fazer sentido com o conteúdo, nunca genérica.
+KingKong Filmes/Correria (Salvador, Bahia) - com a MESMA qualidade de redação natural e humana
+que você usa numa conversa de verdade, nunca o modo "descrevendo uma imagem pra um relatório".
+Vai receber uma imagem (arte, foto ou capa de post) que vai ser publicada no Instagram de um
+cliente específico, e deve escrever UMA legenda pronta pra usar - olhando de verdade o que
+aparece na imagem (evento, produto, promoção, data, texto da própria arte) pra fazer sentido com
+o conteúdo, nunca genérica.
 
 Cliente: {cliente_nome}
 Formato: {rotulo_tipo} do Instagram
 {contexto_extra}
+{contexto_memoria_cliente}
 
 Regras de voz por cliente (use a que bater com o nome acima; se não estiver na lista, tom
 comercial simpático e direto, sem exagero):
@@ -8830,14 +8843,33 @@ comercial simpático e direto, sem exagero):
 - Zurca, Chicafe, Asas do Brasil, Banjo Novo, Olegario, Z5 Montagens, Luan Menezes: tom comercial
   simpático, direto, sem forçar humor que não combine com o negócio.
 
+O ERRO MAIS COMUM que você tem que evitar (motivo desta regra existir): legenda que soa como
+DESCRIÇÃO da arte em vez de CONVITE/CONVERSA com quem vai ler no feed. Antes de responder,
+pergunte a si mesma: "isso aqui é o que o DONO DO NEGÓCIO escreveria pra chamar cliente, ou é o
+que alguém escreveria descrevendo a imagem numa reunião?" - se soar com a segunda opção,
+reescreva antes de devolver.
+
+NUNCA, em nenhuma legenda:
+- Use as palavras "carrossel", "postagem", "post" (no sentido de "esse post"), "feed", "story"
+  (como referência à própria publicação), "pasta", "arquivo", "link", "programar", "agendar",
+  "Metricool" - são termos internos de quem publica, ninguém escreve isso numa legenda de
+  verdade, é sinal de que a legenda está falando SOBRE o processo em vez de PRO cliente.
+- Repita literalmente endereço completo, telefone ou letra miúda que já está legível na própria
+  arte - isso nunca ajuda a legenda. Se local/data importam, transforme em convite natural ("Bora
+  pro Imbuí hoje" em vez de copiar rua e número que já estão escritos na arte).
+- Descreva a imagem em terceira pessoa ("A imagem mostra...", "Nesta arte vemos...", "Confira
+  essa arte/peça...") - a legenda fala DIRETO com quem tá lendo, nunca sobre a própria arte.
+
 Regras gerais (sempre):
 - NUNCA use travessão (em-dash, "—") - só ponto, vírgula ou dois pontos.
 - NUNCA use expressões tipo: "no mundo dinâmico de hoje", "no cenário atual", "em resumo", "vale
   ressaltar", "é importante destacar", "descubra o segredo", "eleve seu", "transforme sua vida",
   "não é só X, é Y", "bora lá" como abertura vazia, trio de adjetivos, frase de coach, emoji em
   excesso (no máximo 1 ou 2, só se combinar com o tom do cliente).
-- Frase curta, verbo concreto, detalhe específico da imagem (o que está escrito nela, o produto,
-  a data, o horário) em vez de generalidade.
+- Frase curta, verbo concreto, detalhe específico da imagem (o produto, a data, o horário, o
+  clima do lugar) em vez de generalidade - o detalhe vira GANCHO/CONVITE, nunca cópia da arte.
+- Linguagem que o dono do negócio realmente usaria no WhatsApp com um cliente, não texto de
+  agência genérica - a mesma naturalidade que você usa quando escreve numa conversa de verdade.
 - CTA específico no fim quando fizer sentido pro tipo de conteúdo (não force CTA em toda legenda).
 - Devolva a legenda pronta pra publicar direto, sem aspas ao redor, sem comentar sobre a própria
   legenda.
@@ -8848,16 +8880,24 @@ Responda SEMPRE E APENAS em JSON válido, sem bloco de código markdown:
 
 
 def _sugerir_legenda_metricool(imagem_base64, imagem_media_type, cliente_nome, tipo_instagram, texto_pedido):
+    """Round 27 parte 40: Torres reclamou que a legenda sugerida estava "dura", descrevendo a
+    arte em vez de escrever de verdade pro cliente, e mencionando termo interno tipo "carrossel"/
+    "endereço" que ninguém usa numa legenda de Instagram real. Reforçado o prompt (ver acima) e
+    injetada a MEMÓRIA PERMANENTE já existente do cliente (mesmo mecanismo de "valores oficiais"
+    da parte 16, reaproveitado - não é uma memória nova) pra legenda vir com contexto de negócio
+    de verdade em vez de genérica."""
     rotulo_tipo = "feed" if tipo_instagram == "POST" else "story"
     contexto_extra = (
         f'Pedido de Torres (pode ter direção extra pra legenda - ex: "engraçada", "mencionar a '
         f'promoção" - ignore o que for só comando/nome de cliente/link): "{texto_pedido}"'
     )
+    contexto_memoria_cliente = _bloco_assuntos_conhecidos_cliente(cliente_nome)
     prompt_sistema = (
         SYSTEM_PROMPT_SUGERIR_LEGENDA_METRICOOL
         .replace("{cliente_nome}", cliente_nome)
         .replace("{rotulo_tipo}", rotulo_tipo)
         .replace("{contexto_extra}", contexto_extra)
+        .replace("{contexto_memoria_cliente}", contexto_memoria_cliente)
     )
     try:
         resultado = chamar_claude(
@@ -8987,6 +9027,99 @@ def _extrair_horario_lote_metricool(texto):
 
 
 _HORARIO_PADRAO_LOTE_METRICOOL = (9, 0)  # 09:00 America/Bahia, quando a mensagem não diz horário
+
+# Round 27 parte 41: só interpreta data/hora na mensagem como PEDIDO DE AGENDAMENTO quando
+# aparece uma palavra que sinaliza isso de propósito - nunca varre o texto inteiro atrás de
+# qualquer "hoje"/"18h" solto. Motivo: a LEGENDA que o próprio Torres escreve pode citar um
+# horário como parte do conteúdo (ex: "vem pro happy hour hoje as 18h!" é a legenda do post, não
+# uma instrução pra programar o post pras 18h) - sem esse gatilho explícito, esse texto vira uma
+# publicação AGENDADA por engano em vez de publicada imediatamente com essa legenda, um bug tão
+# ruim quanto o original (que não agendava quando devia). Mesmo padrão de gatilho explícito já
+# usado em _pede_agendamento_lote_metricool/_pede_sugestao_legenda_metricool.
+_PALAVRAS_GATILHO_AGENDAMENTO_METRICOOL = [
+    "program", "agend", "pra sair", "para sair", "marca pra", "marca para",
+    "deixa marcado", "deixa agendado", "deixa programado",
+]
+
+
+def _extrair_data_hora_pedido_metricool(texto, agora):
+    """Round 27 parte 41, bug real reportado pelo Torres: pediu pra "fazer a programação dessa
+    postagem pra sair hoje no feed as 12h" e a Cintia publicou na hora, ignorando o horário
+    pedido - o fluxo de post ÚNICO (diferente do LOTE da parte 37, que já resolve data/hora por
+    arquivo) nunca extraía nenhuma data/hora da mensagem, sempre publicava "agora" (ver
+    _metricool_criar_post, data_publicacao=None). Resolve por CÓDIGO (nunca pelo modelo, mesma
+    filosofia de sempre) uma data/hora pedida: "hoje"/"amanhã", dia da semana (a próxima
+    ocorrência a partir de hoje), data explícita ("dia 20", "20/09") ou só um horário sozinho
+    (ex: "às 12h" sem dia nenhum - nesse caso assume HOJE, já que pedir só a hora normalmente
+    quer dizer "ainda hoje"). Só entra em ação quando a mensagem tem uma palavra de gatilho de
+    agendamento (ver _PALAVRAS_GATILHO_AGENDAMENTO_METRICOOL) - sem isso, mesmo com "hoje"/"18h"
+    no texto, devolve None (pode ser só conteúdo da legenda, não uma instrução).
+
+    Devolve (data_hora, erro): data_hora é um datetime tz-aware (BAHIA_TZ) quando a mensagem
+    pediu alguma data/hora específica, ou None quando não achou pista nenhuma (nesse caso quem
+    chama mantém o comportamento de sempre: publica imediatamente). Nunca resolve pra uma
+    data/hora que JÁ PASSOU - devolve um erro explícito nesse caso (segunda posição da tupla),
+    pra quem chama avisar Torres em vez de publicar silenciosamente "agora" ou numa hora errada
+    do que foi pedido."""
+    texto_norm = normalizar_texto(texto)
+    if not any(p in texto_norm for p in _PALAVRAS_GATILHO_AGENDAMENTO_METRICOOL):
+        return None, None
+    hoje = agora.date()
+    data_resolvida = None
+
+    if re.search(r"\bhoje\b", texto_norm):
+        data_resolvida = hoje
+    elif re.search(r"\bamanha\b", texto_norm):
+        data_resolvida = hoje + timedelta(days=1)
+    else:
+        m_dia_mes = re.search(r"\bdia\s*0*(\d{1,2})(?:\s*[/\-]\s*0*(\d{1,2}))?\b", texto_norm)
+        if m_dia_mes:
+            dia = int(m_dia_mes.group(1))
+            mes = int(m_dia_mes.group(2)) if m_dia_mes.group(2) else agora.month
+            try:
+                data_resolvida = date(agora.year, mes, dia)
+            except ValueError:
+                data_resolvida = None
+        if data_resolvida is None:
+            m_barra = re.search(r"\b(\d{1,2})[/\-](\d{1,2})\b", texto_norm)
+            if m_barra:
+                try:
+                    data_resolvida = date(agora.year, int(m_barra.group(2)), int(m_barra.group(1)))
+                except ValueError:
+                    data_resolvida = None
+        if data_resolvida is None:
+            for apelido, (_canonico, indice) in _APELIDO_PARA_DIA_SEMANA.items():
+                if re.search(rf"\b{apelido}\b", texto_norm):
+                    dias_a_frente = (indice - hoje.weekday()) % 7
+                    data_resolvida = hoje + timedelta(days=dias_a_frente)
+                    break
+
+    horario_resolvido = _extrair_horario_lote_metricool(texto)
+
+    if data_resolvida is None and horario_resolvido is None:
+        return None, None  # nenhuma pista de data/hora - mantém o comportamento de sempre
+
+    if data_resolvida is None:
+        data_resolvida = hoje  # só a hora foi pedida -> assume hoje
+    hora, minuto = horario_resolvido or _HORARIO_PADRAO_LOTE_METRICOOL
+
+    data_hora = datetime(data_resolvida.year, data_resolvida.month, data_resolvida.day, hora, minuto, tzinfo=BAHIA_TZ)
+    if data_hora <= agora:
+        return None, f"{data_resolvida.strftime('%d/%m')} às {hora:02d}:{minuto:02d} já passou"
+    return data_hora, None
+
+
+def _rotulo_data_publicacao_pedida(data_hora, agora):
+    """Formata a data/hora pedida (ver _extrair_data_hora_pedido_metricool) de um jeito natural
+    pra usar nas mensagens de confirmação/conclusão - "hoje às 12:00", "amanhã às 09:00" ou
+    "20/09 às 09:00" quando não é hoje nem amanhã."""
+    if data_hora is None:
+        return None
+    if data_hora.date() == agora.date():
+        return f"hoje às {data_hora.strftime('%H:%M')}"
+    if data_hora.date() == agora.date() + timedelta(days=1):
+        return f"amanhã às {data_hora.strftime('%H:%M')}"
+    return data_hora.strftime("%d/%m às %H:%M")
 
 
 def _extrair_referencia_dia_do_nome_arquivo(nome_arquivo):
@@ -9202,6 +9335,18 @@ def _processar_pedido_metricool_dm(pessoa, numero, grupo_jid_dm, grupo_nome_dm, 
     if _pede_agendamento_lote_metricool(texto):
         return _processar_agendamento_lote_metricool(pessoa, numero, grupo_jid_dm, grupo_nome_dm, texto, blog_id, cliente_nome, tipo_instagram, midias, rotulo_tipo)
 
+    # Round 27 parte 41, bug real reportado pelo Torres: pediu pra "programar pra sair hoje as
+    # 12h" e a Cintia publicou na hora - o post ÚNICO nunca respeitava horário nenhum pedido na
+    # mensagem (só o LOTE, parte 37, já fazia isso por arquivo). Resolvido aqui uma única vez,
+    # usado tanto na sugestão de legenda quanto na publicação normal e no rascunho abaixo.
+    agora_pedido = horario_bahia_agora()
+    data_publicacao_pedida, erro_data_pedida = _extrair_data_hora_pedido_metricool(texto, agora_pedido)
+    if erro_data_pedida:
+        enviar_texto(numero, f"Você pediu pra programar pro {rotulo_tipo} do {cliente_nome}, mas {erro_data_pedida} - me diz um dia/horário que ainda não passou?")
+        registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", f"[pedido de postagem no Metricool com data/hora já passada: {rotulo_tipo} do {cliente_nome}]", False)
+        return {"metricool_data_pedida_invalida": erro_data_pedida}
+    rotulo_data_pedida = _rotulo_data_publicacao_pedida(data_publicacao_pedida, agora_pedido)
+
     media_urls_publicas = [_publicar_midia_temporaria(m["bytes"], m["mime_type"]) for m in midias]
     eh_carrossel = len(midias) > 1
     # Round 27 parte 36, pedido do Torres: mostrar SEMPRE a ordem/sequência real dos arquivos
@@ -9256,10 +9401,13 @@ def _processar_pedido_metricool_dm(pessoa, numero, grupo_jid_dm, grupo_nome_dm, 
             "metricool_nomes_midias": nomes_midias,
             "metricool_texto": legenda_sugerida,
             "metricool_draft": eh_rascunho,
+            "metricool_data_publicacao": data_publicacao_pedida,
             "metricool_grupo_jid_dm": grupo_jid_dm,
             "metricool_grupo_nome_dm": grupo_nome_dm,
         }
         acao_pendente = "deixar em rascunho" if eh_rascunho else "publicar"
+        if rotulo_data_pedida and not eh_rascunho:
+            acao_pendente = f"programar pra sair {rotulo_data_pedida}"
         handle_sugestao = _metricool_handle_instagram(cliente_nome)
         enviar_texto(
             numero,
@@ -9292,6 +9440,7 @@ def _processar_pedido_metricool_dm(pessoa, numero, grupo_jid_dm, grupo_nome_dm, 
                 "criado_em": time.time(),
                 "eh_postagem_metricool": True,
                 "metricool_draft": True,
+                "metricool_data_publicacao": data_publicacao_pedida,
                 "metricool_blog_id": blog_id,
                 "metricool_cliente_nome": cliente_nome,
                 "metricool_tipo_instagram": tipo_instagram,
@@ -9314,7 +9463,7 @@ def _processar_pedido_metricool_dm(pessoa, numero, grupo_jid_dm, grupo_nome_dm, 
             enviar_texto(numero, f"Encontrei uma inconsistência nos dados dessa publicação (o perfil não bateu com o cliente '{cliente_nome}') e travei por segurança - NÃO fiz nada. Me manda o pedido de novo, por favor.")
             registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", f"[bloqueou rascunho no Metricool por inconsistência de destino: {cliente_nome}]", False)
             return {"metricool_bloqueado_seguranca": True}
-        resultado, erro = _metricool_criar_post(blog_id, tipo_instagram, media_urls_publicas, legenda, draft=True)
+        resultado, erro = _metricool_criar_post(blog_id, tipo_instagram, media_urls_publicas, legenda, draft=True, data_publicacao=data_publicacao_pedida)
         if erro:
             print(f"[_processar_pedido_metricool_dm] falhou (rascunho): {erro}", flush=True)
             enviar_texto(numero, f"Tentei deixar em rascunho no Metricool (perfil {handle_dm}) mas deu erro: {erro}")
@@ -9336,11 +9485,13 @@ def _processar_pedido_metricool_dm(pessoa, numero, grupo_jid_dm, grupo_nome_dm, 
         "metricool_media_urls": media_urls_publicas,
         "metricool_nomes_midias": nomes_midias,
         "metricool_texto": legenda,
+        "metricool_data_publicacao": data_publicacao_pedida,
         "metricool_grupo_jid_dm": grupo_jid_dm,
         "metricool_grupo_nome_dm": grupo_nome_dm,
     }
     resumo_legenda = f' com a legenda "{legenda}"' if legenda else " sem legenda nenhuma (não achei nenhum texto próprio na sua mensagem)"
-    enviar_texto(numero, f"Posso publicar isso agora no {rotulo_tipo} do {cliente_nome} ({handle_dm}){resumo_legenda}{aviso_midias}?{ordem_midias_txt}{bloco_aviso_revisao}\n\nConfirma?")
+    acao_publicacao = f"programar isso pra sair {rotulo_data_pedida}" if rotulo_data_pedida else "publicar isso agora"
+    enviar_texto(numero, f"Posso {acao_publicacao} no {rotulo_tipo} do {cliente_nome} ({handle_dm}){resumo_legenda}{aviso_midias}?{ordem_midias_txt}{bloco_aviso_revisao}\n\nConfirma?")
     registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", f"[aguardando confirmação pra publicar no Metricool: {rotulo_tipo} do {cliente_nome}]", False)
     return {"metricool_aguardando_confirmacao": True}
 
