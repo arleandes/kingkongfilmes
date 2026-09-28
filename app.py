@@ -7195,6 +7195,49 @@ def processar_dm(remote_jid, key, data):
                 )
             responder("\n\n".join(partes_resposta) if partes_resposta else "Não tinha nenhum item nesse lote pra programar.")
             return {"metricool_lote_confirmado": True, "sucessos": len(sucessos_lote), "falhas": len(falhas_lote)}
+        elif confirma is True and pendente.get("eh_repeticao_semanal_metricool"):
+            # Round 27 parte 42: só chega aqui depois do "sim" aprovando a repetição inteira -
+            # cria um post separado por data resolvida (todas as ocorrências do dia da semana
+            # escolhido, dentro do mês que Torres pediu), mesma mídia e legenda em todas. Mesma
+            # blindagem de destino já usada em toda ação real no Metricool.
+            cliente_nome_rep = pendente["metricool_cliente_nome"]
+            rotulo_tipo_rep = "feed" if pendente["metricool_tipo_instagram"] == "POST" else "story"
+            eh_rascunho_rep = pendente.get("metricool_draft", False)
+            handle_rep = _metricool_handle_instagram(cliente_nome_rep)
+            if not _metricool_validar_destino(cliente_nome_rep, pendente["metricool_blog_id"]):
+                print(f"[processar_dm] BLOQUEADO por segurança: blog_id da repetição semanal não bate com o cliente '{cliente_nome_rep}' - nada foi feito", flush=True)
+                _comandos_pendentes.pop(pessoa, None)
+                responder(f"Encontrei uma inconsistência nos dados dessa repetição (o perfil não bateu com o cliente '{cliente_nome_rep}') e travei por segurança - NÃO fiz nada. Me manda o pedido de novo, por favor.")
+                return {"metricool_bloqueado_seguranca": True}
+            datas_repeticao = pendente.get("metricool_datas_repeticao") or []
+            sucessos_rep = []
+            falhas_rep = []
+            for data_hora_rep in datas_repeticao:
+                _resultado_rep, erro_rep = _metricool_criar_post(
+                    pendente["metricool_blog_id"], pendente["metricool_tipo_instagram"],
+                    pendente["metricool_media_urls"], pendente.get("metricool_texto", ""),
+                    draft=eh_rascunho_rep, data_publicacao=data_hora_rep,
+                )
+                rotulo_data_rep = data_hora_rep.strftime("%d/%m às %H:%M")
+                if erro_rep:
+                    print(f"[processar_dm] falhou ao programar repetição semanal ({rotulo_data_rep}): {erro_rep}", flush=True)
+                    falhas_rep.append(f"- {rotulo_data_rep}: {erro_rep}")
+                else:
+                    sucessos_rep.append(f"- {rotulo_data_rep}")
+            _comandos_pendentes.pop(pessoa, None)
+            partes_resposta_rep = []
+            acao_rep_txt = "deixei em rascunho" if eh_rascunho_rep else "programei"
+            if sucessos_rep:
+                partes_resposta_rep.append(
+                    f"Prontinho, {acao_rep_txt} {len(sucessos_rep)} de {len(datas_repeticao)} no {rotulo_tipo_rep} do "
+                    f"{cliente_nome_rep} - perfil {handle_rep} no Instagram! ✅\n\n" + "\n".join(sucessos_rep)
+                )
+            if falhas_rep:
+                partes_resposta_rep.append(
+                    "ATENÇÃO - essas datas NÃO foram programadas, deu erro:\n" + "\n".join(falhas_rep)
+                )
+            responder("\n\n".join(partes_resposta_rep) if partes_resposta_rep else "Não tinha nenhuma data pra programar.")
+            return {"metricool_repeticao_semanal_confirmada": True, "sucessos": len(sucessos_rep), "falhas": len(falhas_rep)}
         elif confirma is True:
             enviar_texto(TRIPA_DESIGNER_JID, pendente["mensagem_tripa"])
             aviso_cobranca = ""
@@ -7300,6 +7343,19 @@ def processar_dm(remote_jid, key, data):
                 'eu programar exatamente como mostrei antes.'
             )
             return {"metricool_lote_pediu_reconfirmacao": True}
+        elif pendente.get("eh_repeticao_semanal_metricool"):
+            # Round 27 parte 42: mesma lógica de segurança do lote (parte 37) - uma repetição
+            # semanal (várias datas da MESMA mídia/legenda) também não tem um "ajuste pontual"
+            # bem definido, nunca cai no bate-papo comum enquanto pendente: sempre re-mostra e
+            # pede sim/não de novo.
+            pendente["criado_em"] = time.time()
+            responder(
+                'Ainda estou com essa repetição semanal aguardando aprovação. Se quiser mudar algo '
+                '(o dia da semana, o mês, o horário), responde "não" que eu descarto essa pendência - '
+                'aí você me manda o pedido de novo já do jeito certo. Ou responde "sim" pra eu '
+                'programar exatamente como mostrei antes.'
+            )
+            return {"metricool_repeticao_semanal_pediu_reconfirmacao": True}
         # confirma is None (e nao era ajuste de briefing/legenda pendente): nao pareceu sim/nem nao,
         # segue o fluxo normal (pode ser uma mensagem nova, ou uma correcao ao comando pendente -
         # nesse caso o comando antigo so expira depois do TTL, ou e substituido se essa mensagem
@@ -9122,6 +9178,43 @@ def _rotulo_data_publicacao_pedida(data_hora, agora):
     return data_hora.strftime("%d/%m às %H:%M")
 
 
+# Round 27 parte 42: Torres pediu pra repetir o MESMO story/post em TODAS as ocorrências de um
+# dia da semana dentro de UM mês só (ex: "programa esse story toda quinta de outubro") - ele
+# mesmo escolhe o mês toda vez na própria mensagem (_extrair_mes_ano_referencia_lote, já
+# existente da parte 37), nunca "o ano todo" sem ele pedir. Exige DOIS sinais juntos, igual à
+# mesma filosofia de gatilho explícito da parte 41: uma palavra de agendamento (mesma lista,
+# _PALAVRAS_GATILHO_AGENDAMENTO_METRICOOL) E uma palavra de repetição ("toda"/"todas as"/
+# "todo"/"todos os") vindo IMEDIATAMENTE antes de um dia da semana reconhecido - assim uma
+# legenda que só CITA "chopp em dobro toda quinta-feira" (conteúdo, não instrução) nunca ativa
+# sozinha, precisa também ter uma palavra de agendamento na mensagem.
+_PALAVRAS_REPETICAO_SEMANAL_METRICOOL = ("toda", "todas", "todo", "todos")
+
+
+def _pede_repeticao_semanal_metricool(texto):
+    """Devolve o dia da semana canônico (ex: "quinta") quando a mensagem pede repetição semanal
+    de verdade, ou None quando não pede. Aceita tanto singular ("toda quinta") quanto plural
+    ("todas as quintas", do jeito que o próprio Torres escreveu o pedido) - nenhum apelido de
+    dia da semana termina em "s", então tirar um "s" do final pra tentar casar de novo é seguro
+    (nunca gera falso positivo com outra palavra)."""
+    texto_norm = normalizar_texto(texto or "")
+    if not any(p in texto_norm for p in _PALAVRAS_GATILHO_AGENDAMENTO_METRICOOL):
+        return None
+    tokens = re.findall(r"[a-z0-9]+", texto_norm)
+    for i, tok in enumerate(tokens):
+        if tok in _PALAVRAS_REPETICAO_SEMANAL_METRICOOL:
+            j = i + 1
+            if j < len(tokens) and tokens[j] in ("as", "os"):
+                j += 1
+            if j < len(tokens):
+                candidato = tokens[j]
+                if candidato not in _APELIDO_PARA_DIA_SEMANA and candidato.endswith("s") and len(candidato) > 1:
+                    candidato = candidato[:-1]
+                if candidato in _APELIDO_PARA_DIA_SEMANA:
+                    canonico, _indice = _APELIDO_PARA_DIA_SEMANA[candidato]
+                    return canonico
+    return None
+
+
 def _extrair_referencia_dia_do_nome_arquivo(nome_arquivo):
     """Procura, no NOME do arquivo, uma referência de dia específico (número solto de 1 a 31,
     "diaNN", ou um par "DD MM" adjacente) ou um dia da semana (nome completo ou abreviação).
@@ -9207,6 +9300,109 @@ _NOMES_DIAS_SEMANA_EXIBICAO = {
     0: "segunda-feira", 1: "terça-feira", 2: "quarta-feira", 3: "quinta-feira",
     4: "sexta-feira", 5: "sábado", 6: "domingo",
 }
+
+_PLURAL_DIA_SEMANA_EXIBICAO = {
+    "segunda": "segundas-feiras", "terca": "terças-feiras", "quarta": "quartas-feiras",
+    "quinta": "quintas-feiras", "sexta": "sextas-feiras", "sabado": "sábados", "domingo": "domingos",
+}
+
+
+def _resolver_datas_repeticao_semanal_metricool(dia_semana_canonico, mes_ref, ano_ref, agora):
+    """Round 27 parte 42: resolve TODAS as ocorrências de um dia da semana dentro de UM ÚNICO
+    mês/ano (nunca sai desse mês - Torres escolhe sempre o mês na própria mensagem, via
+    _extrair_mes_ano_referencia_lote) - por CÓDIGO, mesma filosofia de
+    _resolver_datas_lote_metricool. Pula datas já passadas (pedido no meio do mês só pega as
+    ocorrências que ainda faltam). Devolve lista de date em ordem cronológica - pode vir vazia
+    quando não sobra nenhuma ocorrência futura nesse mês."""
+    import calendar as _calendar_repeticao
+
+    indice_semana = _DIAS_SEMANA_APELIDOS[dia_semana_canonico][0]
+    total_dias_mes = _calendar_repeticao.monthrange(ano_ref, mes_ref)[1]
+    hoje = agora.date()
+    return [
+        d for d in (date(ano_ref, mes_ref, dia) for dia in range(1, total_dias_mes + 1))
+        if d.weekday() == indice_semana and d >= hoje
+    ]
+
+
+def _processar_repeticao_semanal_metricool(pessoa, numero, grupo_jid_dm, grupo_nome_dm, texto, blog_id, cliente_nome, tipo_instagram, midias, rotulo_tipo, dia_semana_canonico):
+    """Round 27 parte 42: pedido verbatim do Torres - repetir o MESMO story/post em TODAS as
+    ocorrências de um dia da semana dentro de UM mês (ex: "toda quinta de outubro"), nunca "o
+    ano todo" sem ele pedir - o mês vem sempre de _extrair_mes_ano_referencia_lote (o que ele
+    escreveu na mensagem, ou o mês corrente se ele não citar nenhum). Confirmado com ele: o
+    horário é sempre EXIGIDO na própria mensagem (nunca assume um padrão tipo 09:00 aqui, ao
+    contrário do lote por pasta) - sem horário, pergunta antes de montar qualquer coisa. Sempre
+    mostra a lista completa de datas resolvidas e espera UM "sim" aprovando todas de uma vez -
+    mesma filosofia de calendário-antes-de-aprovar já usada no lote (parte 37)."""
+    agora = horario_bahia_agora()
+    mes_ref, ano_ref = _extrair_mes_ano_referencia_lote(texto, agora)
+    nome_mes_exibicao = next((nome.capitalize() for nome, num in _MESES_PT.items() if num == mes_ref), str(mes_ref))
+
+    horario_ref = _extrair_horario_lote_metricool(texto)
+    if horario_ref is None:
+        enviar_texto(
+            numero,
+            f"Entendi que é pra repetir esse {rotulo_tipo} do {cliente_nome} em todas as "
+            f"{_PLURAL_DIA_SEMANA_EXIBICAO[dia_semana_canonico]} de {nome_mes_exibicao}/{ano_ref}, mas falta o "
+            "horário - que horas quer que saia em cada data?",
+        )
+        registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", f"[pedido de repetição semanal no Metricool sem horário: {dia_semana_canonico}-feira de {nome_mes_exibicao}]", False)
+        return {"metricool_repeticao_sem_horario": True}
+    hora, minuto = horario_ref
+
+    datas_resolvidas = _resolver_datas_repeticao_semanal_metricool(dia_semana_canonico, mes_ref, ano_ref, agora)
+    if not datas_resolvidas:
+        enviar_texto(
+            numero,
+            f"Não sobrou nenhuma {dia_semana_canonico}-feira em {nome_mes_exibicao}/{ano_ref} a partir de hoje, "
+            "então não programei nada - quer tentar outro mês?",
+        )
+        registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", f"[repetição semanal no Metricool sem datas restantes: {dia_semana_canonico}-feira de {nome_mes_exibicao}]", False)
+        return {"metricool_repeticao_sem_datas": True}
+
+    eh_rascunho = "rascunho" in normalizar_texto(texto) or "draft" in normalizar_texto(texto)
+    handle_repeticao = _metricool_handle_instagram(cliente_nome)
+
+    legenda_repeticao = _extrair_legenda_metricool(texto)
+    resultado_revisao_rep = _revisar_legenda_metricool(legenda_repeticao)
+    legenda_repeticao = resultado_revisao_rep["legenda_final"]
+    avisos_arte_rep = _revisar_artes_metricool(midias)
+    bloco_aviso_revisao_rep = _formatar_aviso_revisao_metricool(resultado_revisao_rep["pontos"], avisos_arte_rep)
+
+    media_urls_publicas = [_publicar_midia_temporaria(m["bytes"], m["mime_type"]) for m in midias]
+    nomes_midias = [m.get("nome") for m in midias]
+    ordem_midias_txt = f"\n\nArquivo:\n{_formatar_ordem_midias(midias)}"
+
+    datas_hora = [
+        datetime(d.year, d.month, d.day, hora, minuto, tzinfo=BAHIA_TZ) for d in datas_resolvidas
+    ]
+    linhas_preview_rep = "\n".join(f"- {dh.strftime('%d/%m')} às {dh.strftime('%H:%M')}" for dh in datas_hora)
+
+    _comandos_pendentes[pessoa] = {
+        "criado_em": time.time(),
+        "eh_repeticao_semanal_metricool": True,
+        "metricool_blog_id": blog_id,
+        "metricool_cliente_nome": cliente_nome,
+        "metricool_tipo_instagram": tipo_instagram,
+        "metricool_media_urls": media_urls_publicas,
+        "metricool_nomes_midias": nomes_midias,
+        "metricool_texto": legenda_repeticao,
+        "metricool_draft": eh_rascunho,
+        "metricool_datas_repeticao": datas_hora,
+        "metricool_grupo_jid_dm": grupo_jid_dm,
+        "metricool_grupo_nome_dm": grupo_nome_dm,
+    }
+    acao_repeticao = "deixar em rascunho" if eh_rascunho else "programar"
+    aviso_legenda_rep = "" if legenda_repeticao else " (sem legenda - vai publicar sem legenda em todas as datas, dá pra completar depois direto no Metricool)"
+    enviar_texto(
+        numero,
+        f"Vou {acao_repeticao} esse {rotulo_tipo} do {cliente_nome} ({handle_repeticao}){aviso_legenda_rep}, repetido em "
+        f"TODAS as {_PLURAL_DIA_SEMANA_EXIBICAO[dia_semana_canonico]} de {nome_mes_exibicao}/{ano_ref} a partir de hoje, "
+        f'com a legenda:\n\n"{legenda_repeticao}"\n\n'
+        f"Datas ({len(datas_hora)}):\n{linhas_preview_rep}{ordem_midias_txt}{bloco_aviso_revisao_rep}\n\nConfirma (sim/não)?",
+    )
+    registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, "Cintia", f"[pedido de repetição semanal no Metricool aguardando aprovação: {dia_semana_canonico}-feira de {nome_mes_exibicao}, {len(datas_hora)} data(s)]", False)
+    return {"metricool_repeticao_semanal_aguardando_confirmacao": True}
 
 
 def _processar_agendamento_lote_metricool(pessoa, numero, grupo_jid_dm, grupo_nome_dm, texto, blog_id, cliente_nome, tipo_instagram, midias, rotulo_tipo):
@@ -9334,6 +9530,16 @@ def _processar_pedido_metricool_dm(pessoa, numero, grupo_jid_dm, grupo_nome_dm, 
     # retorna direto, antes de gastar upload/legenda/etc do fluxo de post único.
     if _pede_agendamento_lote_metricool(texto):
         return _processar_agendamento_lote_metricool(pessoa, numero, grupo_jid_dm, grupo_nome_dm, texto, blog_id, cliente_nome, tipo_instagram, midias, rotulo_tipo)
+
+    # Round 27 parte 42: pedido pra REPETIR o mesmo story/post em TODAS as ocorrências de um dia
+    # da semana dentro do mês que Torres escolher na própria mensagem (nunca "o ano todo") - ex:
+    # "programa esse story toda quinta de outubro". Checado ANTES da extração de data/hora única
+    # da parte 41 logo abaixo (que também reconhece nome de dia da semana, mas só resolve UMA
+    # data) - senão "toda quinta" cairia ali e resolveria só a PRÓXIMA quinta, ignorando as
+    # outras do mês inteiro.
+    dia_semana_repeticao = _pede_repeticao_semanal_metricool(texto)
+    if dia_semana_repeticao:
+        return _processar_repeticao_semanal_metricool(pessoa, numero, grupo_jid_dm, grupo_nome_dm, texto, blog_id, cliente_nome, tipo_instagram, midias, rotulo_tipo, dia_semana_repeticao)
 
     # Round 27 parte 41, bug real reportado pelo Torres: pediu pra "programar pra sair hoje as
     # 12h" e a Cintia publicou na hora - o post ÚNICO nunca respeitava horário nenhum pedido na
