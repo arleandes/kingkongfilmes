@@ -940,28 +940,143 @@ def listar_tarefas_pessoais_pendentes():
         return []
 
 
-def marcar_tarefa_pessoal_concluida(termo_busca):
-    """Marca como concluída a tarefa pessoal pendente mais recente cuja descrição bate
-    (ILIKE, case-insensitive) com termo_busca. Devolve a descrição da tarefa marcada, ou
-    None se não achou nenhuma pendente que bata - nunca inventa/escolhe uma tarefa ao acaso."""
+def _normalizar_texto_busca(texto: str) -> str:
+    """Remove acentos e baixa pra minúsculo, pra comparar frases digitadas de jeitos
+    ligeiramente diferentes (ex: 'vídeo' vs 'video', 'Felipe' vs 'felipe') sem depender de
+    bater caractere por caractere - bug real round 2026-09-29: 'editar o vídeo do doutor
+    Felipe' não batia com a tarefa salva 'editar video do doutor felipe' só por causa do
+    acento, e a Cintia dizia não achar a tarefa mesmo ela estando bem ali na lista."""
+    sem_acento = unicodedata.normalize("NFKD", texto or "").encode("ascii", "ignore").decode("ascii")
+    return sem_acento.lower().strip()
+
+
+_PALAVRAS_IGNORADAS_BUSCA_TAREFA = {
+    "o", "a", "os", "as", "de", "do", "da", "dos", "das", "e", "em", "um", "uma",
+    "no", "na", "nos", "nas", "que", "pra", "para", "com", "por",
+}
+
+
+def _palavras_significativas_busca(texto: str) -> set:
+    """Quebra o texto normalizado em palavras, descartando artigos/preposições comuns, pra
+    permitir comparar duas frases por sobreposição de palavras-chave em vez de exigir que uma
+    seja substring exata da outra - bug real round 2026-09-29: 'editar o vídeo do doutor
+    Felipe' tem uma palavra a mais ('o') que a tarefa salva 'editar video do doutor felipe',
+    então nem uma frase é substring da outra e só corrigir o acento não bastava."""
+    return {p for p in _normalizar_texto_busca(texto).split() if p and p not in _PALAVRAS_IGNORADAS_BUSCA_TAREFA}
+
+
+def _bate_por_palavras_chave(descricao: str, referencia: str) -> bool:
+    """True quando toda palavra significativa da `descricao` (real, do banco) aparece em
+    `referencia` (o que a pessoa digitou), ignorando ordem, acento e artigos/preposições.
+    Exige pelo menos 2 palavras significativas na descrição pra não confundir tarefas curtas
+    por causa de uma palavra solta em comum."""
+    palavras_descricao = _palavras_significativas_busca(descricao)
+    if len(palavras_descricao) < 2:
+        return False
+    palavras_referencia = _palavras_significativas_busca(referencia)
+    if not palavras_referencia:
+        return False
+    return palavras_descricao.issubset(palavras_referencia)
+
+
+_PALAVRAS_TODAS_TAREFAS_PESSOAIS = ("as duas", "ambas", "todas", "tudo", "a lista inteira", "as tarefas todas")
+
+
+def _pede_todas_tarefas_pessoais(referencia: str) -> bool:
+    """Detecta pedido tipo 'as duas tarefas coloque como concluída' - por CÓDIGO, nunca
+    dependendo do classificador ter extraído uma referência de texto pra isso (bug real: o
+    classificador manda 'tarefa_pessoal_referencia' vazia nesse caso, o que antes derrubava
+    a Cintia num beco sem saída perguntando 'qual tarefa?' apesar da pessoa ter acabado de
+    dizer que eram as duas)."""
+    return any(p in _normalizar_texto_busca(referencia) for p in _PALAVRAS_TODAS_TAREFAS_PESSOAIS)
+
+
+def _resolver_tarefas_pessoais_por_referencia(referencia: str, pendentes: list) -> list:
+    """Acha, dentre as tarefas pessoais REALMENTE pendentes (já consultadas no banco em
+    `pendentes`), quais batem com a referência que a pessoa deu. Primeiro tenta por texto
+    normalizado - substring exata (sem acento/case) ou sobreposição de palavras-chave
+    (`_bate_por_palavras_chave`), ambos gratuitos e por CÓDIGO; só se isso não achar nada,
+    pede ajuda ao Jev pra entender o contexto (Choice entre as descrições REAIS + opção
+    'nenhuma') - nunca inventa ou propõe um nome de tarefa que não esteja literalmente em
+    `pendentes` (bug real round 2026-09-29: o bate-papo geral chegou a inventar 'conversar
+    com neto', uma tarefa que nunca existiu, só pra tentar confirmar um pedido confuso)."""
+    referencia_norm = _normalizar_texto_busca(referencia)
+    if not referencia_norm or not pendentes:
+        return []
+
+    encontradas = [
+        t for t in pendentes
+        if _normalizar_texto_busca(t["descricao"]) in referencia_norm
+        or referencia_norm in _normalizar_texto_busca(t["descricao"])
+        or _bate_por_palavras_chave(t["descricao"], referencia)
+    ]
+    if encontradas:
+        return encontradas
+
+    if Choice is None:
+        return []
+    cliente = _obter_cliente_typesafe()
+    if cliente is None:
+        return []
+
+    rotulos = {f"tarefa_{i}": t["descricao"] for i, t in enumerate(pendentes)}
+    criterios = dict(rotulos)
+    criterios["nenhuma"] = "Nenhuma tarefa da lista bate com o que a pessoa pediu"
     try:
-        with db_cursor(commit=True) as cur:
-            cur.execute(
-                "SELECT id, descricao FROM tarefas_pessoais WHERE status != 'CONCLUIDA' "
-                "AND NOT excluido AND descricao ILIKE %s ORDER BY criado_em DESC LIMIT 1",
-                (f"%{termo_busca}%",),
-            )
-            linha = cur.fetchone()
-            if not linha:
-                return None
-            cur.execute(
-                "UPDATE tarefas_pessoais SET status = 'CONCLUIDA', concluido_em = now(), atualizado_em = now() WHERE id = %s",
-                (linha["id"],),
-            )
-            return linha["descricao"]
+        resultado = cliente.system_one(
+            state={"pedido_da_pessoa": referencia, "tarefas_pendentes_reais": list(rotulos.values())},
+            questions={
+                "tarefa_referida": Choice(
+                    instructions=(
+                        "A qual das 'tarefas_pendentes_reais' o 'pedido_da_pessoa' está se "
+                        "referindo? Escolha 'nenhuma' se nenhuma bater com confiança razoável."
+                    ),
+                    criteria=criterios,
+                )
+            },
+            timeout=_TYPESAFE_TIMEOUT_SEGUNDOS,
+        )
+        escolha = resultado.choices["tarefa_referida"].choice
     except Exception as e:
-        print(f"[marcar_tarefa_pessoal_concluida] erro: {e}", flush=True)
-        return None
+        print(f"[jev] falha ao resolver referência de tarefa pessoal: {e}", flush=True)
+        return []
+
+    if escolha not in rotulos:
+        return []
+    indice = int(escolha.split("_")[1])
+    return [pendentes[indice]]
+
+
+def marcar_tarefas_pessoais_concluidas(referencia: str) -> list:
+    """Marca como concluída(s) a(s) tarefa(s) pessoal(is) pendente(s) que batem com
+    `referencia` - por texto normalizado primeiro, com ajuda do Jev pra entender o contexto
+    quando a redação não bate perfeitamente (ver `_resolver_tarefas_pessoais_por_referencia`).
+    Também aceita pedir 'as duas'/'todas'/'ambas' pra marcar a lista inteira de uma vez (ver
+    `_pede_todas_tarefas_pessoais`). Devolve a lista de descrições REAIS marcadas, vazia se
+    não achou nada que bata - nunca marca nem propõe uma tarefa que não esteja de fato na
+    lista pendente."""
+    pendentes = listar_tarefas_pessoais_pendentes()
+    if not pendentes:
+        return []
+
+    if len(pendentes) > 1 and _pede_todas_tarefas_pessoais(referencia):
+        alvos = pendentes
+    else:
+        alvos = _resolver_tarefas_pessoais_por_referencia(referencia, pendentes)
+
+    marcadas = []
+    for tarefa in alvos:
+        try:
+            with db_cursor(commit=True) as cur:
+                cur.execute(
+                    "UPDATE tarefas_pessoais SET status = 'CONCLUIDA', concluido_em = now(), "
+                    "atualizado_em = now() WHERE id = %s AND status != 'CONCLUIDA'",
+                    (tarefa["id"],),
+                )
+            marcadas.append(tarefa["descricao"])
+        except Exception as e:
+            print(f"[marcar_tarefas_pessoais_concluidas] erro ao marcar id={tarefa.get('id')}: {e}", flush=True)
+    return marcadas
 
 
 # Nomes dos meses só pra EXIBIR na resposta da agenda (ex: "setembro de 2026") - não confundir
@@ -1106,7 +1221,7 @@ def _buscar_compromisso_por_referencia(termo_busca, data_referencia_iso=None):
     ("ok", linha) quando acha exatamente um, ("ambiguo", lista_de_linhas) quando tem mais de
     um candidato e não dá pra saber sozinho qual é, ou ("nao_achado", None). Nunca escolhe um
     compromisso "no chute" entre vários parecidos - mesma cautela já usada em
-    `marcar_tarefa_pessoal_concluida`/`marcar_fato_resolvido`."""
+    `marcar_tarefas_pessoais_concluidas`/`marcar_fato_resolvido`."""
     termo = (termo_busca or "").strip()
     if not termo:
         return ("nao_achado", None)
@@ -1630,10 +1745,11 @@ def _zapi_headers() -> dict:
 
 
 try:
-    from typesafe_sdk import TypeSafeClient, Noul
+    from typesafe_sdk import TypeSafeClient, Noul, Choice
 except Exception as _e:
     TypeSafeClient = None
     Noul = None
+    Choice = None
     print(f"[jev] typesafe_sdk indisponível, verificação fica desativada: {_e}", flush=True)
 
 
@@ -1749,11 +1865,13 @@ def _aplicar_verificacao_jev(numero_ou_jid: str, texto_resposta: str) -> str:
         estado["dados_reais_do_banco"] = _montar_estado_tarefas_pendentes_jev()
         perguntas["tarefa_contradiz_banco"] = Noul(
             instructions=(
-                "A 'resposta_da_cintia' afirma que uma tarefa ou compromisso ainda está "
-                "pendente/não feito quando ele NÃO aparece em 'dados_reais_do_banco', ou "
+                "A 'resposta_da_cintia' (a) afirma que uma tarefa ou compromisso ainda está "
+                "pendente/não feito quando ele NÃO aparece em 'dados_reais_do_banco', (b) "
                 "afirma que algo já foi concluído quando ele AINDA aparece pendente em "
-                "'dados_reais_do_banco'? Responda não quando a resposta não fizer nenhuma "
-                "afirmação de status conferível contra esses dados."
+                "'dados_reais_do_banco', ou (c) menciona/propõe um nome específico de tarefa "
+                "ou compromisso que não aparece em nenhuma das duas listas de "
+                "'dados_reais_do_banco' (ou seja, parece inventado)? Responda não quando a "
+                "resposta não fizer nenhuma afirmação conferível contra esses dados."
             ),
         )
 
@@ -7707,18 +7825,22 @@ def _processar_dm_interno(remote_jid, key, data):
             linhas_pendentes = "\n".join(f"- {t['descricao']}" for t in pendentes_pessoais)
             responder(f"📋 Suas tarefas pendentes:\n\n{linhas_pendentes}")
     elif resultado.get("eh_marcar_tarefa_pessoal_concluida"):
-        referencia_tarefa = (resultado.get("tarefa_pessoal_referencia") or "").strip()
-        if not referencia_tarefa:
-            responder("Qual tarefa você quer marcar como feita? Pode me falar melhor qual é.")
+        # Round 2026-09-29, bug real: quando a pessoa pede pra marcar "as duas"/"todas" de
+        # uma vez, o classificador manda "tarefa_pessoal_referencia" vazia - por isso, em vez
+        # de travar perguntando "qual tarefa?", usa a mensagem CRUA como referência nesse caso,
+        # deixando `marcar_tarefas_pessoais_concluidas` (código + Jev) resolver de verdade.
+        referencia_tarefa = (resultado.get("tarefa_pessoal_referencia") or "").strip() or texto
+        tarefas_concluidas = marcar_tarefas_pessoais_concluidas(referencia_tarefa)
+        if len(tarefas_concluidas) == 1:
+            responder(f"Boa! Marquei como feita: \"{tarefas_concluidas[0]}\" ✅")
+        elif len(tarefas_concluidas) > 1:
+            lista_marcadas = "\n".join(f"- {d}" for d in tarefas_concluidas)
+            responder(f"Boa! Marquei como feitas:\n\n{lista_marcadas} ✅")
         else:
-            tarefa_concluida = marcar_tarefa_pessoal_concluida(referencia_tarefa)
-            if tarefa_concluida:
-                responder(f"Boa! Marquei como feita: \"{tarefa_concluida}\" ✅")
-            else:
-                responder(
-                    "Não achei nenhuma tarefa pendente que bata com isso pra marcar como feita. "
-                    "Pode me lembrar melhor qual era?"
-                )
+            responder(
+                "Não achei nenhuma tarefa pendente que bata com isso pra marcar como feita. "
+                "Pode me lembrar melhor qual era?"
+            )
     elif resultado.get("eh_pedido_agenda") and resultado.get("compromissos_agenda"):
         # Round 27 parte 22 (continuação): agenda de verdade, pedido explícito do Torres -
         # aceita VÁRIOS compromissos numa mensagem só (ex: "dia 24 e 25 tenho trabalho com o
