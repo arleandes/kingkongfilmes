@@ -1895,6 +1895,43 @@ def _pode_precisar_verificacao_jev(texto_resposta: str) -> bool:
     return any(p in texto_lower for p in _PALAVRAS_GATILHO_VERIFICACAO_JEV)
 
 
+def _listar_tarefas_pessoais_concluidas_recentemente() -> list:
+    """Tarefas pessoais marcadas como concluídas nos últimos 30 minutos. Bug real de produção
+    (round 2026-09-29): assim que uma tarefa é marcada concluída, ela some da lista de
+    pendentes - e como o Jev só enxergava 'pendentes' e 'compromissos futuros', a confirmação
+    CORRETA da Cintia ("marquei como feita X") citava um nome que não aparecia em NENHUMA
+    lista, e o Jev lia isso como "nome inventado", bloqueando a própria confirmação certa e
+    trocando por uma resposta evasiva - Torres via isso como a Cintia "ficando maluca" mesmo
+    quando a ação por trás tinha funcionado direitinho. Essa lista dá ao Jev visibilidade do
+    que MUDOU de status agora mesmo."""
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                "SELECT descricao FROM tarefas_pessoais WHERE status = 'CONCLUIDA' AND NOT excluido "
+                "AND concluido_em >= now() - interval '30 minutes' ORDER BY concluido_em DESC"
+            )
+            return [r["descricao"] for r in cur.fetchall()]
+    except Exception as e:
+        print(f"[jev] falha ao listar tarefas pessoais concluídas recentemente: {e}", flush=True)
+        return []
+
+
+def _listar_compromissos_atualizados_recentemente() -> list:
+    """Mesma lógica de `_listar_tarefas_pessoais_concluidas_recentemente`, pro lado da agenda:
+    um compromisso marcado concluído/cancelado agora mesmo some de 'futuros_nao_concluidos' e
+    precisa aparecer em algum lugar pro Jev não confundir a confirmação certa com invenção."""
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                "SELECT descricao FROM compromissos_agenda WHERE NOT excluido AND (concluido OR cancelado) "
+                "AND atualizado_em >= now() - interval '30 minutes' ORDER BY atualizado_em DESC"
+            )
+            return [r["descricao"] for r in cur.fetchall()]
+    except Exception as e:
+        print(f"[jev] falha ao listar compromissos atualizados recentemente: {e}", flush=True)
+        return []
+
+
 def _montar_estado_tarefas_pendentes_jev() -> dict:
     """Consulta fresca no banco (nunca confia no que a resposta da Cintia afirma) pra dar ao
     Jev os fatos reais de tarefas pessoais e compromissos - mesmas funções já usadas pelo
@@ -1916,6 +1953,8 @@ def _montar_estado_tarefas_pendentes_jev() -> dict:
             c["descricao"] for c in (compromissos or [])
             if not c.get("concluido") and not c.get("cancelado")
         ],
+        "tarefas_pessoais_concluidas_nos_ultimos_30_minutos": _listar_tarefas_pessoais_concluidas_recentemente(),
+        "compromissos_concluidos_ou_cancelados_nos_ultimos_30_minutos": _listar_compromissos_atualizados_recentemente(),
     }
 
 
@@ -1949,12 +1988,18 @@ def _aplicar_verificacao_jev(numero_ou_jid: str, texto_resposta: str) -> str:
         perguntas["tarefa_contradiz_banco"] = Noul(
             instructions=(
                 "A 'resposta_da_cintia' (a) afirma que uma tarefa ou compromisso ainda está "
-                "pendente/não feito quando ele NÃO aparece em 'dados_reais_do_banco', (b) "
-                "afirma que algo já foi concluído quando ele AINDA aparece pendente em "
-                "'dados_reais_do_banco', ou (c) menciona/propõe um nome específico de tarefa "
-                "ou compromisso que não aparece em nenhuma das duas listas de "
-                "'dados_reais_do_banco' (ou seja, parece inventado)? Responda não quando a "
-                "resposta não fizer nenhuma afirmação conferível contra esses dados."
+                "pendente/não feito quando ele NÃO aparece nas listas de pendentes de "
+                "'dados_reais_do_banco', (b) afirma que algo já foi concluído/cancelado mas "
+                "ele AINDA aparece pendente em 'dados_reais_do_banco' E NÃO aparece em nenhuma "
+                "das listas '..._nos_ultimos_30_minutos', ou (c) menciona/propõe um nome "
+                "específico de tarefa ou compromisso que não aparece em NENHUMA lista de "
+                "'dados_reais_do_banco' - nem pendente, nem recém concluído/cancelado (ou seja, "
+                "parece inventado)? ATENÇÃO: uma tarefa/compromisso que aparece em "
+                "'tarefas_pessoais_concluidas_nos_ultimos_30_minutos' ou "
+                "'compromissos_concluidos_ou_cancelados_nos_ultimos_30_minutos' É a confirmação "
+                "correta de uma ação que acabou de acontecer - isso NUNCA é contradição nem "
+                "invenção, responda não nesse caso. Responda não também quando a resposta não "
+                "fizer nenhuma afirmação conferível contra esses dados."
             ),
         )
 
