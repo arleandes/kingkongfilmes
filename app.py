@@ -979,16 +979,86 @@ def _bate_por_palavras_chave(descricao: str, referencia: str) -> bool:
     return palavras_descricao.issubset(palavras_referencia)
 
 
-_PALAVRAS_TODAS_TAREFAS_PESSOAIS = ("as duas", "ambas", "todas", "tudo", "a lista inteira", "as tarefas todas")
+_PALAVRAS_TODAS_TAREFAS_PESSOAIS = (
+    "as duas", "ambas", "todas", "tudo", "a lista inteira", "as tarefas todas",
+    # Round 2026-09-29 (pedido do Torres sobre contexto de conversa): referências GENÉRICAS ao
+    # conjunto inteiro de tarefas pendentes, sem citar nenhuma em especial - bug real reportado:
+    # "Coloca minhas tarefas como concluídas" (depois da Cintia ter acabado de listar as 2
+    # pendentes) não batia com nenhuma das frases acima e caía sem achar nada.
+    "minhas tarefas", "minha lista", "meus pendentes", "minhas pendencias", "essas tarefas",
+    "as pendencias", "os itens",
+)
 
 
 def _pede_todas_tarefas_pessoais(referencia: str) -> bool:
-    """Detecta pedido tipo 'as duas tarefas coloque como concluída' - por CÓDIGO, nunca
-    dependendo do classificador ter extraído uma referência de texto pra isso (bug real: o
-    classificador manda 'tarefa_pessoal_referencia' vazia nesse caso, o que antes derrubava
-    a Cintia num beco sem saída perguntando 'qual tarefa?' apesar da pessoa ter acabado de
-    dizer que eram as duas)."""
+    """Detecta pedido tipo 'as duas tarefas coloque como concluída' ou 'coloca minhas tarefas
+    como concluídas' - por CÓDIGO, nunca dependendo do classificador ter extraído uma referência
+    de texto pra isso (bug real: o classificador manda 'tarefa_pessoal_referencia' vazia nesse
+    caso, o que antes derrubava a Cintia num beco sem saída perguntando 'qual tarefa?' apesar da
+    pessoa ter acabado de dizer que eram todas). NUNCA chame isto antes de checar
+    `_resolver_tarefas_por_posicao` - "as duas PRIMEIRAS" bate na substring "as duas" mas
+    significa uma coisa bem diferente de "as duas" (marcar as 2 pendentes) quando existem mais de
+    2 tarefas na lista."""
     return any(p in _normalizar_texto_busca(referencia) for p in _PALAVRAS_TODAS_TAREFAS_PESSOAIS)
+
+
+_NUMEROS_PALAVRA_TAREFAS_PESSOAIS = {
+    "um": 1, "uma": 1, "dois": 2, "duas": 2, "tres": 3, "quatro": 4, "cinco": 5,
+    "seis": 6, "sete": 7, "oito": 8, "nove": 9, "dez": 10,
+}
+
+_ORDINAIS_TAREFAS_PESSOAIS = {
+    "primeiro": 1, "primeira": 1, "segundo": 2, "segunda": 2, "terceiro": 3, "terceira": 3,
+    "quarto": 4, "quarta": 4, "quinto": 5, "quinta": 5, "sexto": 6, "sexta": 6,
+    "setimo": 7, "setima": 7, "oitavo": 8, "oitava": 8, "nono": 9, "nona": 9,
+    "decimo": 10, "decima": 10, "ultimo": -1, "ultima": -1, "penultimo": -2, "penultima": -2,
+}
+
+
+def _resolver_tarefas_por_posicao(referencia: str, pendentes: list) -> list:
+    """Resolve referências de POSIÇÃO na lista de tarefas pendentes - mesma ordem em que
+    `listar_tarefas_pessoais_pendentes` devolve (mais antiga primeiro) e em que a Cintia mostra
+    pra Torres. Pedido explícito do Torres (round 2026-09-29, "Cintia precisa interpretar
+    corretamente o contexto da conversa"): depois dela listar as tarefas, "conclui as duas
+    primeiras"/"marca a última"/"a primeira e a segunda" tem que funcionar sem precisar repetir o
+    texto de cada tarefa. Sempre por CÓDIGO, determinístico, sem gastar chamada ao Jev.
+    Nunca dispara em cima de 'segunda'/'quarta'/'quinta'/'sexta' quando o texto também menciona
+    'feira' (dia da semana, ex: "segunda-feira") - evita confundir dia com posição na lista."""
+    referencia_norm = _normalizar_texto_busca(referencia)
+    if not referencia_norm or not pendentes:
+        return []
+    tokens = referencia_norm.replace("-", " ").split()
+    total = len(pendentes)
+
+    # "as duas primeiras" / "os dois últimos" / "3 primeiras" - quantidade + primeiro(s)/último(s).
+    # Checada ANTES das palavras avulsas abaixo (e sempre antes de `_pede_todas_tarefas_pessoais`
+    # no chamador) porque "as duas primeiras" contém a substring "as duas", que sozinha
+    # significa outra coisa (marcar as 2 pendentes) quando há mais de 2 tarefas na lista.
+    for i, tok in enumerate(tokens):
+        quantidade = _NUMEROS_PALAVRA_TAREFAS_PESSOAIS.get(tok)
+        if quantidade is None and tok.isdigit():
+            quantidade = int(tok)
+        if quantidade and i + 1 < len(tokens):
+            proximo = tokens[i + 1]
+            n = min(quantidade, total)
+            if proximo.startswith("primeir"):
+                return pendentes[:n]
+            if proximo.startswith("ultim"):
+                return pendentes[total - n:]
+
+    if "feira" in tokens:
+        return []
+
+    # Palavras de posição avulsas ("a primeira", "a última", "a primeira e a segunda").
+    indices = set()
+    for tok in tokens:
+        valor = _ORDINAIS_TAREFAS_PESSOAIS.get(tok)
+        if valor is None:
+            continue
+        indice = valor - 1 if valor > 0 else total + valor
+        if 0 <= indice < total:
+            indices.add(indice)
+    return [pendentes[i] for i in sorted(indices)]
 
 
 def _resolver_tarefas_pessoais_por_referencia(referencia: str, pendentes: list) -> list:
@@ -1012,6 +1082,10 @@ def _resolver_tarefas_pessoais_por_referencia(referencia: str, pendentes: list) 
     ]
     if encontradas:
         return encontradas
+
+    por_posicao = _resolver_tarefas_por_posicao(referencia, pendentes)
+    if por_posicao:
+        return por_posicao
 
     if Choice is None:
         return []
@@ -1052,14 +1126,23 @@ def marcar_tarefas_pessoais_concluidas(referencia: str) -> list:
     `referencia` - por texto normalizado primeiro, com ajuda do Jev pra entender o contexto
     quando a redação não bate perfeitamente (ver `_resolver_tarefas_pessoais_por_referencia`).
     Também aceita pedir 'as duas'/'todas'/'ambas' pra marcar a lista inteira de uma vez (ver
-    `_pede_todas_tarefas_pessoais`). Devolve a lista de descrições REAIS marcadas, vazia se
-    não achou nada que bata - nunca marca nem propõe uma tarefa que não esteja de fato na
-    lista pendente."""
+    `_pede_todas_tarefas_pessoais`), e referência de POSIÇÃO ('as duas primeiras', 'a última')
+    pra marcar só uma parte dela (ver `_resolver_tarefas_por_posicao`). Devolve a lista de
+    descrições REAIS marcadas, vazia se não achou nada que bata - nunca marca nem propõe uma
+    tarefa que não esteja de fato na lista pendente."""
     pendentes = listar_tarefas_pessoais_pendentes()
     if not pendentes:
         return []
 
-    if len(pendentes) > 1 and _pede_todas_tarefas_pessoais(referencia):
+    # Round 2026-09-29 (pedido do Torres sobre contexto de conversa, exemplo real dele: 3
+    # tarefas, "conclui as duas primeiras" tem que marcar só as 2 primeiras e deixar a 3ª
+    # pendente): checa POSIÇÃO antes do atalho de "todas" - "as duas primeiras" contém a
+    # substring "as duas", que sozinha significa "marcar as 2 pendentes" (o atalho de baixo),
+    # uma coisa bem diferente quando há mais de 2 tarefas na lista.
+    alvos_posicao = _resolver_tarefas_por_posicao(referencia, pendentes)
+    if alvos_posicao:
+        alvos = alvos_posicao
+    elif len(pendentes) > 1 and _pede_todas_tarefas_pessoais(referencia):
         alvos = pendentes
     else:
         alvos = _resolver_tarefas_pessoais_por_referencia(referencia, pendentes)
@@ -3757,12 +3840,27 @@ OUTRA COISA), que agora é o seu modo padrão de assistente livre, não um catch
    eu tenho pra fazer?", "mostra minha lista", "o que ainda tá pendente?"). Marque
    "eh_pedido_listar_tarefas_pessoais" como true.
 
-20) AVISO DE QUE UMA TAREFA PESSOAL JÁ FOI FEITA/CONCLUÍDA (ex: "já resolvi a questão do carro",
-   "pode marcar a tarefa do CNH como feita", "aquilo que você anotou já foi"). Marque
+20) AVISO DE QUE UMA TAREFA PESSOAL JÁ FOI FEITA/CONCLUÍDA, OU PEDIDO PRA MARCAR TAREFA(S) COMO
+   CONCLUÍDA(S) (ex: "já resolvi a questão do carro", "pode marcar a tarefa do CNH como feita",
+   "aquilo que você anotou já foi", "conclui as duas primeiras", "marca a última como feita",
+   "coloca minhas tarefas como concluídas", "marca todas como feitas"). Marque
    "eh_marcar_tarefa_pessoal_concluida" como true e preencha "tarefa_pessoal_referencia" com um
    trecho que ajude a identificar qual tarefa da lista (nunca invente, só o suficiente pra achar a
-   tarefa certa) - se genuinamente não der pra saber qual é (mais de uma tarefa parecida, ou
-   nenhuma pista), deixe vazio e pergunte em "resposta_conversa" qual delas é.
+   tarefa certa).
+   CONTEXTO DA CONVERSA (pedido explícito de {pessoa_nome}): antes de decidir que não dá pra saber
+   qual tarefa é, SEMPRE olhe primeiro a ÚLTIMA VEZ que você mostrou a lista de tarefas pendentes
+   nas mensagens recentes acima - {pessoa_nome} não precisa repetir os nomes das tarefas que você
+   acabou de listar pra ele. Referências de POSIÇÃO na lista ("a primeira", "a última", "as duas
+   primeiras", "a primeira e a segunda") e referências genéricas ao conjunto todo ("minhas
+   tarefas", "todas", "a lista toda", "ambas") são interpretações VÁLIDAS mesmo sem citar o texto
+   de nenhuma tarefa - nesses casos preencha "tarefa_pessoal_referencia" com a própria referência
+   tal como foi dita (ex: "as duas primeiras"), sem tentar adivinhar sozinha qual tarefa é isso:
+   a resolução de verdade acontece depois por código, usando a ordem real da lista - você só
+   precisa reconhecer que a referência existe e passá-la adiante. Só deixe
+   "tarefa_pessoal_referencia" vazio (e pergunte em "resposta_conversa") quando a referência for
+   GENUINAMENTE impossível de resolver mesmo com o contexto (ex: nenhuma pista de qual tarefa, ou
+   mais de uma tarefa real e igualmente parecida) - nunca pergunte "qual tarefa?" quando a lista
+   acabou de ser mostrada e a referência (posição ou "todas") já deixa claro o suficiente.
 
 21) PEDIDO PRA ANOTAR UM COMPROMISSO NA AGENDA (ex: "anota na minha agenda: domingo tenho um
    trabalho com o Deivid às 10h", "dia 24 e 25 tenho trabalho com o Tony no Cimantec", "compromisso
