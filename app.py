@@ -1629,6 +1629,167 @@ def _zapi_headers() -> dict:
     return headers
 
 
+try:
+    from typesafe_sdk import TypeSafeClient, Noul
+except Exception as _e:
+    TypeSafeClient = None
+    Noul = None
+    print(f"[jev] typesafe_sdk indisponível, verificação fica desativada: {_e}", flush=True)
+
+
+# Round 2026-09-29: checagem do Jev (modelo "System One" da TypeSafe) antes de qualquer
+# texto sair pro Torres/Luan - pedido explícito do Torres depois de bugs recorrentes de
+# (a) Cintia tratar tarefa já concluída como pendente ou vice-versa e (b) resposta mudar de
+# assunto no meio da conversa. Guarda o pedido original (texto cru que a pessoa mandou) numa
+# thread-local, setado no início de `_processar_dm_interno` e limpo no fim - cada requisição
+# do Flask roda numa thread própria (gunicorn gthread), então isso nunca vaza pra uma
+# mensagem de OUTRA pessoa/requisição, mesmo com o worker reaproveitando a thread depois.
+_contexto_dm_jev = threading.local()
+
+_TYPESAFE_TIMEOUT_SEGUNDOS = 5.0
+_LIMIAR_PROBABILIDADE_JEV = 0.6
+_RESPOSTA_SEGURA_JEV = "Deixa eu conferir isso direito antes de te responder, já te retorno."
+
+_PALAVRAS_GATILHO_VERIFICACAO_JEV = (
+    "tarefa", "pendente", "pendência", "pendencia", "compromisso", "conclu",
+    "terminei", "finalizei", "ainda não", "ainda nao", "ainda estou", "falta",
+    "marquei", "feito", "pronto", "resolvid", "cancelei", "agenda",
+)
+
+_cliente_typesafe = None
+_cliente_typesafe_tentado = False
+
+
+def _obter_cliente_typesafe():
+    """Cria o cliente do TypeSafe uma única vez (lê TYPESAFE_API_KEY do ambiente sozinho,
+    mesmo padrão de cache preguiçoso de outros clientes externos deste arquivo). Devolve None
+    quando a chave não está configurada ou o SDK não pôde ser importado - nesses casos a
+    verificação fica só desligada, nunca derruba o envio da mensagem."""
+    global _cliente_typesafe, _cliente_typesafe_tentado
+    if _cliente_typesafe_tentado:
+        return _cliente_typesafe
+    _cliente_typesafe_tentado = True
+    if TypeSafeClient is None:
+        return None
+    if not os.environ.get("TYPESAFE_API_KEY"):
+        print("[jev] TYPESAFE_API_KEY não configurada - verificação desativada", flush=True)
+        return None
+    try:
+        _cliente_typesafe = TypeSafeClient()
+    except Exception as e:
+        print(f"[jev] falha ao criar cliente TypeSafe: {e}", flush=True)
+        _cliente_typesafe = None
+    return _cliente_typesafe
+
+
+def _numero_e_pessoal(numero_ou_jid: str) -> bool:
+    """Só Torres/Luan (assistente pessoal) passam pela checagem do Jev - avisos internos
+    pontuais pra TEAM_NUMBERS fora desse fluxo e qualquer outro destino ficam de fora."""
+    return numero_bate(numero_ou_jid, TORRES_NUMBER) or numero_bate(numero_ou_jid, LUAN_NUMBER)
+
+
+def _pode_precisar_verificacao_jev(texto_resposta: str) -> bool:
+    """Filtro barato (mesmo padrão já usado em outros pontos do sistema, ex:
+    _pode_ser_pedido_edicao_imagem) pra só gastar uma chamada ao Jev quando a resposta tem
+    chance real de estar falando de status de tarefa/compromisso."""
+    texto_lower = (texto_resposta or "").lower()
+    return any(p in texto_lower for p in _PALAVRAS_GATILHO_VERIFICACAO_JEV)
+
+
+def _montar_estado_tarefas_pendentes_jev() -> dict:
+    """Consulta fresca no banco (nunca confia no que a resposta da Cintia afirma) pra dar ao
+    Jev os fatos reais de tarefas pessoais e compromissos - mesmas funções já usadas pelo
+    resto do sistema, sem tabela/consulta nova."""
+    try:
+        tarefas = listar_tarefas_pessoais_pendentes()
+    except Exception as e:
+        print(f"[jev] falha ao listar tarefas pessoais pendentes: {e}", flush=True)
+        tarefas = []
+    try:
+        agora = horario_bahia_agora()
+        compromissos = listar_compromissos_periodo(agora, agora + timedelta(days=60))
+    except Exception as e:
+        print(f"[jev] falha ao listar compromissos: {e}", flush=True)
+        compromissos = []
+    return {
+        "tarefas_pessoais_pendentes": [t["descricao"] for t in (tarefas or [])],
+        "compromissos_futuros_nao_concluidos": [
+            c["descricao"] for c in (compromissos or [])
+            if not c.get("concluido") and not c.get("cancelado")
+        ],
+    }
+
+
+def _aplicar_verificacao_jev(numero_ou_jid: str, texto_resposta: str) -> str:
+    """Roda a checagem do Jev antes de mandar qualquer texto pro Torres/Luan. Nunca bloqueia
+    nem atrasa o envio de verdade: se o Jev não está configurado, falha, ou demora mais que
+    _TYPESAFE_TIMEOUT_SEGUNDOS, a resposta original segue sem checagem (mesma filosofia de
+    "falha da IA nunca derruba o fluxo" já usada noutras partes do sistema). Só troca a
+    resposta quando o Jev sinaliza, com confiança razoável, uma contradição real com o banco
+    ou uma mudança de assunto - nesse caso NUNCA manda a resposta arriscada, manda uma resposta
+    honesta no lugar (decisão explícita do Torres) e loga os detalhes pra investigar depois."""
+    if not texto_resposta or not _numero_e_pessoal(numero_ou_jid):
+        return texto_resposta
+
+    texto_pedido = getattr(_contexto_dm_jev, "texto_pedido", None)
+    precisa_checar_tarefa = _pode_precisar_verificacao_jev(texto_resposta)
+    precisa_checar_assunto = bool(texto_pedido)
+
+    if not precisa_checar_tarefa and not precisa_checar_assunto:
+        return texto_resposta
+
+    cliente = _obter_cliente_typesafe()
+    if cliente is None:
+        return texto_resposta
+
+    perguntas = {}
+    estado = {"resposta_da_cintia": texto_resposta}
+
+    if precisa_checar_tarefa:
+        estado["dados_reais_do_banco"] = _montar_estado_tarefas_pendentes_jev()
+        perguntas["tarefa_contradiz_banco"] = Noul(
+            instructions=(
+                "A 'resposta_da_cintia' afirma que uma tarefa ou compromisso ainda está "
+                "pendente/não feito quando ele NÃO aparece em 'dados_reais_do_banco', ou "
+                "afirma que algo já foi concluído quando ele AINDA aparece pendente em "
+                "'dados_reais_do_banco'? Responda não quando a resposta não fizer nenhuma "
+                "afirmação de status conferível contra esses dados."
+            ),
+        )
+
+    if precisa_checar_assunto:
+        estado["pedido_original_do_torres"] = texto_pedido
+        perguntas["assunto_muda"] = Noul(
+            instructions=(
+                "A 'resposta_da_cintia' muda de assunto ou mistura o assunto de "
+                "'pedido_original_do_torres' com um assunto diferente e não relacionado, em "
+                "vez de responder diretamente ao que foi pedido?"
+            ),
+        )
+
+    try:
+        resultado = cliente.system_one(state=estado, questions=perguntas, timeout=_TYPESAFE_TIMEOUT_SEGUNDOS)
+    except Exception as e:
+        print(f"[jev] falha na verificação, mandando resposta original sem checar: {e}", flush=True)
+        return texto_resposta
+
+    problema = None
+    if "tarefa_contradiz_banco" in resultado.nouls and resultado.nouls["tarefa_contradiz_banco"].noul > _LIMIAR_PROBABILIDADE_JEV:
+        problema = "tarefa_contradiz_banco"
+    elif "assunto_muda" in resultado.nouls and resultado.nouls["assunto_muda"].noul > _LIMIAR_PROBABILIDADE_JEV:
+        problema = "assunto_muda"
+
+    if problema:
+        print(
+            f"[jev] segurou resposta arriscada ({problema}) - original: {texto_resposta!r} | "
+            f"pedido: {texto_pedido!r}",
+            flush=True,
+        )
+        return _RESPOSTA_SEGURA_JEV
+
+    return texto_resposta
+
+
 def enviar_texto(numero_ou_jid: str, texto: str) -> bool:
     """Retorna True só quando a mensagem foi REALMENTE aceita/enviada, False em qualquer
     outro caso (erro HTTP, exceção, ou resposta 200 sem confirmação de envio - ver comentário
@@ -1648,7 +1809,11 @@ def enviar_texto(numero_ou_jid: str, texto: str) -> bool:
     função tinha sido CHAMADA, e confirmava sempre, incondicionalmente. Agora toda chamada loga
     o resultado (sucesso com o messageId, ou falha com o motivo) e devolve um bool de verdade,
     que os pontos de confirmação (ver "sim" + eh_resposta_cliente) passam a checar antes de
-    dizer que enviou."""
+    dizer que enviou.
+
+    Round 2026-09-29: antes de mandar de verdade, passa pelo Jev (_aplicar_verificacao_jev) -
+    só pra Torres/Luan, nunca bloqueia o envio se o Jev falhar."""
+    texto = _aplicar_verificacao_jev(numero_ou_jid, texto)
     if WHATSAPP_PROVIDER == "zapi":
         return _enviar_texto_zapi(numero_ou_jid, texto)
     return _enviar_texto_evolution(numero_ou_jid, texto)
@@ -6700,6 +6865,19 @@ def _processar_valores_oficiais_cliente_dm(nome_cliente_bruto, texto_extra, pess
 
 
 def processar_dm(remote_jid, key, data):
+    """Fina camada em volta de `_processar_dm_interno` só pra garantir que o contexto usado
+    pela verificação do Jev (`_contexto_dm_jev`) começa limpo e termina limpo nesta thread -
+    importante porque o gunicorn (worker gthread) reaproveita a mesma thread pra requisições
+    diferentes ao longo do tempo, então sem o `finally` um pedido desta mensagem podia vazar
+    e ser comparado com a resposta de uma mensagem seguinte, de outra pessoa/conversa."""
+    _contexto_dm_jev.texto_pedido = None
+    try:
+        return _processar_dm_interno(remote_jid, key, data)
+    finally:
+        _contexto_dm_jev.texto_pedido = None
+
+
+def _processar_dm_interno(remote_jid, key, data):
     if numero_bate(remote_jid, TORRES_NUMBER):
         pessoa, numero = "torres", TORRES_NUMBER
     elif numero_bate(remote_jid, LUAN_NUMBER):
@@ -6856,6 +7034,10 @@ def processar_dm(remote_jid, key, data):
             # chegou, em vez de sumir completamente do historico.
             registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, pessoa, f"[mandou uma mensagem do tipo '{message_type}', não suportada ainda]", True)
             return {"skipped": "DM de tipo não tratado nesta versão, mas registrado no histórico"}
+        # Guarda o pedido original pra checagem do Jev (_aplicar_verificacao_jev) poder
+        # comparar contra a resposta que a Cintia vai mandar mais abaixo, seja qual for o
+        # caminho que essa mensagem tomar dali pra frente.
+        _contexto_dm_jev.texto_pedido = texto
 
         # Round 27 parte 16: "valores pro/pra <cliente>: <lista digitada ou link do Drive>" -
         # checado ANTES do link do Drive genérico logo abaixo, senão um link colado junto com
