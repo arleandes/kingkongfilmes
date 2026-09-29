@@ -1799,9 +1799,9 @@ def _obter_cliente_typesafe():
 
 
 def _numero_e_pessoal(numero_ou_jid: str) -> bool:
-    """Só Torres/Luan (assistente pessoal) passam pela checagem do Jev - avisos internos
-    pontuais pra TEAM_NUMBERS fora desse fluxo e qualquer outro destino ficam de fora."""
-    return numero_bate(numero_ou_jid, TORRES_NUMBER) or numero_bate(numero_ou_jid, LUAN_NUMBER)
+    """Só o Torres (assistente pessoal, round 44: Cintia não fala mais com o Luan em lugar
+    nenhum) passa pela checagem do Jev - qualquer outro destino fica de fora."""
+    return numero_bate(numero_ou_jid, TORRES_NUMBER)
 
 
 def _pode_precisar_verificacao_jev(texto_resposta: str) -> bool:
@@ -3925,6 +3925,15 @@ def _marcar_lembrete_agendado_resolvido_db(lembrete_id):
 
 
 def enviar_lembrete(destinatario, numero_ou_jid, texto_lembrete, primeira_vez):
+    # Round 44, pedido explícito do Torres ("Cintia agora não fala com Luan ela só fala
+    # comigo", 100% de precisão): ponto único por onde TODO lembrete de verdade sai (pontual,
+    # recorrente e nag) - trava aqui pega até um lembrete agendado ANTES desse pedido e
+    # restaurado do banco num reinício (`_restaurar_lembretes_agendados` usa o numero_ou_jid
+    # salvo direto, sem passar de novo por `resolver_destinatario_lembrete`), nunca deixando
+    # passar pro número do Luan em nenhuma circunstância.
+    if numero_bate(numero_ou_jid, LUAN_NUMBER):
+        numero_ou_jid = TORRES_NUMBER
+        texto_lembrete = f"(era um lembrete pro Luan, mas não mando mais mensagem pra ele) {texto_lembrete}"
     prefixo = "⏰ Lembrete!" if primeira_vez else "⏰ Lembrete (ainda pendente):"
     enviar_texto(numero_ou_jid, f"{prefixo} {texto_lembrete}")
 
@@ -4067,10 +4076,13 @@ def resolver_destinatario_lembrete(destinatario_lembrete):
     """Traduz o campo 'destinatario_lembrete' do classificador (torres/luan/tripa) pra
     (chave interna, numero/jid de envio, nome de exibicao, se deve repetir cobrando ate
     confirmar). Devolve None quando o campo veio vazio/nao reconhecido, pra quem chamou usar
-    o padrao (a propria pessoa que pediu o lembrete)."""
+    o padrao (a propria pessoa que pediu o lembrete).
+    Round 44, pedido explícito do Torres ("Cintia agora não fala com Luan ela só fala
+    comigo"): "luan" deixou de ser um destino válido de verdade - NUNCA mais manda uma
+    mensagem de lembrete pro número dele. Quem chama esta função (`_processar_dm_interno`)
+    trata o retorno None distinguindo esse caso específico do "nao reconhecido" genérico,
+    pra avisar o Torres com honestidade em vez de mandar pro Luan calado."""
     d = normalizar_texto(destinatario_lembrete or "")
-    if d == "luan":
-        return "luan", LUAN_NUMBER, "o Luan", True
     if d == "torres":
         return "torres", TORRES_NUMBER, "o Torres", True
     if d == "tripa":
@@ -6996,12 +7008,14 @@ def processar_dm(remote_jid, key, data):
 
 
 def _processar_dm_interno(remote_jid, key, data):
-    if numero_bate(remote_jid, TORRES_NUMBER):
-        pessoa, numero = "torres", TORRES_NUMBER
-    elif numero_bate(remote_jid, LUAN_NUMBER):
-        pessoa, numero = "luan", LUAN_NUMBER
-    else:
+    # Pedido explícito do Torres (round 44): "Cintia agora não fala com Luan ela só fala
+    # comigo". O gate de verdade já fica em `_processar_evento_webhook` (barra qualquer DM
+    # que não seja do TORRES_NUMBER antes mesmo de chegar aqui) - esta checagem é uma
+    # segunda camada independente, pra nunca depender de um único ponto do código pra essa
+    # garantia (defesa em profundidade, já que precisão de 100% aqui é inegociável).
+    if not numero_bate(remote_jid, TORRES_NUMBER):
         return {"skipped": "DM de número não reconhecido"}
+    pessoa, numero = "torres", TORRES_NUMBER
 
     # Registra TUDO que Torres/Luan falam ou mandam no privado com a Cintia, pra servir
     # de historico/backup (assim como ja fazemos com os grupos de cliente) - sistema de
@@ -7773,6 +7787,11 @@ def _processar_dm_interno(remote_jid, key, data):
             return {"erro": "não conseguiu parsear data_hora_alvo_iso", "resultado": resultado}
 
         texto_lembrete = resultado.get("texto_lembrete", texto)
+        # Round 44: "luan" nunca mais é um destino de verdade (ver resolver_destinatario_lembrete) -
+        # detectado aqui separado do "não reconhecido" genérico só pra poder avisar o Torres
+        # com honestidade em vez de silenciosamente redirecionar o lembrete pra ele sem dizer
+        # o motivo.
+        pedido_era_pro_luan = normalizar_texto(resultado.get("destinatario_lembrete") or "") == "luan"
         destino = resolver_destinatario_lembrete(resultado.get("destinatario_lembrete"))
         if destino:
             destinatario_key, numero_destino, quem_recebe, repetir = destino
@@ -7792,7 +7811,9 @@ def _processar_dm_interno(remote_jid, key, data):
             agendar_lembrete(destinatario_key, numero_destino, alvo, texto_lembrete, repetir_ate_confirmar=repetir)
             quando = f"às {alvo.strftime('%H:%M')}" if not repetir else "10 min antes"
 
-        if quem_recebe == "você":
+        if pedido_era_pro_luan:
+            responder(f"Não mando mensagem pro Luan diretamente mais, então guardei esse lembrete pra VOCÊ {quando}: \"{texto_lembrete}\" 👍 (repassa pra ele se for o caso)")
+        elif quem_recebe == "você":
             responder(f"Combinado! Vou te lembrar {quando}: \"{texto_lembrete}\" 👍")
         else:
             responder(f"Combinado! Vou lembrar {quem_recebe} {quando}: \"{texto_lembrete}\" 👍")
