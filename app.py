@@ -4776,6 +4776,26 @@ def _buscar_imagens_recentes_para_edicao(chave_conversa):
     return [img for img in buffer if agora - img["timestamp"] <= _IMAGENS_RECENTES_EDICAO_TTL]
 
 
+def _aguardar_imagens_recentes_para_edicao(chave_conversa, timeout=6.0, intervalo=0.5):
+    """Bug urgente reportado pelo Torres: mandou uma imagem e, na sequência rápida (mesma
+    janela de poucos segundos), digitou em TEXTO solto o pedido de edição - como a imagem chega
+    e o texto chegam como duas requisições/threads diferentes, é possível o texto ser processado
+    antes da imagem terminar de baixar/ser bufferizada, deixando o buffer vazio bem na hora em
+    que o texto olha pra ele (a Cintia então "esquecia" que tem uma API de edição de verdade e
+    respondia com uma limitação inventada). Em vez de desistir na hora, espera até `timeout`
+    segundos (checando a cada `intervalo`) por uma imagem aparecer no buffer - só é chamada
+    quando o filtro barato (_pode_ser_pedido_edicao_imagem) já indicou que o texto parece um
+    pedido de edição E o buffer já foi checado uma vez e estava vazio, então não adiciona
+    nenhuma espera ao fluxo normal de mensagens do dia a dia."""
+    esperar_ate = time.time() + timeout
+    while time.time() < esperar_ate:
+        time.sleep(intervalo)
+        imagens = _buscar_imagens_recentes_para_edicao(chave_conversa)
+        if imagens:
+            return imagens
+    return []
+
+
 _PALAVRAS_GATILHO_EDICAO_IMAGEM = [
     "edita", "edite", "editar", "edicao", "edição",
     "muda", "mude", "mudar", "troca", "troque", "trocar",
@@ -7189,6 +7209,20 @@ def _processar_dm_interno(remote_jid, key, data):
         nome_pasta_dm = "Torres" if pessoa == "torres" else "Luan"
         grupo_dm_drive = {"nome": nome_pasta_dm, "interno": False}
         midia_b64_dm = baixar_midia(key)
+
+        # Bug urgente reportado pelo Torres: mandou um flyer encaminhado e, na sequência rápida
+        # (mesmo minuto), digitou em texto solto o pedido de edição ("mude essa arte tirando o
+        # nome de X e coloque Y") - a Cintia respondeu como se não tivesse a ferramenta de edição
+        # de verdade, dizendo "não consigo editar arquivo de imagem". Causa raiz: o buffer de
+        # edição (_guardar_imagem_para_edicao) só era preenchido DEPOIS do backup no Drive e da
+        # descrição por IA da imagem (mais abaixo, ambas chamadas de rede que podem levar vários
+        # segundos) - se o texto de edição chegasse antes disso terminar, o buffer ainda estava
+        # vazio e o pedido caía no fluxo comum de conversa (que não sabe da API de edição e
+        # "inventa" uma limitação). Bufferiza aqui, assim que a imagem termina de baixar, antes
+        # de qualquer chamada lenta - fecha a corrida na origem.
+        if midia_b64_dm and "image" in tipo_lower:
+            _guardar_imagem_para_edicao(grupo_jid_dm, midia_b64_dm, "image/jpeg")
+
         link_dm = None
         if midia_b64_dm:
             if "image" in tipo_lower:
@@ -7260,11 +7294,8 @@ def _processar_dm_interno(remote_jid, key, data):
         else:
             texto_historico_dm = f"[enviou imagem/PDF pra revisão de arte]{sufixo_dm}"
         registrar_mensagem_grupo(grupo_jid_dm, grupo_nome_dm, pessoa, texto_historico_dm, True)
-        if "image" in tipo_lower and midia_b64_dm:
-            # Guarda a imagem no buffer de edição (não é pedido de edição ESSA aqui, mas pode
-            # virar a "foto de referência" ou o "flyer base" de um pedido de edição na PRÓXIMA
-            # mensagem - ex: manda o flyer sem legenda, e só na foto seguinte pede a troca).
-            _guardar_imagem_para_edicao(grupo_jid_dm, midia_b64_dm, "image/jpeg")
+        # (imagem já foi bufferizada pro fluxo de edição logo no início, assim que baixou - ver
+        # comentário acima, junto de "midia_b64_dm = baixar_midia(key)")
         return revisar_arte_dm(numero, key, data, message_type, grupo_jid_dm=grupo_jid_dm)
 
     # Audio/PTT no privado: transcreve e trata como se fosse uma mensagem de texto normal
@@ -7435,12 +7466,20 @@ def _processar_dm_interno(remote_jid, key, data):
     # achou pistas de edição E existe pelo menos uma imagem recente guardada nessa conversa pra
     # editar; sem nenhuma das duas coisas, nem chega a perguntar, cai no fluxo normal (evita
     # gastar uma chamada de IA à toa numa mensagem comum do dia a dia).
-    if _pode_ser_pedido_edicao_imagem(texto) and _buscar_imagens_recentes_para_edicao(grupo_jid_dm):
-        eh_pedido_edicao, instrucao_edicao = _detectar_pedido_edicao_imagem(texto)
-        if eh_pedido_edicao:
-            # A mensagem de texto em si já foi registrada no histórico mais acima (fluxo normal
-            # de texto/áudio) - não registra de novo aqui, só executa a edição.
-            return _realizar_edicao_imagem_dm(numero, grupo_jid_dm, grupo_nome_dm, instrucao_edicao)
+    if _pode_ser_pedido_edicao_imagem(texto):
+        imagens_disponiveis_edicao = _buscar_imagens_recentes_para_edicao(grupo_jid_dm)
+        if not imagens_disponiveis_edicao:
+            # Bug urgente (ver comentário em _aguardar_imagens_recentes_para_edicao): a imagem
+            # pode ainda estar sendo baixada/bufferizada numa requisição concorrente quando esse
+            # texto já chegou (mensagens quase simultâneas) - espera um pouco antes de desistir,
+            # em vez de cair direto no fluxo comum sem a ferramenta de edição de verdade.
+            imagens_disponiveis_edicao = _aguardar_imagens_recentes_para_edicao(grupo_jid_dm)
+        if imagens_disponiveis_edicao:
+            eh_pedido_edicao, instrucao_edicao = _detectar_pedido_edicao_imagem(texto)
+            if eh_pedido_edicao:
+                # A mensagem de texto em si já foi registrada no histórico mais acima (fluxo
+                # normal de texto/áudio) - não registra de novo aqui, só executa a edição.
+                return _realizar_edicao_imagem_dm(numero, grupo_jid_dm, grupo_nome_dm, instrucao_edicao)
 
     # Round 27 parte 30: pedido de POSTAGEM NO METRICOOL (link + cliente + feed/story, ex:
     # "posta no story do Zurca: <link>") - filtro barato primeiro (precisa ter uma URL de
