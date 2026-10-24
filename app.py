@@ -44,6 +44,7 @@ import unicodedata
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, date, timezone, timedelta
+from urllib.parse import quote
 
 from flask import Flask, request, jsonify, redirect, Response
 import requests
@@ -8360,9 +8361,127 @@ def webhook_zapi():
     return _processar_evento_webhook(data, origem="zapi")
 
 
-@app.route("/", methods=["GET"])
-def health():
+def _health_response():
     return jsonify({"status": "ok", "service": "kingkong-whatsapp-webhook"})
+
+
+def _render_inicio_html(token="", exigir_token=False, token_invalido=False):
+    """Tela inicial simples para abrir os painéis pelo celular ou computador."""
+    if exigir_token:
+        aviso_erro = '<div class="erro">Senha incorreta.</div>' if token_invalido else ""
+        return """<!doctype html>
+<html lang="pt-br">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Entrar - Cíntia</title>
+<style>
+  * { box-sizing:border-box; }
+  body { margin:0; min-height:100vh; display:grid; place-items:center; padding:24px; background:#f4f5f7; color:#1c1c1e; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  .caixa { width:100%; max-width:420px; background:#fff; border-radius:20px; padding:28px; box-shadow:0 14px 40px rgba(0,0,0,.10); }
+  h1 { margin:0 0 8px; font-size:28px; }
+  p { margin:0 0 22px; color:#636366; line-height:1.45; }
+  label { display:block; margin-bottom:7px; font-size:14px; font-weight:700; }
+  input { width:100%; padding:14px; border:1px solid #d1d1d6; border-radius:11px; font:inherit; }
+  button { width:100%; margin-top:12px; padding:14px; border:0; border-radius:11px; background:#1c1c1e; color:#fff; font:inherit; font-weight:700; cursor:pointer; }
+  .erro { margin-top:12px; color:#c62828; font-size:13px; }
+</style>
+</head>
+<body>
+  <main class="caixa">
+    <h1>Cíntia</h1>
+    <p>Digite a senha do painel para continuar.</p>
+    <form method="GET" action="/sistema">
+      <label for="token">Senha</label>
+      <input id="token" name="token" type="password" autocomplete="current-password" autofocus required>
+      <button type="submit">Entrar</button>
+    </form>
+    <!-- AVISO_ERRO -->
+  </main>
+</body>
+</html>""".replace("<!-- AVISO_ERRO -->", aviso_erro)
+
+    token_qs = f"?token={quote(token, safe='')}" if token else ""
+    return f"""<!doctype html>
+<html lang="pt-br">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cíntia - KingKong Filmes</title>
+<style>
+  * {{ box-sizing:border-box; }}
+  body {{ margin:0; min-height:100vh; background:#f4f5f7; color:#1c1c1e; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }}
+  header {{ background:#1c1c1e; color:#fff; padding:28px 20px; }}
+  .topo, main {{ width:100%; max-width:720px; margin:0 auto; }}
+  h1 {{ margin:0; font-size:28px; }}
+  .subtitulo {{ margin:7px 0 0; color:#d1d1d6; }}
+  .online {{ display:inline-flex; align-items:center; gap:7px; margin-top:17px; padding:7px 11px; border-radius:999px; background:#2c2c2e; font-size:13px; }}
+  .ponto {{ width:9px; height:9px; border-radius:50%; background:#30d158; box-shadow:0 0 0 4px rgba(48,209,88,.13); }}
+  main {{ padding:28px 20px 50px; }}
+  h2 {{ margin:0 0 6px; font-size:21px; }}
+  .instrucao {{ margin:0 0 20px; color:#636366; }}
+  .grade {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; }}
+  .cartao {{ display:block; min-height:150px; padding:22px; border-radius:17px; background:#fff; color:inherit; text-decoration:none; box-shadow:0 3px 14px rgba(0,0,0,.07); border:1px solid #e5e5ea; transition:transform .15s,box-shadow .15s; }}
+  .cartao:hover {{ transform:translateY(-2px); box-shadow:0 8px 24px rgba(0,0,0,.10); }}
+  .icone {{ display:block; margin-bottom:18px; font-size:30px; }}
+  .cartao strong {{ display:block; margin-bottom:5px; font-size:18px; }}
+  .cartao span:last-child {{ color:#636366; font-size:14px; line-height:1.4; }}
+  .secundario {{ display:inline-block; margin-top:22px; color:#636366; font-size:13px; }}
+  @media (max-width:560px) {{ .grade {{ grid-template-columns:1fr; }} .cartao {{ min-height:auto; }} }}
+</style>
+</head>
+<body>
+<header>
+  <div class="topo">
+    <h1>Cíntia</h1>
+    <p class="subtitulo">KingKong Filmes</p>
+    <div class="online"><span class="ponto"></span>Sistema online</div>
+  </div>
+</header>
+<main>
+  <h2>O que você quer abrir?</h2>
+  <p class="instrucao">Toque em uma opção para continuar.</p>
+  <div class="grade">
+    <a class="cartao" href="/painel-pedidos{token_qs}">
+      <span class="icone">📋</span>
+      <strong>Pedidos</strong>
+      <span>Criar e acompanhar pedidos de mudança no sistema.</span>
+    </a>
+    <a class="cartao" href="/painel-conversas{token_qs}">
+      <span class="icone">💬</span>
+      <strong>Conversas</strong>
+      <span>Consultar o histórico recente dos grupos.</span>
+    </a>
+  </div>
+  <a class="secundario" href="/status-memoria{token_qs}">Ver status da memória</a>
+</main>
+</body>
+</html>"""
+
+
+@app.route("/", methods=["GET"])
+def inicio():
+    # Mantém compatibilidade com health checks e integrações que esperam JSON na raiz.
+    # Navegadores enviam Accept: text/html e recebem a tela visual.
+    if "text/html" not in request.headers.get("Accept", ""):
+        return _health_response()
+    return sistema()
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return _health_response()
+
+
+@app.route("/sistema", methods=["GET"])
+def sistema():
+    token = request.args.get("token", "")
+    token_esperado = os.environ.get("DEBUG_TOKEN")
+    if token_esperado and token != token_esperado:
+        token_invalido = "token" in request.args
+        status = 403 if token_invalido else 200
+        return _render_inicio_html(exigir_token=True, token_invalido=token_invalido), status
+    return _render_inicio_html(token=token)
 
 
 def _checar_token_painel():
