@@ -1,0 +1,21 @@
+{
+  "0": "enviar_texto",
+  "1": "_processar_dm_interno",
+  "2": "normalizar_texto",
+  "3": "db_cursor",
+  "4": "horario_bahia_agora",
+  "5": "app.py",
+  "6": "marcar_tarefas_pessoais_concluidas",
+  "7": "agendar_lembrete",
+  "8": "_jid_para_zapi_phone",
+  "9": "_baixar_arquivo_drive_por_id",
+  "10": "metricool_resumo_posts_ou_reels",
+  "11": "_lagobada_listar_itens_desde",
+  "12": "route",
+  "13": "_atualizar_flag_compromisso",
+  "14": "painel_conversas",
+  "15": "listar_grupos_com_atividade_hoje",
+  "16": "painel_pedidos",
+  "17": "registrar_pedido_pendente",
+  "18": "debug_testar_edicao_imagem"
+}
